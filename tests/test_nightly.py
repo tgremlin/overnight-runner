@@ -406,32 +406,35 @@ def test_nightly_paused_at_start_zero_tasks(tmp_path: Path):
 
 
 def test_nightly_dependency_blocked_skipped(tmp_path: Path, monkeypatch):
-    repo = _init_repo(tmp_path)
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
-    db = Database(default_db_path())
-    _enqueue_read_only(db, "dep-A", repo, head, depends_on="missing")
-    _enqueue_read_only(db, "free-C", repo, head, priority=1)
-    # Both have approved envelopes. A is dep-blocked, C is independent.
-    import overnight_runner.worker as wmod
-    orig = wmod.Worker.__init__
-    # C just reports DONE (no mutation; read_only with no required validator)
-    C = _script_client_class([
-        {"tool_calls": [{"id": "r", "function": {"name": "report_result",
-                                                "arguments": {"disposition": "DONE", "summary": "ok"}}}]},
-    ])
-    wmod.Worker.__init__ = lambda self, **kw: orig(self, client=C(), **kw)
+    from overnight_runner import ollama_client as oc
+    orig_digest = oc.OllamaClient.model_digest
+    oc.OllamaClient.model_digest = lambda self, name: "d"
     try:
-        with runner_lock():
-            res = run_nightly(session_id="nightly-dep")
+        repo = _init_repo(tmp_path)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+        db = Database(default_db_path())
+        _enqueue_read_only(db, "dep-A", repo, head, depends_on="missing")
+        _enqueue_read_only(db, "free-C", repo, head, priority=1)
+        import overnight_runner.worker as wmod
+        orig = wmod.Worker.__init__
+        C = _script_client_class([
+            {"tool_calls": [{"id": "r", "function": {"name": "report_result",
+                                                    "arguments": {"disposition": "DONE", "summary": "ok"}}}]},
+        ])
+        wmod.Worker.__init__ = lambda self, **kw: orig(self, client=C(), **kw)
+        try:
+            with runner_lock():
+                res = run_nightly(session_id="nightly-dep")
+        finally:
+            wmod.Worker.__init__ = orig
+        assert res.tasks_attempted == 1
+        assert res.tasks_passed == 1
+        assert any(t["task_id"] == "free-C" for t in res.task_results)
+        summary = json.loads((state_dir() / "sessions" / "nightly-dep" / "summary.json").read_text())
+        assert any(b["task_id"] == "dep-A" for b in summary["dep_blocked_approved"])
+        assert db.get_task("dep-A")["status"] == "APPROVED"
     finally:
-        wmod.Worker.__init__ = orig
-    assert res.tasks_attempted == 1
-    assert res.tasks_passed == 1
-    assert any(t["task_id"] == "free-C" for t in res.task_results)
-    summary = json.loads((state_dir() / "sessions" / "nightly-dep" / "summary.json").read_text())
-    assert any(b["task_id"] == "dep-A" for b in summary["dep_blocked_approved"])
-    # dep-A is still APPROVED (not silently failed)
-    assert db.get_task("dep-A")["status"] == "APPROVED"
+        oc.OllamaClient.model_digest = orig_digest
 
 
 def test_nightly_mutation_last_and_max_one(tmp_path: Path, monkeypatch):

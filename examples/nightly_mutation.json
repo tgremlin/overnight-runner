@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "task_id": "nightly-mutation-001",
+  "title": "Rename greeting to 'howdy'",
+  "execution_class": "source_mutation",
+  "objective": "In config.py, change the literal string 'hello' to 'howdy' (one word, no other changes).",
+  "repo": { "path": "/tmp/nightly-fixture", "require_clean_tree": true },
+  "paths": {
+    "read_paths": ["config.py"],
+    "write_paths": ["config.py"],
+    "create_paths": []
+  },
+  "commands": {
+    "model_allowed_command_ids": [],
+    "required_validator_ids": ["python_compile"]
+  },
+  "limits": {
+    "max_model_turns": 8,
+    "max_tool_calls": 16,
+    "task_timeout_seconds": 300
+  },
+  "context_budget": {
+    "max_read_bytes": 4096,
+    "max_files_read": 2,
+    "max_files_written": 1
+  }
+}

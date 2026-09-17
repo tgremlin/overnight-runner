@@ -99,16 +99,18 @@ class OllamaClient:
         return ChatResult(content=content, tool_calls=tool_calls, metrics=m, raw=raw)
 
     def model_digest(self, model_name: str) -> str | None:
+        """Return the digest of an installed model via /api/tags.
+
+        /api/show does not expose digest at the top level; the digest is
+        present per-model in the /api/tags listing.
+        """
         try:
-            with urllib.request.urlopen(
-                urllib.request.Request(f"{self.host}/api/show", method="POST"),
-                # we send body below:
-                data=json.dumps({"name": model_name}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            ) as resp:
+            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            return data.get("digest")
+            for m in data.get("models", []):
+                if m.get("name") == model_name:
+                    return m.get("digest")
+            return None
         except Exception:
             return None
 
