@@ -47,9 +47,20 @@ def execute_queued_task(task_row: dict[str, Any], *, heartbeat_every: int = HEAR
     manifest = TaskManifest.model_validate(json.loads(task_row["manifest_json"]))
     repo_root = Path(manifest.repo.path).resolve()
 
+    # Dependency enforcement: every declared dep must be PASSED.
+    for dep in manifest.dependencies:
+        d = Database(default_db_path()).get_task(dep.task_id)
+        if d is None or d["status"] != TaskStatus.PASSED.value:
+            # Leave the task in PENDING_APPROVAL-equivalent state; we don't
+            # claim it. The scheduler should re-attempt later.
+            raise RuntimeError(f"dependency_unmet: {dep.task_id} not PASSED")
+
     session_id = f"sess-{uuid.uuid4().hex[:8]}"
     run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    artifact_root = state_dir() / "runs" / task_id / run_id
+    # artifact_root is the per-run directory; we pass the parent so the
+    # worker appends <task_id>/<run_id> (consistent with manual run).
+    artifact_parent = state_dir() / "runs"
+    artifact_root = artifact_parent / task_id / run_id
     artifact_root.mkdir(parents=True, exist_ok=True)
     (artifact_root / "manifest.json").write_bytes(_canonical(manifest))
 
@@ -125,7 +136,7 @@ def execute_queued_task(task_row: dict[str, Any], *, heartbeat_every: int = HEAR
     def on_mutation(entry) -> None:
         db.mark_mutation_started(run_id)
 
-    worker = Worker(artifact_root=artifact_root)
+    worker = Worker(artifact_root=artifact_parent)
     # Wrap broker's on_mutation to flag mutation_started.
     # We do this by patching after _build_broker: we instead pass via the
     # run() call indirectly by registering a hook. Simpler: subclass via
@@ -139,7 +150,7 @@ def execute_queued_task(task_row: dict[str, Any], *, heartbeat_every: int = HEAR
 
     started = time.time()
     try:
-        result = worker.run(manifest, approval=approval)
+        result = worker.run(manifest, approval=approval, artifact_dir=artifact_root)
         status = result.status
         reason_code = result.reason_code
         reason_text = result.reason_text

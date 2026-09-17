@@ -147,19 +147,27 @@ class Worker:
     # ---------- Public entrypoint: manual run (Phase 1) ----------
 
     def run(self, manifest: TaskManifest, *, dry_run: bool = False,
-            approval: Approval | None = None) -> RunResult:
+            approval: Approval | None = None,
+            artifact_dir: Path | None = None) -> RunResult:
         """Manual single-task run.
 
         If `approval` is None we derive one ONLY for ad-hoc local runs (Phase 1).
         For queued execution the caller MUST supply an independently recorded
         Approval (Phase 2 / run-next).
+
+        If `artifact_dir` is provided, the worker uses it as-is (no extra
+        nesting). Otherwise it creates artifact_root/<task_id>/<run_id>.
         """
         started = time.time()
         repo_root = Path(manifest.repo.path).resolve()
 
-        run_id = f"run-{int(started)}-{uuid.uuid4().hex[:8]}"
-        artifact_dir = self.artifact_root / manifest.task_id / run_id
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if artifact_dir is None:
+            run_id = f"run-{int(started)}-{uuid.uuid4().hex[:8]}"
+            artifact_dir = self.artifact_root / manifest.task_id / run_id
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            artifact_dir = Path(artifact_dir)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / "manifest.json").write_bytes(_canonical(manifest))
 
         result = RunResult(status="RUNNING", artifacts_dir=str(artifact_dir))
@@ -750,8 +758,11 @@ def _format_user_brief(m: TaskManifest) -> str:
         f"model_allowed_command_ids: {m.commands.model_allowed_command_ids}\n"
         f"required_validator_ids: {m.commands.required_validator_ids}\n"
         f"acceptance_criteria: {m.acceptance_criteria}\n"
-        "Begin. Make the smallest change that satisfies the objective. "
-        "When done, call report_result(disposition='DONE', summary=...)."
+        "Begin. Make the smallest change that satisfies the objective.\n"
+        "After all changes are applied, your LAST tool call must be "
+        "report_result(disposition='DONE', summary='...', evidence=[...]). "
+        "Do NOT call run_command_id with required_validator_ids — those are "
+        "run automatically by Python after you report DONE."
     )
 
 
