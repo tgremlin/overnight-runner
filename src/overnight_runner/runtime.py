@@ -12,11 +12,12 @@ from pathlib import Path
 from .safety import sha256_bytes
 
 
-DEFAULT_STATE_DIR = Path(os.environ.get("OVERNIGHT_STATE_DIR", str(Path.home() / ".local" / "state" / "overnight-runner")))
+DEFAULT_STATE_DIR_FALLBACK = Path.home() / ".local" / "state" / "overnight-runner"
 
 
 def state_dir() -> Path:
-    p = DEFAULT_STATE_DIR
+    """Read OVERNIGHT_STATE_DIR at call time so monkeypatch works."""
+    p = Path(os.environ.get("OVERNIGHT_STATE_DIR", str(DEFAULT_STATE_DIR_FALLBACK)))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -35,7 +36,8 @@ def is_paused() -> bool:
 
 def require_not_paused() -> None:
     if is_paused():
-        raise RuntimeError("PAUSED sentinel present; aborting")
+        from .safety import SafetyError
+        raise SafetyError("PAUSED sentinel present; aborting")
 
 
 @contextmanager

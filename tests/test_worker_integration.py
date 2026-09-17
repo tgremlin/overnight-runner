@@ -149,17 +149,32 @@ def test_worker_happy_path_end_to_end(tmp_path: Path):
 def test_worker_blocked_when_validator_fails(tmp_path: Path):
     repo = _init_repo_with_hello(tmp_path)
     m = _manifest(repo)
-    # Make python_compile fail by requiring a non-existent file pattern.
-    # We instead mutate the validator's argv via the broker registry.
-    from overnight_runner.broker import CommandRegistry, CommandSpec
-    reg = CommandRegistry()
-    reg.register(CommandSpec("python_compile", ["python3", "-c", "import sys; sys.exit(1)"], "argv_path", 30, "read"))
+    # Make test_hello.py syntactically broken AND commit so tree is clean at approval.
+    (repo / "test_hello.py").write_text("from hello import hello\ndef broken(:\n")
+    git_commit_all(repo, "break-syntax")
+    sha_h = sha256_file(repo / "hello.py")
     fake = FakeClient(scripts=[
-        {"tool_calls": [{"id": "t1", "function": {"name": "report_result", "arguments": {"disposition": "DONE", "summary": "done"}}}]},
+        # Propose hello.py change (so source_mutation has applied_proposals).
+        {"tool_calls": [{
+            "id": "p1", "function": {"name": "propose_patch", "arguments": {
+                "op": "replace_exact",
+                "path": "hello.py",
+                "expected_sha256": sha_h,
+                "old_text": 'return "old"',
+                "new_text": 'return "v2"',
+                "expected_occurrences": 1,
+            }}
+        }]},
+        {"tool_calls": [{
+            "id": "a1", "function": {"name": "apply_validated_patch", "arguments": {"proposal_id": "_"}}
+        }]},
+        {"tool_calls": [{
+            "id": "r1", "function": {"name": "report_result", "arguments": {"disposition": "DONE", "summary": "done"}}
+        }]},
     ])
-    w = Worker(client=fake, registry=reg)
+    w = Worker(client=fake)
     res = w.run(m)
-    assert res.status == "FAILED"
+    assert res.status == "FAILED", (res.status, res.reason_code)
     assert "VALIDATORS_FAILED" in res.reason_code
 
 

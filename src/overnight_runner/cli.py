@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .schemas import TaskManifest
-from .worker import Worker
+from .worker import Approval, Worker
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -31,7 +31,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.repo:
         m.repo.path = str(Path(args.repo).resolve())
     worker = Worker()
-    result = worker.run(m)
+    result = worker.run(m)  # Phase 1 ad-hoc; ephemeral approval
     print(json.dumps({
         "status": result.status,
         "reason_code": result.reason_code,
@@ -41,8 +41,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         "artifacts_dir": result.artifacts_dir,
         "proposal_count": result.proposal_count,
         "applied_proposal_count": result.applied_proposal_count,
+        "approval_ephemeral": result.extra.get("approval_ephemeral", True),
     }, indent=2))
-    return 0 if result.status in ("PASSED",) else 1
+    return 0 if result.status == "PASSED" else 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -64,7 +65,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    """Phase 2: validate manifest and queue into SQLite."""
     from .db import Database, default_db_path
     from .schemas import TaskStatus
     manifest_path = Path(args.manifest).resolve()
@@ -74,8 +74,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     db = Database(default_db_path())
     try:
         db.upsert_task(
-            task_id=m.task_id,
-            manifest_sha256=sha,
+            task_id=m.task_id, manifest_sha256=sha,
             manifest_json=manifest_path.read_text(),
             status=TaskStatus.PENDING_APPROVAL,
         )
@@ -87,11 +86,11 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    """Phase 2: bind approval envelope and mark APPROVED."""
+    """Record an independently-stored approval envelope and transition to APPROVED."""
     from .db import Database, default_db_path
-    from .schemas import TaskStatus
+    from .runtime import runtime_fingerprint
     from .safety import git_head
-    from .runtime import runtime_fingerprint, state_dir
+    from .schemas import TaskStatus
     db = Database(default_db_path())
     try:
         t = db.get_task(args.task_id)
@@ -111,6 +110,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 [Path(__file__).parent, Path(__file__).parent.parent / "prompts"]
             ).sha256,
             "approved_model_digest": None,
+            "approved_model_name": manifest.model_profile.model_name,
         }
         db.approve_task(args.task_id, approved_by="manual-cli", approval_envelope=env)
         db.emit_event("cli", "task_approved", task_id=args.task_id, details={"head": head})
@@ -147,48 +147,53 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 
 def cmd_run_next(args: argparse.Namespace) -> int:
-    """Phase 2: claim and run the next approved task."""
+    """Claim the next APPROVED task; run with its independently-stored envelope."""
     from .db import Database, default_db_path
-    from .schemas import TaskStatus
+    from .runner import execute_queued_task
     from .runtime import runner_lock
+    from .schemas import TaskStatus
     db = Database(default_db_path())
     try:
-        # Atomic claim: pick first APPROVED task and transition to RUNNING.
         with db.transaction() as cur:
-            cur.execute("SELECT * FROM tasks WHERE status=? ORDER BY priority ASC, created_at ASC LIMIT 1", (TaskStatus.APPROVED.value,))
+            cur.execute(
+                "SELECT * FROM tasks WHERE status=? ORDER BY priority ASC, created_at ASC LIMIT 1",
+                (TaskStatus.APPROVED.value,),
+            )
             row = cur.fetchone()
             if not row:
                 print("(no approved tasks)")
                 return 0
             task = dict(row)
-            cur.execute("UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-                        (TaskStatus.RUNNING.value, int(time.time()), task["task_id"]))
-    finally:
-        pass
-    manifest = TaskManifest.model_validate(json.loads(task["manifest_json"]))
-    try:
-        with runner_lock():
-            worker = Worker()
-            res = worker.run(manifest)
-        # Final state
-        final_status = TaskStatus(res.status)
-        db.update_status(task["task_id"], final_status,
-                         final_reason_code=res.reason_code,
-                         final_reason_text=res.reason_text)
-        db.emit_event("cli", "task_finished", task_id=task["task_id"],
-                      from_state=TaskStatus.RUNNING.value, to_state=final_status.value,
-                      details={"reason_code": res.reason_code, "reason_text": res.reason_text,
-                               "artifact_dir": res.artifacts_dir})
-        print(json.dumps({
-            "task_id": task["task_id"],
-            "status": res.status,
-            "reason_code": res.reason_code,
-            "reason_text": res.reason_text,
-            "artifacts_dir": res.artifacts_dir,
-        }, indent=2))
-        return 0 if res.status == "PASSED" else 1
+            cur.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                (TaskStatus.RUNNING.value, int(time.time()), task["task_id"]),
+            )
     finally:
         db.close()
+
+    try:
+        with runner_lock():
+            res = execute_queued_task(task)
+    except Exception as e:
+        print(f"run-next failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps({
+        "task_id": res.task_id, "run_id": res.run_id, "status": res.status,
+        "reason_code": res.reason_code, "reason_text": res.reason_text,
+        "artifact_dir": res.artifact_dir,
+    }, indent=2))
+    return 0 if res.status == "PASSED" else 1
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    from .runner import recovery_scan
+    out = recovery_scan()
+    if not out:
+        print("(no stale runs)")
+        return 0
+    print(json.dumps(out, indent=2))
+    return 0
 
 
 def _csha(m: TaskManifest) -> str:
@@ -204,27 +209,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("manifest")
     s.set_defaults(func=cmd_validate)
 
-    s = sub.add_parser("run", help="Phase 1: manually invoke a single task")
+    s = sub.add_parser("run", help="Phase 1: manually invoke a single task (ephemeral approval)")
     s.add_argument("manifest")
-    s.add_argument("--repo", default=None, help="Override repo.path")
+    s.add_argument("--repo", default=None)
     s.set_defaults(func=cmd_run)
 
-    s = sub.add_parser("import", help="(Phase 2) Validate + queue")
+    s = sub.add_parser("import", help="Phase 2: validate + queue")
     s.add_argument("manifest")
     s.set_defaults(func=cmd_import)
 
-    s = sub.add_parser("approve", help="(Phase 2) Bind approval envelope + APPROVED")
+    s = sub.add_parser("approve", help="Phase 2: record approval envelope + transition to APPROVED")
     s.add_argument("task_id")
     s.set_defaults(func=cmd_approve)
 
-    s = sub.add_parser("status", help="(Phase 2) List tasks")
+    s = sub.add_parser("status", help="Phase 2: list tasks")
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("summary", help="(Phase 2) Morning summary")
+    s = sub.add_parser("summary", help="Phase 2: morning summary")
     s.set_defaults(func=cmd_summary)
 
-    s = sub.add_parser("run-next", help="(Phase 2) Claim + run next APPROVED task")
+    s = sub.add_parser("run-next", help="Phase 2: claim + run next APPROVED task with stored envelope")
     s.set_defaults(func=cmd_run_next)
+
+    s = sub.add_parser("recover", help="Phase 2: scan for stale RUNNING runs")
+    s.set_defaults(func=cmd_recover)
 
     s = sub.add_parser("doctor", help="Check Ollama + Python")
     s.set_defaults(func=cmd_doctor)

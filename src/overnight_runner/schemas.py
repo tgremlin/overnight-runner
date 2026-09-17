@@ -111,6 +111,10 @@ class PathPolicy(StrictBase):
 class CommandPolicy(StrictBase):
     model_allowed_command_ids: list[_ID] = Field(default_factory=list)
     required_validator_ids: list[_ID] = Field(default_factory=list)
+    # If True, the manifest author accepts that zero files may change even on a
+    # source_mutation task. Default False for v1 safety: source_mutation MUST
+    # apply at least one change to PASS.
+    allow_no_mutation: bool = False
 
 
 class Limits(StrictBase):
@@ -259,8 +263,20 @@ class RunCommandArgs(StrictBase):
 class ReportResultArgs(StrictBase):
     tool: Literal["report_result"] = "report_result"
     disposition: Disposition
-    summary: str = Field(min_length=1, max_length=4000)
+    summary: str = Field(default="", max_length=4000)
     evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _coerce_evidence(cls, v):
+        # Models occasionally send a single string or None; coerce to list[str].
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        return [str(v)]
 
 
 class ToolCall(StrictBase):

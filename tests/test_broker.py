@@ -142,7 +142,9 @@ def test_run_command_id_runs_safe_fixture(repo):
     from overnight_runner.broker import CommandSpec
     reg.register(CommandSpec("true_command", ["true"], "repo", 10, "none"))
     b = Broker(repo_root=repo, registry=reg,
-               allowed_write_paths=["hello.py"], max_tool_result_bytes=10_000)
+               allowed_write_paths=["hello.py"],
+               model_allowed_command_ids=["true_command"],
+               max_tool_result_bytes=10_000)
     call = ToolCall(call_id="c1", args=RunCommandArgs(command_id="true_command"))
     out = b.handle(call)
     assert out["exit_code"] == 0
@@ -162,13 +164,11 @@ def test_dirty_worktree_detected(repo):
     assert not git_is_clean(repo)
 
 
-def test_dirty_worktree_actually_blocks_worker(repo, tmp_path):
-    """A source_mutation manifest refuses to start when the tree is dirty.
-    We assert the worker preflight path raises via a direct call."""
+def test_dirty_worktree_blocks_execution(repo):
+    """source_mutation + dirty tree -> run() must terminate before Ollama is invoked."""
     (repo / "hello.py").write_text("MODIFIED\n")
     from overnight_runner.schemas import TaskManifest
     from overnight_runner.worker import Worker
-    from overnight_runner.safety import SafetyError
     raw = {
         "schema_version": "1.0",
         "task_id": "x",
@@ -179,9 +179,16 @@ def test_dirty_worktree_actually_blocks_worker(repo, tmp_path):
         "paths": {"write_paths": ["hello.py"]},
     }
     m = TaskManifest.model_validate(raw)
-    w = Worker()
-    with pytest.raises(SafetyError):
-        w._preflight(m, repo, tmp_path)
+    called = {"chat": 0}
+    class NoChat:
+        def chat(self, profile, system, messages, tools=None):
+            called["chat"] += 1
+            raise AssertionError("Ollama must not be called when binding fails")
+    w = Worker(client=NoChat())
+    res = w.run(m)
+    assert res.status == "BLOCKED"
+    assert res.reason_code == "APPROVAL_DIRTY_WORKTREE"
+    assert called["chat"] == 0
 
 
 def test_git_escape_denied(repo):

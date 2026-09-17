@@ -39,7 +39,7 @@ def test_paused_sentinel(tmp_path: Path, monkeypatch):
     require_not_paused()
     pp.write_text("paused\n")
     assert is_paused()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception):
         require_not_paused()
     pp.unlink()
     assert not is_paused()

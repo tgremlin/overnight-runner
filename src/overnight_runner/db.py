@@ -221,6 +221,103 @@ class Database:
 
     # ---------------- Morning summary ----------------
 
+    def find_stale_runs(self, now: int, lease_window_seconds: int = 600) -> list[dict[str, Any]]:
+        """Find RUNNING runs whose lease has expired (worker disappeared).
+
+        Mutation tasks MUST NOT auto-retry; they transition to REVIEW_REQUIRED.
+        Read-only tasks MAY be retried (the caller decides).
+        """
+        cur = self._conn.execute(
+            """
+            SELECT r.* FROM runs r
+            WHERE r.status='RUNNING'
+              AND (
+                r.lease_expires_at IS NULL
+                OR r.lease_expires_at < ?
+              )
+            """,
+            (now - lease_window_seconds,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def insert_run(
+        self,
+        run_id: str,
+        task_id: str,
+        session_id: str,
+        attempt_no: int,
+        status: str,
+        started_at: int,
+        *,
+        worker_pid: int,
+        model_name: str,
+        model_digest: str | None,
+        model_profile: str,
+        lease_expires_at: int,
+        pre_repo_head: str,
+        pre_worktree_sha256: str,
+        artifact_dir: str,
+        mutation_started: bool = False,
+    ) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO runs (
+                    run_id, task_id, session_id, attempt_no, status, started_at,
+                    worker_pid, model_name, model_digest, model_profile,
+                    lease_owner, heartbeat_at, lease_expires_at,
+                    pre_repo_head, pre_worktree_sha256, mutation_started, artifact_dir
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    run_id, task_id, session_id, attempt_no, status, started_at,
+                    worker_pid, model_name, model_digest, model_profile,
+                    f"pid:{worker_pid}", started_at, lease_expires_at,
+                    pre_repo_head, pre_worktree_sha256, int(mutation_started), artifact_dir,
+                ),
+            )
+
+    def heartbeat(self, run_id: str, now: int, lease_expires_at: int,
+                  *, prompt_eval_count: int = 0, eval_count: int = 0,
+                  total_ns: int = 0, eval_ns: int = 0,
+                  model_calls: int | None = None, tool_calls: int | None = None) -> None:
+        sets = ["heartbeat_at=?", "lease_expires_at=?"]
+        vals: list[Any] = [now, lease_expires_at]
+        for k, v in (("prompt_eval_count", prompt_eval_count), ("eval_count", eval_count),
+                     ("ollama_total_duration_ns", total_ns), ("ollama_eval_duration_ns", eval_ns)):
+            sets.append(f"{k}=?")
+            vals.append(v)
+        if model_calls is not None:
+            sets.append("model_calls=?"); vals.append(model_calls)
+        if tool_calls is not None:
+            sets.append("tool_calls=?"); vals.append(tool_calls)
+        vals.append(run_id)
+        self._conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id=?", vals)
+
+    def mark_mutation_started(self, run_id: str) -> None:
+        self._conn.execute("UPDATE runs SET mutation_started=1 WHERE run_id=?", (run_id,))
+
+    def finish_run(self, run_id: str, status: str, now: int, *,
+                   post_worktree_sha256: str | None = None,
+                   error_code: str | None = None,
+                   error_text: str | None = None,
+                   wall_duration_ms: int | None = None) -> None:
+        sets = ["status=?", "finished_at=?"]
+        vals: list[Any] = [status, now]
+        if post_worktree_sha256 is not None:
+            sets.append("post_worktree_sha256=?")
+            vals.append(post_worktree_sha256)
+        if error_code is not None:
+            sets.append("error_code=?"); vals.append(error_code)
+        if error_text is not None:
+            sets.append("error_text=?"); vals.append(error_text)
+        if wall_duration_ms is not None:
+            sets.append("wall_duration_ms=?"); vals.append(wall_duration_ms)
+        vals.append(run_id)
+        self._conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id=?", vals)
+
+    # ---------------- Summary ----------------
+
     def summary(self) -> dict[str, Any]:
         cur = self._conn.execute(
             "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"

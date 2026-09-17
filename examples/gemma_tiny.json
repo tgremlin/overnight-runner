@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "task_id": "gemma-tiny-001",
+  "title": "Add a polite greeting",
+  "execution_class": "source_mutation",
+  "objective": "Change greet() in greet.py to return the string 'hello, ' + name (note the comma). Update test_greet.py so its assertion matches.",
+  "repo": { "path": "/tmp/gemma-fixture", "require_clean_tree": true },
+  "paths": {
+    "read_paths": ["greet.py", "test_greet.py"],
+    "write_paths": ["greet.py", "test_greet.py"],
+    "create_paths": []
+  },
+  "commands": {
+    "model_allowed_command_ids": ["git_diff_check", "git_status"],
+    "required_validator_ids": ["python_compile"]
+  },
+  "limits": {
+    "max_model_turns": 12,
+    "max_tool_calls": 24,
+    "task_timeout_seconds": 600
+  },
+  "context_budget": {
+    "max_read_bytes": 16384,
+    "max_files_read": 4,
+    "max_files_written": 2
+  },
+  "acceptance_criteria": [
+    "greet.py returns 'hello, world' for greet('world')",
+    "test_greet.py asserts the new format",
+    "python_compile passes on both files"
+  ]
+}
