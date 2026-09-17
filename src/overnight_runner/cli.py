@@ -25,13 +25,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """Phase 1 manual invocation. Held under the global runner lock so a
+    human run cannot overlap a systemd-timer run.
+    """
+    from .runtime import runner_lock
     manifest_path = Path(args.manifest).resolve()
     raw = json.loads(manifest_path.read_text())
     m = TaskManifest.model_validate(raw)
     if args.repo:
         m.repo.path = str(Path(args.repo).resolve())
     worker = Worker()
-    result = worker.run(m)  # Phase 1 ad-hoc; ephemeral approval
+    try:
+        with runner_lock():
+            result = worker.run(m)  # Phase 1 ad-hoc; ephemeral approval
+    except RuntimeError as e:
+        print(f"runner lock: {e}", file=sys.stderr)
+        return 4
     print(json.dumps({
         "status": result.status,
         "reason_code": result.reason_code,
@@ -77,17 +86,25 @@ def cmd_import(args: argparse.Namespace) -> int:
             task_id=m.task_id, manifest_sha256=sha,
             manifest_json=manifest_path.read_text(),
             status=TaskStatus.PENDING_APPROVAL,
+            execution_class=m.execution_class.value,
+            dependencies_json=json.dumps([d.model_dump(mode="json") for d in m.dependencies]),
         )
-        db.emit_event("cli", "task_imported", task_id=m.task_id, details={"sha256": sha})
+        db.emit_event("cli", "task_imported", task_id=m.task_id,
+                      details={"sha256": sha, "execution_class": m.execution_class.value})
     finally:
         db.close()
-    print(f"imported task_id={m.task_id} sha256={sha} status=PENDING_APPROVAL")
+    print(f"imported task_id={m.task_id} sha256={sha} status=PENDING_APPROVAL class={m.execution_class.value}")
     return 0
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    """Record an independently-stored approval envelope and transition to APPROVED."""
+    """Record an independently-stored approval envelope and transition to APPROVED.
+
+    Resolves model digest via Ollama. Refuses approval if model cannot be
+    resolved or digest has changed since import.
+    """
     from .db import Database, default_db_path
+    from .ollama_client import OllamaClient
     from .runtime import runtime_fingerprint
     from .safety import git_head
     from .schemas import TaskStatus
@@ -103,20 +120,31 @@ def cmd_approve(args: argparse.Namespace) -> int:
         if not head:
             print("repo has no commits", file=sys.stderr)
             return 2
+        # Resolve model digest.
+        client = OllamaClient()
+        digest = client.model_digest(manifest.model_profile.model_name)
+        if not digest:
+            print(
+                f"refusing to approve: model {manifest.model_profile.model_name!r} not installed in Ollama",
+                file=sys.stderr,
+            )
+            return 3
         env = {
             "manifest_sha256": t["manifest_sha256"],
             "approved_repo_head": head,
             "approved_runtime_sha256": runtime_fingerprint(
                 [Path(__file__).parent, Path(__file__).parent.parent / "prompts"]
             ).sha256,
-            "approved_model_digest": None,
             "approved_model_name": manifest.model_profile.model_name,
+            "approved_model_digest": digest,
         }
         db.approve_task(args.task_id, approved_by="manual-cli", approval_envelope=env)
-        db.emit_event("cli", "task_approved", task_id=args.task_id, details={"head": head})
+        db.emit_event("cli", "task_approved", task_id=args.task_id,
+                      details={"head": head, "model": manifest.model_profile.model_name,
+                               "digest": digest})
     finally:
         db.close()
-    print(f"approved task_id={args.task_id}")
+    print(f"approved task_id={args.task_id} model={manifest.model_profile.model_name} digest={digest[:12]}")
     return 0
 
 
@@ -147,41 +175,28 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 
 def cmd_run_next(args: argparse.Namespace) -> int:
-    """Claim the next APPROVED task; run with its independently-stored envelope."""
+    """Claim and run the next eligible APPROVED task under the global lock."""
     from .db import Database, default_db_path
-    from .runner import execute_queued_task
+    from .runner import execute_claimed_task
     from .runtime import runner_lock
     from .schemas import TaskStatus
-    db = Database(default_db_path())
-    try:
-        with db.transaction() as cur:
-            cur.execute(
-                "SELECT * FROM tasks WHERE status=? ORDER BY priority ASC, created_at ASC LIMIT 1",
-                (TaskStatus.APPROVED.value,),
-            )
-            row = cur.fetchone()
-            if not row:
-                print("(no approved tasks)")
-                return 0
-            task = dict(row)
-            cur.execute(
-                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-                (TaskStatus.RUNNING.value, int(time.time()), task["task_id"]),
-            )
-    finally:
-        db.close()
-
     try:
         with runner_lock():
-            res = execute_queued_task(task)
-    except Exception as e:
-        print(f"run-next failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return 1
-
+            db = Database(default_db_path())
+            try:
+                res = execute_claimed_task(db, execution_class_filter=None)
+            finally:
+                db.close()
+    except RuntimeError as e:
+        print(f"runner lock: {e}", file=sys.stderr)
+        return 4
+    if res is None:
+        print("(no eligible approved task)")
+        return 0
     print(json.dumps({
-        "task_id": res.task_id, "run_id": res.run_id, "status": res.status,
-        "reason_code": res.reason_code, "reason_text": res.reason_text,
-        "artifact_dir": res.artifact_dir,
+        "task_id": res.task_id, "run_id": res.run_id, "attempt": res.attempt_no,
+        "status": res.status, "reason_code": res.reason_code,
+        "reason_text": res.reason_text, "artifact_dir": res.artifact_dir,
     }, indent=2))
     return 0 if res.status == "PASSED" else 1
 
@@ -193,6 +208,43 @@ def cmd_recover(args: argparse.Namespace) -> int:
         print("(no stale runs)")
         return 0
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_run_nightly(args: argparse.Namespace) -> int:
+    """Run the full nightly session under the global runner lock."""
+    from .db import Database, default_db_path
+    from .runner import run_nightly
+    from .runtime import runner_lock
+    session_id = args.session_id or None
+    try:
+        with runner_lock():
+            db = Database(default_db_path())
+            try:
+                db.close()
+            except Exception:
+                pass
+            res = run_nightly(session_id=session_id)
+    except RuntimeError as e:
+        print(f"runner lock: {e}", file=sys.stderr)
+        return 4
+    summary_dir = Path.home() / ".local" / "state" / "overnight-runner" / "sessions" / res.session_id
+    print(json.dumps({
+        "session_id": res.session_id,
+        "started_at": res.started_at,
+        "finished_at": res.finished_at,
+        "wall_duration_seconds": int(res.finished_at - res.started_at),
+        "stop_reason": res.stop_reason,
+        "tasks_attempted": res.tasks_attempted,
+        "tasks_passed": res.tasks_passed,
+        "tasks_failed": res.tasks_failed,
+        "tasks_blocked": res.tasks_blocked,
+        "tasks_review_required": res.tasks_review_required,
+        "read_only_attempted": res.read_only_attempted,
+        "mutation_attempted": res.mutation_attempted,
+        "summary_dir": str(summary_dir),
+    }, indent=2))
+    print(f"summary written to: {summary_dir}/summary.json and summary.md", file=sys.stderr)
     return 0
 
 
@@ -228,10 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("summary", help="Phase 2: morning summary")
     s.set_defaults(func=cmd_summary)
 
-    s = sub.add_parser("run-next", help="Phase 2: claim + run next APPROVED task with stored envelope")
+    s = sub.add_parser("run-next", help="Phase 2: claim + run next eligible APPROVED task under global lock")
     s.set_defaults(func=cmd_run_next)
 
-    s = sub.add_parser("recover", help="Phase 2: scan for stale RUNNING runs")
+    s = sub.add_parser("run-nightly", help="Run the full nightly session under global lock")
+    s.add_argument("--session-id", default=None, help="Override session id")
+    s.set_defaults(func=cmd_run_nightly)
+
+    s = sub.add_parser("recover", help="Phase 2: scan for stale RUNNING runs + orphan RUNNING tasks")
     s.set_defaults(func=cmd_recover)
 
     s = sub.add_parser("doctor", help="Check Ollama + Python")

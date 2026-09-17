@@ -148,7 +148,8 @@ class Worker:
 
     def run(self, manifest: TaskManifest, *, dry_run: bool = False,
             approval: Approval | None = None,
-            artifact_dir: Path | None = None) -> RunResult:
+            artifact_dir: Path | None = None,
+            on_metrics=None) -> RunResult:
         """Manual single-task run.
 
         If `approval` is None we derive one ONLY for ad-hoc local runs (Phase 1).
@@ -157,6 +158,9 @@ class Worker:
 
         If `artifact_dir` is provided, the worker uses it as-is (no extra
         nesting). Otherwise it creates artifact_root/<task_id>/<run_id>.
+
+        If `on_metrics(snapshot)` is provided, it is called after each Ollama
+        turn with cumulative metric counters. Worker is decoupled from DB.
         """
         started = time.time()
         repo_root = Path(manifest.repo.path).resolve()
@@ -188,7 +192,8 @@ class Worker:
             require_not_paused()
 
             # Bind checks. Any mismatch invalidates approval BEFORE Ollama.
-            mismatch = _bind_check(manifest, approval, repo_root, self.runtime_roots)
+            mismatch = _bind_check(manifest, approval, repo_root, self.runtime_roots,
+                                   digest_resolver=self.model_digest_resolver)
             if mismatch:
                 _append_evidence(artifact_dir, "approval_invalidated", mismatch)
                 result.status = "BLOCKED"
@@ -261,6 +266,17 @@ class Worker:
                     "content": chat.content[:4000],
                     "tool_calls": chat.tool_calls,
                 })
+                if on_metrics is not None:
+                    try:
+                        on_metrics({
+                            "prompt_eval_count": chat.metrics.prompt_eval_count,
+                            "eval_count": chat.metrics.eval_count,
+                            "ollama_total_duration_ns": chat.metrics.total_duration_ns,
+                            "ollama_eval_duration_ns": chat.metrics.eval_duration_ns,
+                            "model_calls": 1,
+                        })
+                    except Exception:
+                        pass
 
                 if chat.tool_calls:
                     tool_messages: list[dict[str, Any]] = []
@@ -271,6 +287,11 @@ class Worker:
                             continue
                         total_calls += 1
                         result.tool_calls = total_calls
+                        if on_metrics is not None:
+                            try:
+                                on_metrics({"tool_calls": 1})
+                            except Exception:
+                                pass
                         try:
                             tc_args = tc.get("function", {}).get("arguments", {})
                             if isinstance(tc_args, str):
@@ -485,18 +506,36 @@ def _finalise(
             if vid == "no_op" or vid == "noop":
                 continue
         # Registry-backed validator (worker can run them; model cannot).
+        # Use the same owned-process-group helper the broker uses for
+        # model-invoked commands so timeouts kill only the validator's pgid.
         spec = broker.registry.get(vid)
+        # Non-mutating validators: capture worktree fingerprint for drift check.
+        from .safety import git_worktree_sha
+        pre_wt = None
+        if spec.side_effects in ("none", "read"):
+            pre_wt = git_worktree_sha(repo_root)
         try:
-            import subprocess
-            proc = subprocess.run(
-                spec.argv, cwd=repo_root, capture_output=True, text=True,
-                timeout=spec.timeout_seconds, shell=False,
-            )
+            from .broker import _spawn_own_pgrp, _TimeoutExpired
+            if pre_wt is not None:
+                proc = _spawn_own_pgrp(list(spec.argv), cwd=repo_root,
+                                       timeout=spec.timeout_seconds)
+            else:
+                # For mutating validators we don't capture pre/post; allow
+                # them through the safe primitive too. They get a new pgid
+                # so a runaway can be killed precisely.
+                proc = _spawn_own_pgrp(list(spec.argv), cwd=repo_root,
+                                       timeout=spec.timeout_seconds)
             (artifact_dir / "commands" / vid).mkdir(parents=True, exist_ok=True)
             (artifact_dir / "commands" / vid / "stdout.txt").write_text(proc.stdout or "")
             (artifact_dir / "commands" / vid / "stderr.txt").write_text(proc.stderr or "")
             if proc.returncode != 0:
                 failures.append(f"{vid} exit={proc.returncode}")
+            if pre_wt is not None:
+                post_wt = git_worktree_sha(repo_root)
+                if pre_wt != post_wt:
+                    failures.append(f"{vid} non_mutating_command_drift ({pre_wt[:8]}->{post_wt[:8]})")
+        except _TimeoutExpired as e:
+            failures.append(f"{vid} timed_out: {e}")
         except Exception as e:
             failures.append(f"{vid} error={type(e).__name__}: {e}")
 
@@ -518,8 +557,16 @@ def _bind_check(
     approval: Approval,
     repo_root: Path,
     runtime_roots: list[Path],
+    *,
+    current_model_digest: str | None = None,
+    digest_resolver=None,
 ) -> str:
-    """Return '' if all bind values match; otherwise a precise reason code."""
+    """Return '' if all bind values match; otherwise a precise reason code.
+
+    If `digest_resolver` is supplied it is called as digest_resolver(name) to
+    resolve the current installed model digest; the result is compared to
+    approval.approved_model_digest when the latter is non-None.
+    """
     if canonical_sha(manifest) != approval.manifest_sha256:
         return "APPROVAL_MANIFEST_CHANGED"
     cur_head = git_head(repo_root)
@@ -528,8 +575,16 @@ def _bind_check(
     cur_rt = runtime_fingerprint(runtime_roots).sha256
     if cur_rt != approval.approved_runtime_sha256:
         return "APPROVAL_RUNTIME_CHANGED"
-    if approval.approved_model_digest and manifest.model_profile.model_name != approval.approved_model_name:
-        return "APPROVAL_MODEL_CHANGED"
+    if approval.approved_model_digest:
+        if manifest.model_profile.model_name != approval.approved_model_name:
+            return "APPROVAL_MODEL_CHANGED"
+        if digest_resolver is not None and approval.approved_model_digest:
+            try:
+                cur_digest = digest_resolver(manifest.model_profile.model_name)
+            except Exception:
+                cur_digest = None
+            if cur_digest is not None and cur_digest != approval.approved_model_digest:
+                return "APPROVAL_MODEL_CHANGED"
     if manifest.execution_class == ExecutionClass.SOURCE_MUTATION and manifest.repo.require_clean_tree:
         if not git_is_clean(repo_root):
             return "APPROVAL_DIRTY_WORKTREE"

@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     manifest_json TEXT NOT NULL,
     status TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 100,
+    execution_class TEXT NOT NULL DEFAULT 'read_only',
+    dependencies_json TEXT NOT NULL DEFAULT '[]',
+    run_id TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     approved_at INTEGER,
@@ -29,11 +32,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     approved_manifest_sha256 TEXT,
     approved_repo_head TEXT,
     approved_runtime_sha256 TEXT,
+    approved_model_name TEXT,
     approved_model_digest TEXT,
     final_reason_code TEXT,
     final_reason_text TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS tasks_priority ON tasks(priority, created_at);
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
@@ -123,20 +128,27 @@ class Database:
         manifest_json: str,
         status: TaskStatus,
         priority: int = 100,
+        execution_class: str = "read_only",
+        dependencies_json: str = "[]",
     ) -> None:
         now = int(time.time())
         with self.transaction() as cur:
             cur.execute(
                 """
-                INSERT INTO tasks (task_id, manifest_sha256, manifest_json, status, priority, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (
+                    task_id, manifest_sha256, manifest_json, status, priority,
+                    execution_class, dependencies_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     manifest_sha256=excluded.manifest_sha256,
                     manifest_json=excluded.manifest_json,
                     status=excluded.status,
+                    execution_class=COALESCE(NULLIF(excluded.execution_class, ''), tasks.execution_class),
+                    dependencies_json=COALESCE(NULLIF(excluded.dependencies_json, ''), tasks.dependencies_json),
                     updated_at=excluded.updated_at
                 """,
-                (task_id, manifest_sha256, manifest_json, status.value, priority, now, now),
+                (task_id, manifest_sha256, manifest_json, status.value, priority,
+                 execution_class, dependencies_json, now, now),
             )
 
     def update_status(self, task_id: str, status: TaskStatus, **fields: Any) -> None:
@@ -172,6 +184,7 @@ class Database:
                     approved_manifest_sha256=?,
                     approved_repo_head=?,
                     approved_runtime_sha256=?,
+                    approved_model_name=?,
                     approved_model_digest=?,
                     updated_at=?
                 WHERE task_id=?
@@ -183,6 +196,7 @@ class Database:
                     approval_envelope.get("manifest_sha256"),
                     approval_envelope.get("approved_repo_head"),
                     approval_envelope.get("approved_runtime_sha256"),
+                    approval_envelope.get("approved_model_name"),
                     approval_envelope.get("approved_model_digest"),
                     int(time.time()),
                     task_id,
@@ -221,8 +235,11 @@ class Database:
 
     # ---------------- Morning summary ----------------
 
-    def find_stale_runs(self, now: int, lease_window_seconds: int = 600) -> list[dict[str, Any]]:
+    def find_stale_runs(self, now: int) -> list[dict[str, Any]]:
         """Find RUNNING runs whose lease has expired (worker disappeared).
+
+        Strict semantics: lease_expires_at < now means stale. The lease window
+        already provides the grace interval. No extra hidden grace.
 
         Mutation tasks MUST NOT auto-retry; they transition to REVIEW_REQUIRED.
         Read-only tasks MAY be retried (the caller decides).
@@ -236,7 +253,142 @@ class Database:
                 OR r.lease_expires_at < ?
               )
             """,
-            (now - lease_window_seconds,),
+            (now,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def find_orphan_running_tasks(self) -> list[dict[str, Any]]:
+        """Find tasks stuck in RUNNING with no active RUNNING runs row.
+
+        This is a legacy/edge-case safety net. The atomic claim in
+        `claim_next_approved` should make this impossible going forward.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT t.* FROM tasks t
+            WHERE t.status='RUNNING'
+              AND NOT EXISTS (
+                SELECT 1 FROM runs r
+                WHERE r.task_id = t.task_id AND r.status='RUNNING'
+              )
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def claim_next_approved(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        attempt_no: int,
+        worker_pid: int,
+        model_name: str,
+        model_digest: str | None,
+        model_profile_json: str,
+        now: int,
+        lease_expires_at: int,
+        artifact_dir: str,
+        execution_class_filter: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically: pick eligible APPROVED task, create RUNNING runs row,
+        transition task APPROVED -> RUNNING.
+
+        Returns the joined claim record (task row + run row fields) or None
+        if nothing eligible. Eligibility = status=APPROVED AND all declared
+        dependencies have status=PASSED.
+        """
+        where_extra = ""
+        params: list[Any] = []
+        if execution_class_filter:
+            placeholders = ",".join("?" for _ in execution_class_filter)
+            where_extra = f" AND t.execution_class IN ({placeholders})"
+            params.extend(execution_class_filter)
+        with self.transaction() as cur:
+            cur.execute(
+                f"""
+                SELECT t.* FROM tasks t
+                WHERE t.status='APPROVED'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(t.dependencies_json) d
+                    WHERE d.required_state='PASSED'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tasks dep
+                        WHERE dep.task_id = d.task_id AND dep.status='PASSED'
+                      )
+                  )
+                  {where_extra}
+                ORDER BY t.priority ASC, t.created_at ASC
+                LIMIT 1
+                """,
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            task = dict(row)
+            # Transition task RUNNING.
+            cur.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=? AND status='APPROVED'",
+                (TaskStatus.RUNNING.value, now, task["task_id"]),
+            )
+            if cur.rowcount != 1:
+                return None  # Lost the race.
+            # Insert RUNNING runs row.
+            cur.execute(
+                """
+                INSERT INTO runs (
+                    run_id, task_id, session_id, attempt_no, status, started_at,
+                    worker_pid, model_name, model_digest, model_profile,
+                    lease_owner, heartbeat_at, lease_expires_at,
+                    pre_repo_head, pre_worktree_sha256, mutation_started, artifact_dir
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    run_id, task["task_id"], session_id, attempt_no, "RUNNING", now,
+                    worker_pid, model_name, model_digest, model_profile_json,
+                    f"pid:{worker_pid}", now, lease_expires_at,
+                    task["approved_repo_head"], "", 0, artifact_dir,
+                ),
+            )
+            cur.execute(
+                "UPDATE tasks SET run_id=? WHERE task_id=?",
+                (run_id, task["task_id"]),
+            )
+        return {"task": task, "run_id": run_id, "attempt_no": attempt_no}
+
+    def increment_attempt_for_task(self, task_id: str) -> int:
+        """Return next attempt_no for this task (1, 2, ...)."""
+        cur = self._conn.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) AS m FROM runs WHERE task_id=?",
+            (task_id,),
+        )
+        return int(cur.fetchone()["m"]) + 1
+
+    def get_dep_blocked_approved(self) -> list[dict[str, Any]]:
+        """List APPROVED tasks with at least one unmet dependency."""
+        cur = self._conn.execute(
+            """
+            SELECT t.task_id,
+                   (SELECT GROUP_CONCAT(json_extract(d.value, '$.task_id'))
+                      FROM json_each(t.dependencies_json) d
+                    WHERE json_extract(d.value, '$.required_state')='PASSED'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tasks dep
+                        WHERE dep.task_id = json_extract(d.value, '$.task_id')
+                          AND dep.status='PASSED'
+                      )) AS blocked_by
+            FROM tasks t
+            WHERE t.status='APPROVED'
+              AND EXISTS (
+                SELECT 1 FROM json_each(t.dependencies_json) d
+                WHERE json_extract(d.value, '$.required_state')='PASSED'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tasks dep
+                    WHERE dep.task_id = json_extract(d.value, '$.task_id')
+                      AND dep.status='PASSED'
+                  )
+              )
+            """
         )
         return [dict(r) for r in cur.fetchall()]
 

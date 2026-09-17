@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env python3 -m overnight_runner.cli run-next
+ExecStart=/usr/bin/env python3 -m overnight_runner.cli run-nightly
 Restart=no
 RuntimeMaxSec=29700
 TimeoutStopSec=60
