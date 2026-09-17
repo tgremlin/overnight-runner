@@ -27,7 +27,7 @@ from overnight_runner.runtime import (
     is_paused, lock_path, paused_path, runner_lock, state_dir,
 )
 from overnight_runner.runner import (
-    DEFAULT_NIGHTLY, LEASE_SECONDS, _atomic_claim, execute_claimed_task,
+    DEFAULT_NIGHTLY, LEASE_SECONDS, execute_claimed_task,
     recovery_scan, run_nightly,
 )
 from overnight_runner.safety import git_commit_all, git_init_empty, sha256_file
@@ -84,7 +84,10 @@ def test_atomic_claim_creates_running_runs_row(tmp_path: Path):
     db = Database(default_db_path())
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     _enqueue(db, m, head=head, rt="x")
-    claim = _atomic_claim(db, execution_class_filter=None, session_id=None)
+    claim = db.claim_next_approved(
+            run_id=f"r-{int(time.time()*1e6)}-x", session_id="sess", worker_pid=1,
+            model_profile_json="{}", now=__import__("time").time_ns()//1_000_000_000, lease_expires_at=0,
+        )
     assert claim is not None
     assert claim["run_id"]
     t = db.get_task("ac-1")
@@ -97,7 +100,10 @@ def test_atomic_claim_creates_running_runs_row(tmp_path: Path):
 
 def test_atomic_claim_returns_none_when_no_eligible(tmp_path: Path):
     db = Database(default_db_path())
-    assert _atomic_claim(db, execution_class_filter=None, session_id=None) is None
+    assert db.claim_next_approved(
+            run_id=f"r-{int(time.time()*1e6)}-x", session_id="sess", worker_pid=1,
+            model_profile_json="{}", now=__import__("time").time_ns()//1_000_000_000, lease_expires_at=0,
+        ) is None
 
 
 # ---------- Lock before claim ----------
@@ -159,7 +165,10 @@ def test_dependency_blocked_task_skipped_independent_runs(tmp_path: Path):
     db.approve_task("C", approved_by="t", approval_envelope={
         "manifest_sha256": sha_c, "approved_repo_head": head,
         "approved_runtime_sha256": rt, "approved_model_name": "gemma4:12b", "approved_model_digest": "d"})
-    claim = _atomic_claim(db, execution_class_filter=None, session_id=None)
+    claim = db.claim_next_approved(
+            run_id=f"r-{int(time.time()*1e6)}-x", session_id="sess", worker_pid=1,
+            model_profile_json="{}", now=__import__("time").time_ns()//1_000_000_000, lease_expires_at=0,
+        )
     assert claim is not None
     assert claim["task"]["task_id"] == "C"
     assert db.get_task("A")["status"] == "APPROVED"
@@ -653,7 +662,10 @@ def test_attempt_number_increments_on_retry(tmp_path: Path, monkeypatch):
         "approved_runtime_sha256": "x", "approved_model_name": "gemma4:12b",
         "approved_model_digest": "d"})
     # First claim -> attempt 1
-    c1 = _atomic_claim(db, execution_class_filter=None, session_id=None)
+    c1 = db.claim_next_approved(
+            run_id=f"r-{int(time.time()*1e6)}-x", session_id="sess", worker_pid=1,
+            model_profile_json="{}", now=__import__("time").time_ns()//1_000_000_000, lease_expires_at=0,
+        )
     assert c1["attempt_no"] == 1
     # Mark finished; reset task to APPROVED for retry simulation.
     db.finish_run(c1["run_id"], "PASSED", int(time.time()))
@@ -663,5 +675,8 @@ def test_attempt_number_increments_on_retry(tmp_path: Path, monkeypatch):
     # Actually we want to test attempt_no in the runs row. Just trigger claim again:
     # need to set status APPROVED first.
     db._conn.execute("UPDATE tasks SET status='APPROVED', run_id=NULL WHERE task_id='an-1'")
-    c2 = _atomic_claim(db, execution_class_filter=None, session_id=None)
+    c2 = db.claim_next_approved(
+            run_id=f"r-{int(time.time()*1e6)}-x", session_id="sess", worker_pid=1,
+            model_profile_json="{}", now=__import__("time").time_ns()//1_000_000_000, lease_expires_at=0,
+        )
     assert c2["attempt_no"] == 2

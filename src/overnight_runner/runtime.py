@@ -82,31 +82,46 @@ class FingerprintResult:
     files: int
 
 
+# File extensions that count as runtime source for the security fingerprint.
+# Anything else (pycache, .pyc, etc.) is excluded so regenerating bytecode
+# does not change the fingerprint.
+_RUNTIME_SOURCE_SUFFIXES = {".py", ".toml", ".md", ".txt", ".json", ".yaml", ".yml"}
+# Directories that are NEVER security-relevant runtime source.
+_EXCLUDE_DIR_NAMES = {"__pycache__", ".git", ".tox", "node_modules", ".venv", "venv"}
+
+
+def _is_runtime_source(p: Path) -> bool:
+    if not p.is_file():
+        return False
+    if any(part in _EXCLUDE_DIR_NAMES for part in p.parts):
+        return False
+    return p.suffix.lower() in _RUNTIME_SOURCE_SUFFIXES or p.name in {"config.toml", "prompts"}
+
+
 def runtime_fingerprint(file_roots: list[Path]) -> FingerprintResult:
-    """Deterministic SHA-256 over (sorted_path, file_sha256) pairs.
+    """Deterministic SHA-256 over (sorted_relative_path, file_sha256) pairs.
 
     Used to detect changes in:
-      - schemas.py, broker.py, worker.py, ollama_client.py, config.toml, prompts/*
+      - overnight_runner source files (.py)
+      - top-level config files (config.toml)
+      - prompts/* (text content)
+
+    Excludes: __pycache__/, *.pyc, .git/, virtualenvs, node_modules.
     """
     pairs: list[tuple[str, str]] = []
     for root in file_roots:
         if not root.exists():
             continue
         if root.is_file():
-            try:
-                rel = str(root)
-                pairs.append((rel, sha256_bytes(root.read_bytes())))
-            except OSError:
-                continue
+            if _is_runtime_source(root):
+                pairs.append((root.name, sha256_bytes(root.read_bytes())))
             continue
         for p in sorted(root.rglob("*")):
-            if not p.is_file():
-                continue
-            try:
-                rel = str(p)
+            if _is_runtime_source(p):
+                # Use POSIX relative path so fingerprint is independent of
+                # installation prefix.
+                rel = p.relative_to(root).as_posix()
                 pairs.append((rel, sha256_bytes(p.read_bytes())))
-            except OSError:
-                continue
     h = hashlib.sha256()
     for rel, sha in pairs:
         h.update(rel.encode("utf-8"))

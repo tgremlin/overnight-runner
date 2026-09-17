@@ -31,9 +31,45 @@ overnight-runner run path/to/manifest.json --repo path/to/test-repo
 overnight-runner import path/to/manifest.json        # Phase 2
 overnight-runner approve <task-id>                    # Phase 2
 overnight-runner run-next                             # Phase 2
+overnight-runner run-nightly                          # Phase 2 (8 h session)
 overnight-runner status                               # Phase 2
 overnight-runner summary                              # Phase 2
+overnight-runner recover                              # Phase 2 (stale/orphan recovery)
 ```
+
+## Phase 2 status
+
+**READY FOR CONTROLLED REAL-PROJECT TRIAL.**
+
+Not yet production-proven. Not yet fully autonomous. The next phase is
+empirical testing in real repositories:
+
+1. **Trial 1**: real repository, READ-ONLY contracts only.
+2. **Trial 2**: real repository, harmless test or documentation mutation.
+3. **Trial 3**: small mechanical source mutation.
+
+Only after evidence from those should the architecture change.
+
+See `docs/SPRINT_REPORT.md` for the full capability matrix and the
+recommended trial sequence.
+
+## Operational modes
+
+### `run <manifest>` (manual / debug)
+- Ephemeral approval (no digest binding, no persistent approval envelope).
+- Holds the global runner lock so a human invocation cannot overlap a
+  systemd run.
+- NOT intended for unattended operation.
+
+### `import -> approve -> run-next` or `run-nightly` (durable / unattended)
+- Independently stored approval envelope binds: manifest SHA, repo HEAD,
+  runtime fingerprint, model name + digest.
+- Atomic claim creates the `runs` row in the SAME transaction that
+  transitions the task APPROVED -> RUNNING.
+- Heartbeat thread (own DB connection) extends the lease while the worker
+  runs.
+- Mutations are last, never chained, and stopped immediately after.
+- PAUSED sentinel stops new tasks cleanly without deleting the sentinel.
 
 ## Runtime layout
 

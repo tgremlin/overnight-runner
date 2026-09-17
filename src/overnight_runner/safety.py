@@ -129,43 +129,66 @@ def git_head(repo_root: Path) -> str:
 
 
 def git_is_clean(repo_root: Path) -> bool:
-    """True iff `git status --porcelain` is empty."""
+    """True iff `git status --porcelain` is empty (ignoring ignored files).
+
+    Tracked-file changes, deletions, and non-ignored untracked files all
+    count as DIRTY. Ignored files do NOT make the tree dirty.
+    """
     try:
+        # --ignored shows ignored entries too; we then drop lines whose
+        # status column starts with '!!' (ignored) before checking.
         out = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["git", "status", "--porcelain", "--ignored"],
             cwd=repo_root,
             capture_output=True,
             text=True,
             check=True,
         )
-    except subprocess.CalledProcessError:
-        # If git fails, treat as not-clean (safer).
+    except subprocess.CalledError if False else subprocess.CalledProcessError:
         return False
-    return out.stdout.strip() == ""
+    lines = out.stdout.splitlines()
+    non_ignored = [ln for ln in lines if not ln.startswith("!!")]
+    return len(non_ignored) == 0
 
 
 def git_worktree_sha(repo_root: Path) -> str:
-    """Hash of the entire working-tree state (HEAD + dirty files content).
+    """Deterministic fingerprint of working-tree state including untracked.
 
-    Used to detect unauthorized changes between approval and execution.
+    Hashes (sorted):
+      - each TRACKED file's path + content (ls-files)
+      - each non-ignored UNTRACKED file's path + content (ls-files --others
+        --exclude-standard, ignoring .git/ internals)
+
+    This is the canonical before/after fingerprint used to detect drift
+    caused by a non-mutating command (e.g. untracked file creation).
     """
-    files: list[str] = []
+    h = hashlib.sha256()
     try:
+        # Tracked files
         out = subprocess.run(
             ["git", "ls-files", "-z"],
-            cwd=repo_root,
-            capture_output=True,
-            check=True,
+            cwd=repo_root, capture_output=True, check=True,
         )
-        files = [f for f in out.stdout.split(b"\x00") if f]
+        tracked = [f for f in out.stdout.split(b"\x00") if f]
     except subprocess.CalledProcessError:
-        pass
+        tracked = []
 
-    h = hashlib.sha256()
-    for raw in sorted(files):
+    try:
+        # Non-ignored untracked files (--exclude-standard respects .gitignore)
+        out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=repo_root, capture_output=True, check=True,
+        )
+        untracked = [f for f in out.stdout.split(b"\x00") if f]
+    except subprocess.CalledProcessError:
+        untracked = []
+
+    for raw in sorted(tracked + untracked):
         try:
             text = raw.decode("utf-8", errors="replace")
         except Exception:
+            continue
+        if text.startswith(".git/"):
             continue
         h.update(text.encode("utf-8"))
         h.update(b"\x00")
@@ -174,6 +197,7 @@ def git_worktree_sha(repo_root: Path) -> str:
             h.update(full.read_bytes())
         except OSError:
             h.update(b"<unreadable>")
+        h.update(b"\n")
     return h.hexdigest()
 
 

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .broker import Broker, MutationJournalEntry, default_registry
+from .broker import Broker, default_registry
 from .ollama_client import OllamaClient
 from .runtime import is_paused, require_not_paused, runtime_fingerprint, state_dir
 from .safety import SafetyError, git_head, git_is_clean, git_worktree_sha
@@ -510,7 +510,6 @@ def _finalise(
         # model-invoked commands so timeouts kill only the validator's pgid.
         spec = broker.registry.get(vid)
         # Non-mutating validators: capture worktree fingerprint for drift check.
-        from .safety import git_worktree_sha
         pre_wt = None
         if spec.side_effects in ("none", "read"):
             pre_wt = git_worktree_sha(repo_root)
@@ -578,13 +577,18 @@ def _bind_check(
     if approval.approved_model_digest:
         if manifest.model_profile.model_name != approval.approved_model_name:
             return "APPROVAL_MODEL_CHANGED"
-        if digest_resolver is not None and approval.approved_model_digest:
-            try:
-                cur_digest = digest_resolver(manifest.model_profile.model_name)
-            except Exception:
-                cur_digest = None
-            if cur_digest is not None and cur_digest != approval.approved_model_digest:
-                return "APPROVAL_MODEL_CHANGED"
+        # Fail-closed digest check: require resolver, success, non-empty
+        # result, AND equality. Any failure => block before Ollama.
+        if digest_resolver is None:
+            return "APPROVAL_MODEL_UNRESOLVABLE"
+        try:
+            cur_digest = digest_resolver(manifest.model_profile.model_name)
+        except Exception:
+            return "APPROVAL_MODEL_UNRESOLVABLE"
+        if not cur_digest:
+            return "APPROVAL_MODEL_UNRESOLVABLE"
+        if cur_digest != approval.approved_model_digest:
+            return "APPROVAL_MODEL_CHANGED"
     if manifest.execution_class == ExecutionClass.SOURCE_MUTATION and manifest.repo.require_clean_tree:
         if not git_is_clean(repo_root):
             return "APPROVAL_DIRTY_WORKTREE"

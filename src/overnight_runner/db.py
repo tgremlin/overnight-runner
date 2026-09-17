@@ -89,6 +89,14 @@ CREATE INDEX IF NOT EXISTS events_type ON events(event_type);
 """
 
 
+class ClaimConflict(Exception):
+    """Raised when an atomic claim loses a race or fails to satisfy constraints.
+
+    Always raised from within a transaction so the caller knows the
+    transaction has been rolled back.
+    """
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -233,6 +241,26 @@ class Database:
             ),
         )
 
+    def _emit_event_via_cur(
+        self, cur, session_id: str, event_type: str,
+        *, task_id: str | None = None, run_id: str | None = None,
+        from_state: str | None = None, to_state: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit an event using an existing transaction cursor.
+
+        Used by the atomic claim so the run_started event is committed in
+        the SAME transaction as the rows insert and the task transition.
+        """
+        cur.execute(
+            """
+            INSERT INTO events (timestamp, session_id, task_id, run_id, event_type, from_state, to_state, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (int(time.time()), session_id, task_id, run_id, event_type,
+             from_state, to_state, json.dumps(details or {})),
+        )
+
     # ---------------- Morning summary ----------------
 
     def find_stale_runs(self, now: int) -> list[dict[str, Any]]:
@@ -280,81 +308,119 @@ class Database:
         *,
         run_id: str,
         session_id: str,
-        attempt_no: int,
         worker_pid: int,
-        model_name: str,
-        model_digest: str | None,
         model_profile_json: str,
         now: int,
         lease_expires_at: int,
-        artifact_dir: str,
         execution_class_filter: list[str] | None = None,
+        # If provided, candidates whose `task_timeout_seconds` exceeds
+        # `remaining_runtime - shutdown_margin` are skipped in priority order.
+        remaining_runtime: float | None = None,
+        shutdown_margin: float = 0.0,
     ) -> dict[str, Any] | None:
-        """Atomically: pick eligible APPROVED task, create RUNNING runs row,
+        """Atomically pick eligible APPROVED task, insert RUNNING runs row,
         transition task APPROVED -> RUNNING.
 
-        Returns the joined claim record (task row + run row fields) or None
-        if nothing eligible. Eligibility = status=APPROVED AND all declared
-        dependencies have status=PASSED.
+        Single implementation. Used by both `run-next` and `run-nightly`.
+
+        Eligibility:
+          - status='APPROVED'
+          - execution_class IN (execution_class_filter) if filter given
+          - all declared dependencies (status='PASSED') are PASSED
+          - if remaining_runtime is provided: the manifest's
+            limits.task_timeout_seconds fits within remaining - shutdown_margin
+
+        Returns the claim dict {task, run_id, attempt_no, session_id} or
+        None if no eligible task.
+
+        Raises ClaimConflict on lost-race UPDATE rowcount != 1 (transaction
+        rolls back; caller may retry).
         """
         where_extra = ""
         params: list[Any] = []
         if execution_class_filter:
             placeholders = ",".join("?" for _ in execution_class_filter)
-            where_extra = f" AND t.execution_class IN ({placeholders})"
+            where_extra = f" AND execution_class IN ({placeholders})"
             params.extend(execution_class_filter)
-        with self.transaction() as cur:
-            cur.execute(
-                f"""
-                SELECT t.* FROM tasks t
-                WHERE t.status='APPROVED'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM json_each(t.dependencies_json) d
-                    WHERE d.required_state='PASSED'
+        # We try candidates in priority order. If a candidate's timeout
+        # is too large, try the next. We do this in a single transaction
+        # with a loop over (peek + claim) so the budget check is race-safe.
+        while True:
+            with self.transaction() as cur:
+                # Find best candidate (priority + created_at order).
+                cur.execute(
+                    f"""
+                    SELECT task_id, manifest_json FROM tasks
+                    WHERE status='APPROVED'
                       AND NOT EXISTS (
-                        SELECT 1 FROM tasks dep
-                        WHERE dep.task_id = d.task_id AND dep.status='PASSED'
+                        SELECT 1 FROM json_each(dependencies_json) d
+                        WHERE json_extract(d.value, '$.required_state')='PASSED'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM tasks dep
+                            WHERE dep.task_id = json_extract(d.value, '$.task_id')
+                              AND dep.status='PASSED'
+                          )
                       )
-                  )
-                  {where_extra}
-                ORDER BY t.priority ASC, t.created_at ASC
-                LIMIT 1
-                """,
-                tuple(params),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            task = dict(row)
-            # Transition task RUNNING.
-            cur.execute(
-                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=? AND status='APPROVED'",
-                (TaskStatus.RUNNING.value, now, task["task_id"]),
-            )
-            if cur.rowcount != 1:
-                return None  # Lost the race.
-            # Insert RUNNING runs row.
-            cur.execute(
-                """
-                INSERT INTO runs (
-                    run_id, task_id, session_id, attempt_no, status, started_at,
-                    worker_pid, model_name, model_digest, model_profile,
-                    lease_owner, heartbeat_at, lease_expires_at,
-                    pre_repo_head, pre_worktree_sha256, mutation_started, artifact_dir
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    run_id, task["task_id"], session_id, attempt_no, "RUNNING", now,
-                    worker_pid, model_name, model_digest, model_profile_json,
-                    f"pid:{worker_pid}", now, lease_expires_at,
-                    task["approved_repo_head"], "", 0, artifact_dir,
-                ),
-            )
-            cur.execute(
-                "UPDATE tasks SET run_id=? WHERE task_id=?",
-                (run_id, task["task_id"]),
-            )
-        return {"task": task, "run_id": run_id, "attempt_no": attempt_no}
+                      {where_extra}
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 10
+                    """,
+                    tuple(params),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                if not rows:
+                    return None
+                # Choose first candidate that fits in remaining budget.
+                chosen = None
+                if remaining_runtime is None:
+                    chosen = rows[0]
+                else:
+                    import json as _json
+                    from .schemas import TaskManifest as _TM
+                    for r in rows:
+                        m = _TM.model_validate(_json.loads(r["manifest_json"]))
+                        if remaining_runtime - shutdown_margin >= m.limits.task_timeout_seconds:
+                            chosen = r
+                            break
+                    if chosen is None:
+                        # No candidate fits the remaining budget.
+                        return None
+
+                task_id = chosen["task_id"]
+                cur.execute("SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM runs WHERE task_id=?", (task_id,))
+                attempt_no = int(cur.fetchone()["n"])
+                cur.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,))
+                task = dict(cur.fetchone())
+                # Insert RUNNING runs row.
+                cur.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, task_id, session_id, attempt_no, status, started_at,
+                        worker_pid, model_name, model_digest, model_profile,
+                        lease_owner, heartbeat_at, lease_expires_at,
+                        pre_repo_head, pre_worktree_sha256, mutation_started, artifact_dir
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run_id, task_id, session_id, attempt_no, "RUNNING", now,
+                        worker_pid, task.get("approved_model_name"),
+                        task.get("approved_model_digest"), model_profile_json,
+                        f"pid:{worker_pid}", now, lease_expires_at,
+                        task.get("approved_repo_head"), "", 0, "",
+                    ),
+                )
+                # Transition APPROVED -> RUNNING, guarded by status.
+                cur.execute(
+                    "UPDATE tasks SET status='RUNNING', run_id=?, updated_at=? WHERE task_id=? AND status='APPROVED'",
+                    (run_id, now, task_id),
+                )
+                if cur.rowcount != 1:
+                    # Lost the race. ROLLBACK is automatic on exception; we
+                    # raise so the caller knows the transaction was aborted.
+                    raise ClaimConflict(f"task {task_id} no longer APPROVED")
+                db_emit_run_started(self, cur, session_id, task_id, run_id, attempt_no)
+            return {"task": task, "run_id": run_id, "attempt_no": attempt_no,
+                    "session_id": session_id}
 
     def increment_attempt_for_task(self, task_id: str) -> int:
         """Return next attempt_no for this task (1, 2, ...)."""
@@ -467,6 +533,16 @@ class Database:
             sets.append("wall_duration_ms=?"); vals.append(wall_duration_ms)
         vals.append(run_id)
         self._conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id=?", vals)
+
+    # ---------------- Internal helper ----------------
+
+
+def db_emit_run_started(db: Database, cur, session_id: str, task_id: str,
+                        run_id: str, attempt_no: int) -> None:
+    db._emit_event_via_cur(cur, session_id, "run_started", task_id=task_id,
+                           run_id=run_id, from_state="APPROVED",
+                           to_state="RUNNING", details={"attempt_no": attempt_no})
+
 
     # ---------------- Summary ----------------
 

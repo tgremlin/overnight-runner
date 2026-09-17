@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .broker import Broker, MutationJournalEntry
+from .broker import Broker
 from .db import Database, default_db_path
 from .ollama_client import OllamaClient
 from .runtime import is_paused, state_dir
@@ -41,62 +41,6 @@ from .worker import Approval, Worker
 LEASE_SECONDS = 120
 HEARTBEAT_EVERY = 30
 SHUTDOWN_MARGIN_SECONDS = 60
-
-
-# Backwards-compat alias used by older tests.
-def execute_queued_task(task_row: dict[str, Any], **kwargs) -> "QueuedRunResult":
-    """Compatibility shim: pre-existing test API. New code should call
-    execute_claimed_task(db, ...) under the global runner lock."""
-    from .db import Database, default_db_path
-    db = Database(default_db_path())
-    try:
-        # Inject the task row into a fake claim; not used by new tests.
-        return _legacy_execute_with_task(db, task_row, **kwargs)
-    finally:
-        db.close()
-
-
-def _legacy_execute_with_task(db: Database, task_row: dict[str, Any], **kwargs) -> QueuedRunResult:
-    """Legacy path: insert RUNNING runs row + transition task atomically
-    outside of claim_next_approved. Kept only for the older integration
-    tests that pass a pre-fetched row directly."""
-    from .db import default_db_path as _dp
-    now = int(time.time())
-    run_id = f"run-{now}-{uuid.uuid4().hex[:6]}"
-    artifact_dir = state_dir() / "runs" / task_row["task_id"] / run_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    manifest = TaskManifest.model_validate(json.loads(task_row["manifest_json"]))
-    (artifact_dir / "manifest.json").write_bytes(_canonical(manifest))
-    sid = f"sess-{uuid.uuid4().hex[:8]}"
-    with db.transaction() as cur:
-        cur.execute("SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM runs WHERE task_id=?", (task_row["task_id"],))
-        attempt_no = int(cur.fetchone()["n"])
-        cur.execute(
-            """
-            INSERT INTO runs (run_id, task_id, session_id, attempt_no, status, started_at,
-                worker_pid, model_name, model_digest, model_profile, lease_owner,
-                heartbeat_at, lease_expires_at, pre_repo_head, pre_worktree_sha256,
-                mutation_started, artifact_dir)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (run_id, task_row["task_id"], sid, attempt_no, "RUNNING", now,
-             os.getpid(), task_row.get("approved_model_name"),
-             task_row.get("approved_model_digest"), "{}", f"pid:{os.getpid()}",
-             now, now + LEASE_SECONDS, task_row.get("approved_repo_head"), "",
-             0, str(artifact_dir)),
-        )
-        cur.execute(
-            "UPDATE tasks SET status='RUNNING', run_id=?, updated_at=? WHERE task_id=? AND status='APPROVED'",
-            (run_id, now, task_row["task_id"]),
-        )
-        if cur.rowcount != 1:
-            raise RuntimeError("task no longer APPROVED")
-        db.emit_event(sid, "run_started", task_id=task_row["task_id"], run_id=run_id)
-    # Now run the worker under the new execution path.
-    # Refetch task row + delegate.
-    fresh = db.get_task(task_row["task_id"])
-    res = _execute_via_worker(db, fresh, run_id, attempt_no, artifact_dir, sid)
-    return res
 
 
 def _execute_via_worker(db: Database, task_row: dict[str, Any], run_id: str,
@@ -307,16 +251,36 @@ def recovery_scan(now: int | None = None) -> list[dict[str, Any]]:
 
 # ----------------------------- Atomic claim + run -----------------------------
 
-def execute_claimed_task(db: Database, *, execution_class_filter: list[str] | None = None,
-                         session_id: str | None = None,
-                         max_wall_seconds: int | None = None) -> QueuedRunResult | None:
+def execute_claimed_task(
+    db: Database, *,
+    execution_class_filter: list[str] | None = None,
+    session_id: str | None = None,
+    remaining_runtime: float | None = None,
+    shutdown_margin: float = 0.0,
+) -> QueuedRunResult | None:
     """Atomic claim, run, finalize.
 
     Caller MUST hold the global runner_lock.
     Returns None if no eligible task.
+
+    `remaining_runtime` is the budget (seconds) remaining in the calling
+    session; combined with `shutdown_margin` it is used to skip candidates
+    whose `task_timeout_seconds` would not fit.
     """
-    claim = _atomic_claim(db, execution_class_filter=execution_class_filter,
-                         session_id=session_id)
+    now = int(time.time())
+    sid = session_id or f"sess-{uuid.uuid4().hex[:8]}"
+    run_id = f"run-{now}-{uuid.uuid4().hex[:6]}"
+    try:
+        claim = db.claim_next_approved(
+            run_id=run_id, session_id=sid, worker_pid=os.getpid(),
+            model_profile_json="{}",
+            now=now, lease_expires_at=now + LEASE_SECONDS,
+            execution_class_filter=execution_class_filter,
+            remaining_runtime=remaining_runtime,
+            shutdown_margin=shutdown_margin,
+        )
+    except ClaimConflict:
+        return None
     if claim is None:
         return None
     task_row = claim["task"]
@@ -328,92 +292,9 @@ def execute_claimed_task(db: Database, *, execution_class_filter: list[str] | No
     artifact_dir = state_dir() / "runs" / manifest.task_id / run_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "manifest.json").write_bytes(_canonical(manifest))
-    # Set artifact_dir on the runs row so recovery sees it.
-    db._conn.execute("UPDATE runs SET artifact_dir=? WHERE run_id=?", (str(artifact_dir), run_id))
+    db._conn.execute("UPDATE runs SET artifact_dir=? WHERE run_id=?",
+                     (str(artifact_dir), run_id))
     return _execute_via_worker(db, task_row, run_id, attempt_no, artifact_dir, sid)
-
-
-def _atomic_claim(db: Database, *, execution_class_filter: list[str] | None,
-                  session_id: str | None) -> dict[str, Any] | None:
-    """One short BEGIN IMMEDIATE transaction.
-
-    Picks one eligible APPROVED task, increments attempt_no, inserts the
-    RUNNING runs row, transitions the task APPROVED -> RUNNING. Returns the
-    claim record.
-    """
-    now = int(time.time())
-    sid = session_id or f"sess-{uuid.uuid4().hex[:8]}"
-    # We need a candidate task_id before we can compute attempt_no.
-    where_extra = ""
-    params: list[Any] = []
-    if execution_class_filter:
-        placeholders = ",".join("?" for _ in execution_class_filter)
-        where_extra = f" AND execution_class IN ({placeholders})"
-        params.extend(execution_class_filter)
-    with db.transaction() as cur:
-        cur.execute(
-            f"""
-            SELECT task_id FROM tasks
-            WHERE status='APPROVED'
-              AND NOT EXISTS (
-                SELECT 1 FROM json_each(dependencies_json) d
-                WHERE json_extract(d.value, '$.required_state')='PASSED'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM tasks dep
-                    WHERE dep.task_id = json_extract(d.value, '$.task_id')
-                      AND dep.status='PASSED'
-                  )
-              )
-              {where_extra}
-            ORDER BY priority ASC, created_at ASC
-            LIMIT 1
-            """,
-            tuple(params),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        task_id = row["task_id"]
-        cur.execute("SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM runs WHERE task_id=?", (task_id,))
-        attempt_no = int(cur.fetchone()["n"])
-        run_id = f"run-{now}-{uuid.uuid4().hex[:6]}"
-        # Fetch manifest snapshot for model_profile_json.
-        cur.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,))
-        task = dict(cur.fetchone())
-        model_profile_json = json.dumps({
-            "num_ctx": json.loads(task["manifest_json"]).get("model_profile", {}),
-            "model_name": task.get("approved_model_name") or "",
-        }, default=str)
-        # Insert RUNNING runs row FIRST so a crash leaves a recoverable artifact.
-        cur.execute(
-            """
-            INSERT INTO runs (
-                run_id, task_id, session_id, attempt_no, status, started_at,
-                worker_pid, model_name, model_digest, model_profile,
-                lease_owner, heartbeat_at, lease_expires_at,
-                pre_repo_head, pre_worktree_sha256, mutation_started, artifact_dir
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                run_id, task_id, sid, attempt_no, "RUNNING", now,
-                os.getpid(), task.get("approved_model_name"),
-                task.get("approved_model_digest"), model_profile_json,
-                f"pid:{os.getpid()}", now, now + LEASE_SECONDS,
-                task.get("approved_repo_head"), "", 0, "",
-            ),
-        )
-        # Transition APPROVED -> RUNNING, guarded by status.
-        cur.execute(
-            "UPDATE tasks SET status='RUNNING', run_id=?, updated_at=? WHERE task_id=? AND status='APPROVED'",
-            (run_id, now, task_id),
-        )
-        if cur.rowcount != 1:
-            # Lost the race; rollback via transaction context.
-            return None
-        db.emit_event(sid, "run_started", task_id=task_id, run_id=run_id,
-                      from_state="APPROVED", to_state="RUNNING",
-                      details={"attempt_no": attempt_no})
-    return {"task": task, "run_id": run_id, "attempt_no": attempt_no, "session_id": sid}
 
 
 def _make_metrics_cb(state: dict[str, int]):
@@ -431,7 +312,9 @@ DEFAULT_NIGHTLY = {
     "max_wall_seconds": 8 * 3600,
     "max_tasks": 6,
     "max_mutation_tasks": 1,
-    "retries": 1,
+    # automatic retries intentionally NOT implemented for MVP.
+    # "safety > utilization". A failed task is left for human review.
+    "retries": 0,
 }
 
 
@@ -450,17 +333,25 @@ def run_nightly(session_id: str | None = None) -> NightlyResult:
     """
     from .runtime import require_not_paused  # raises SafetyError -> BLOCKED
 
-    started = time.time()
-    session_id = session_id or f"nightly-{int(started)}-{uuid.uuid4().hex[:6]}"
-    result = NightlyResult(session_id=session_id, started_at=started,
-                           finished_at=started, stop_reason="init")
+    # Wall timestamps for audit/persistence; monotonic for scheduling.
+    wall_started = time.time()
+    mono_started = time.monotonic()
+    session_id = session_id or f"nightly-{int(wall_started)}-{uuid.uuid4().hex[:6]}"
+    result = NightlyResult(session_id=session_id, started_at=wall_started,
+                           finished_at=wall_started, stop_reason="init")
+
+    def remaining_budget() -> float:
+        return DEFAULT_NIGHTLY["max_wall_seconds"] - (time.monotonic() - mono_started)
+
+    def fits_in_budget(task_timeout_seconds: int) -> bool:
+        return remaining_budget() - SHUTDOWN_MARGIN_SECONDS >= task_timeout_seconds
 
     try:
         require_not_paused()
     except Exception as e:
         result.stop_reason = f"PAUSED_AT_START: {e}"
         result.finished_at = time.time()
-        _write_summary(result, [], session_id, started, result.finished_at)
+        _write_summary(result, [], session_id, wall_started, result.finished_at)
         return result
 
     # Recovery first.
@@ -471,19 +362,51 @@ def run_nightly(session_id: str | None = None) -> NightlyResult:
     try:
         # Phase 1: read-only loop
         while True:
-            elapsed = time.time() - started
             if is_paused():
                 result.stop_reason = "PAUSED_BETWEEN_TASKS"
                 break
             if result.tasks_attempted >= DEFAULT_NIGHTLY["max_tasks"]:
                 result.stop_reason = "MAX_TASKS_REACHED"
                 break
-            if elapsed + SHUTDOWN_MARGIN_SECONDS >= DEFAULT_NIGHTLY["max_wall_seconds"]:
+            if remaining_budget() - SHUTDOWN_MARGIN_SECONDS <= 0:
                 result.stop_reason = "RUNTIME_BUDGET_EXHAUSTED"
                 break
-            r = execute_claimed_task(db,
-                                     execution_class_filter=[ExecutionClass.READ_ONLY.value],
-                                     session_id=session_id)
+            # Peek at next eligible task timeout to ensure we don't claim
+            # something we can't finish. If no candidate fits, leave it for
+            # the next night and stop this one.
+            from .schemas import TaskManifest as _TM
+            with db.transaction() as cur:
+                cur.execute(
+                    """
+                    SELECT manifest_json FROM tasks
+                    WHERE status='APPROVED' AND execution_class='read_only'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM json_each(dependencies_json) d
+                        WHERE json_extract(d.value, '$.required_state')='PASSED'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM tasks dep
+                            WHERE dep.task_id = json_extract(d.value, '$.task_id')
+                              AND dep.status='PASSED'
+                          )
+                      )
+                    ORDER BY priority ASC, created_at ASC LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                if row is None:
+                    result.stop_reason = "NO_MORE_READ_ONLY"
+                    break
+                peek = _TM.model_validate(json.loads(row["manifest_json"]))
+            if not fits_in_budget(peek.limits.task_timeout_seconds):
+                result.stop_reason = "BUDGET_INSUFFICIENT_FOR_NEXT_TASK"
+                break
+            r = execute_claimed_task(
+                db,
+                execution_class_filter=[ExecutionClass.READ_ONLY.value],
+                session_id=session_id,
+                remaining_runtime=remaining_budget(),
+                shutdown_margin=SHUTDOWN_MARGIN_SECONDS,
+            )
             if r is None:
                 result.stop_reason = "NO_MORE_READ_ONLY"
                 break
@@ -493,26 +416,53 @@ def run_nightly(session_id: str | None = None) -> NightlyResult:
             if r.execution_class == "source_mutation":
                 # Defensive: should never happen with the filter.
                 break
-            # Stop after a single mutation (defensive even though filter excludes)
             if r.status not in ("PASSED", "FAILED", "BLOCKED", "REVIEW_REQUIRED"):
                 break
 
         # Phase 2: at most one mutation (if capacity remains and no mutation already done)
-        if result.mutation_attempted < DEFAULT_NIGHTLY["max_mutation_tasks"] \
-                and not is_paused() \
-                and result.tasks_attempted < DEFAULT_NIGHTLY["max_tasks"] \
-                and time.time() - started + SHUTDOWN_MARGIN_SECONDS < DEFAULT_NIGHTLY["max_wall_seconds"]:
-            r = execute_claimed_task(db,
-                                     execution_class_filter=[ExecutionClass.SOURCE_MUTATION.value],
-                                     session_id=session_id)
-            if r is not None:
-                result.tasks_attempted += 1
-                result.mutation_attempted += 1
-                _absorb_task_result(result, r)
-                # Stop immediately after mutation regardless of outcome.
-                result.stop_reason = "MUTATION_DONE_STOPPING"
-            # else: leave stop_reason as the read-only reason (none available).
-        # else: leave stop_reason as the read-only reason.
+        if (result.mutation_attempted < DEFAULT_NIGHTLY["max_mutation_tasks"]
+                and not is_paused()
+                and result.tasks_attempted < DEFAULT_NIGHTLY["max_tasks"]):
+            # Peek mutation timeout if any.
+            with db.transaction() as cur:
+                cur.execute(
+                    """
+                    SELECT manifest_json FROM tasks
+                    WHERE status='APPROVED' AND execution_class='source_mutation'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM json_each(dependencies_json) d
+                        WHERE json_extract(d.value, '$.required_state')='PASSED'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM tasks dep
+                            WHERE dep.task_id = json_extract(d.value, '$.task_id')
+                              AND dep.status='PASSED'
+                          )
+                      )
+                    ORDER BY priority ASC, created_at ASC LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+            if row is None:
+                if result.stop_reason in ("ready",):
+                    result.stop_reason = "NO_ELIGIBLE_MUTATION"
+            else:
+                peek = _TM.model_validate(json.loads(row["manifest_json"]))
+                if not fits_in_budget(peek.limits.task_timeout_seconds):
+                    result.stop_reason = "BUDGET_INSUFFICIENT_FOR_MUTATION"
+                else:
+                    r = execute_claimed_task(
+                        db,
+                        execution_class_filter=[ExecutionClass.SOURCE_MUTATION.value],
+                        session_id=session_id,
+                        remaining_runtime=remaining_budget(),
+                        shutdown_margin=SHUTDOWN_MARGIN_SECONDS,
+                    )
+                    if r is not None:
+                        result.tasks_attempted += 1
+                        result.mutation_attempted += 1
+                        _absorb_task_result(result, r)
+                        result.stop_reason = "MUTATION_DONE_STOPPING"
+                    # else: leave stop_reason as the read-only reason.
     finally:
         # Capture dep-blocked tasks for the summary.
         try:
@@ -522,7 +472,7 @@ def run_nightly(session_id: str | None = None) -> NightlyResult:
         db.close()
 
     result.finished_at = time.time()
-    _write_summary(result, recovery_actions, session_id, started, result.finished_at)
+    _write_summary(result, recovery_actions, session_id, wall_started, result.finished_at)
     return result
 
 
@@ -583,7 +533,7 @@ def _write_summary(result: NightlyResult, recovery_actions: list[dict[str, Any]]
         f"- Max wall: {DEFAULT_NIGHTLY['max_wall_seconds']} seconds",
         f"- Max tasks: {DEFAULT_NIGHTLY['max_tasks']}",
         f"- Max mutation tasks: {DEFAULT_NIGHTLY['max_mutation_tasks']}",
-        f"- Retries: {DEFAULT_NIGHTLY['retries']} (read-only only)",
+        f"- Auto-retries: {DEFAULT_NIGHTLY['retries']} (0 = none; tasks that fail are left for human review)",
         "",
         "## Counts",
         f"- Attempted: {result.tasks_attempted}",

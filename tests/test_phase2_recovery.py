@@ -18,7 +18,7 @@ from overnight_runner.db import Database, default_db_path
 from overnight_runner.ollama_client import ChatResult, OllamaMetrics
 from overnight_runner.runtime import state_dir
 from overnight_runner.runner import (
-    LEASE_SECONDS, execute_queued_task, recovery_scan,
+    LEASE_SECONDS, execute_claimed_task, recovery_scan,
 )
 from overnight_runner.safety import git_commit_all, git_init_empty, sha256_file
 from overnight_runner.schemas import (
@@ -77,7 +77,6 @@ def test_execute_queued_task_passes_and_writes_artifacts(tmp_path: Path):
     here = Path(__file__).resolve().parents[1] / "src" / "overnight_runner"
     rt = runtime_fingerprint([here]).sha256
     _enqueue(db, m, status=TaskStatus.APPROVED, head=head, rt_sha=rt)
-    row = db.get_task("q-1")
 
     # FakeClient that does propose + apply + DONE.
     sha = sha256_file(repo / "hello.py")
@@ -121,7 +120,7 @@ def test_execute_queued_task_passes_and_writes_artifacts(tmp_path: Path):
     orig_client_init = wmod.Worker.__init__
     wmod.Worker.__init__ = lambda self, **kw: orig_client_init(self, client=C(), **kw)
     try:
-        res = execute_queued_task(row)
+        res = execute_claimed_task(db)
     finally:
         wmod.Worker.__init__ = orig_client_init
 

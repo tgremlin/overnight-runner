@@ -37,7 +37,7 @@ from overnight_runner.broker import (
 from overnight_runner.db import Database, default_db_path
 from overnight_runner.ollama_client import ChatResult, OllamaMetrics
 from overnight_runner.runtime import is_paused, paused_path, runtime_fingerprint
-from overnight_runner.runner import execute_queued_task, recovery_scan
+from overnight_runner.runner import execute_claimed_task, recovery_scan
 from overnight_runner.safety import (
     SafetyError,
     git_commit_all,
