@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "task_id": "example-mutation-001",
+  "title": "Change hello() return value",
+  "execution_class": "source_mutation",
+  "objective": "Change hello() in hello.py to return 'v2' and update test_hello.py accordingly. Smallest exact change.",
+  "repo": { "path": "/tmp/example-repo", "require_clean_tree": true },
+  "paths": {
+    "read_paths": ["hello.py", "test_hello.py"],
+    "write_paths": ["hello.py", "test_hello.py"],
+    "create_paths": []
+  },
+  "commands": {
+    "model_allowed_command_ids": ["git_diff_check", "git_status"],
+    "required_validator_ids": ["python_compile"]
+  },
+  "acceptance_criteria": [
+    "hello.py returns 'v2'",
+    "test_hello.py asserts hello() == 'v2'",
+    "python_compile passes on both files"
+  ]
+}

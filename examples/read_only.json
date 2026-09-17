@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "task_id": "example-read-only-001",
+  "title": "Inspect hello.py",
+  "execution_class": "read_only",
+  "objective": "Read hello.py and report its current behaviour. Do not modify any file.",
+  "repo": { "path": "/tmp/example-repo" },
+  "paths": {
+    "read_paths": ["hello.py"]
+  },
+  "commands": {
+    "model_allowed_command_ids": ["git_diff_check", "git_status"],
+    "required_validator_ids": []
+  },
+  "acceptance_criteria": [
+    "Model reads hello.py",
+    "Model reports DONE with summary describing file"
+  ]
+}

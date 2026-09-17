@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Build / dist
+build/
+dist/
+
+# Runtime state (developers do NOT commit state)
+state/
+runs/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store

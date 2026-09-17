@@ -1,0 +1,26 @@
+[Unit]
+Description=overnight-runner: bounded local-model work pipeline
+Documentation=https://github.com/tgremlin/overnight-runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 -m overnight_runner.cli run-next
+Restart=no
+RuntimeMaxSec=29700
+TimeoutStopSec=60
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+# If Linger=no (default), the user systemd manager stops after logout.
+# The user must EITHER remain logged in overnight OR run:
+#     loginctl enable-linger <user>
+# The runner does NOT enable linger automatically.
+
+[Install]
+WantedBy=default.target

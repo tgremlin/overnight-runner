@@ -1,0 +1,13 @@
+[Unit]
+Description=overnight-runner nightly timer
+Documentation=https://github.com/tgremlin/overnight-runner
+
+[Timer]
+# 02:30 local time. Adjust to taste.
+OnCalendar=*-*-* 02:30:00
+Persistent=false
+AccuracySec=60s
+Unit=overnight-runner.service
+
+[Install]
+WantedBy=timers.target
