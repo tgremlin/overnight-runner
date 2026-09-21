@@ -312,36 +312,6 @@ def _resolve_campaign_worktree(
     return wt
 
 
-# Campaign states from which no consequential integration may proceed.
-_BLOCKED_CAMPAIGN_STATES = frozenset({
-    "EFFECT_UNKNOWN", "NEEDS_DECISION", "CANCELLED", "EXPIRED",
-    "COMPLETE", "BUDGET_EXHAUSTED", "PAUSED_OPERATOR",
-})
-
-
-def _assert_campaign_integratable(db: Database, *, campaign_id: str) -> None:
-    """Refuse integration from a blocked campaign state.
-
-    P06 follow-up #4 (item 4): the consequence API itself enforces this,
-    so safe operation does not depend on the caller invoking a preflight
-    helper.
-    """
-    cur = db._conn.execute(
-        "SELECT state FROM campaigns WHERE campaign_id=?", (campaign_id,)
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise SafetyError(f"campaign {campaign_id!r} not registered")
-    if row["state"] in _BLOCKED_CAMPAIGN_STATES:
-        raise SafetyError(
-            f"campaign {campaign_id!r} is in blocking state={row['state']}; "
-            f"integration refused"
-        )
-    from .runtime import is_paused
-    if is_paused():
-        raise SafetyError("PAUSED sentinel present; integration refused")
-
-
 def _validate_admission_lease_lineage(
     db: Database,
     *,
@@ -349,13 +319,39 @@ def _validate_admission_lease_lineage(
     chunk_id: str,
     admission_id: str,
     holder_fence_generation: int,
+    now: int | None = None,
 ) -> None:
     """Bind integration to the admitted authority lineage.
 
-    P06 follow-up #4 (item 9): chunk -> admission -> lease/fence. A
-    released/stale admission (or its lease) may not advance merely
-    because the caller knows the current integer fence.
+    P06 follow-up #4 (item 9): chunk -> admission -> lease/fence.
+
+    P06 follow-up #5 (item 2): the admission lease is a full authority
+    object. Integration REQUIRES:
+
+      * the lease belongs to ``campaign_id``;
+      * ``released_at == 0``;
+      * ``expires_at > now`` (an expired lease is NOT made valid by a
+        live-or-dead holder — it requires explicit reconciliation /
+        reacquisition / fenced takeover);
+      * lease fence == admission fence == campaign current fence.
     """
+    now = int(now if now is not None else time.time())
+
+    crow = db._conn.execute(
+        "SELECT current_fence FROM campaigns WHERE campaign_id=?",
+        (campaign_id,),
+    ).fetchone()
+    if crow is None:
+        raise SafetyError(
+            f"integration gate: campaign {campaign_id!r} not registered"
+        )
+    current_fence_gen = int(crow["current_fence"])
+    if holder_fence_generation != current_fence_gen:
+        raise SafetyError(
+            f"integration gate: holder fence {holder_fence_generation} != "
+            f"campaign current fence {current_fence_gen}; refusing integration"
+        )
+
     cur = db._conn.execute(
         "SELECT chunk_id, lease_id, fence_generation FROM admissions "
         "WHERE admission_id=?",
@@ -372,10 +368,11 @@ def _validate_admission_lease_lineage(
             f"integration gate: admission {admission_id!r} is for chunk "
             f"{arow['chunk_id']!r}, not {chunk_id!r}"
         )
-    if int(arow["fence_generation"]) != holder_fence_generation:
+    admission_fence_gen = int(arow["fence_generation"])
+    if admission_fence_gen != holder_fence_generation:
         raise SafetyError(
             f"integration gate: admission fence_generation="
-            f"{arow['fence_generation']} != holder fence "
+            f"{admission_fence_gen} != holder fence "
             f"{holder_fence_generation}; refusing integration"
         )
     lease_id = arow["lease_id"] or ""
@@ -385,7 +382,8 @@ def _validate_admission_lease_lineage(
             f"refusing integration"
         )
     lrow = db._conn.execute(
-        "SELECT released_at, fence_generation FROM leases WHERE lease_id=?",
+        "SELECT campaign_id, released_at, expires_at, fence_generation "
+        "FROM leases WHERE lease_id=?",
         (lease_id,),
     ).fetchone()
     if lrow is None:
@@ -393,16 +391,28 @@ def _validate_admission_lease_lineage(
             f"integration gate: admission lease {lease_id!r} not found; "
             f"refusing integration"
         )
+    if (lrow["campaign_id"] or "") != campaign_id:
+        raise SafetyError(
+            f"integration gate: admission lease {lease_id!r} belongs to "
+            f"campaign {lrow['campaign_id']!r}, not {campaign_id!r}"
+        )
     if int(lrow["released_at"]) != 0:
         raise SafetyError(
             f"integration gate: admission lease {lease_id!r} was released; "
             f"a stale admission may not advance integration"
         )
-    if int(lrow["fence_generation"]) != holder_fence_generation:
+    if int(lrow["expires_at"]) > 0 and int(lrow["expires_at"]) <= now:
+        raise SafetyError(
+            f"integration gate: admission lease {lease_id!r} expired at "
+            f"{lrow['expires_at']} (now={now}); an expired lease has no "
+            f"integration authority — reconcile/reacquire or perform a "
+            f"fenced takeover"
+        )
+    if int(lrow["fence_generation"]) != admission_fence_gen:
         raise SafetyError(
             f"integration gate: admission lease fence_generation="
-            f"{lrow['fence_generation']} != holder fence "
-            f"{holder_fence_generation}; refusing integration"
+            f"{lrow['fence_generation']} != admission fence "
+            f"{admission_fence_gen}; refusing integration"
         )
 
 
@@ -548,6 +558,7 @@ def compare_and_swap_advance(
     expected_chunk_id: str | None = None,
     expected_validator_id: str | None = None,
     campaign_worktree: Path | None = None,
+    now: int | None = None,
 ) -> CompareAndSwapResult:
     """Atomically advance the campaign's integration ref.
 
@@ -570,13 +581,25 @@ def compare_and_swap_advance(
       5. Append to ``integration_journal`` and update campaigns row.
     """
     require_campaign_v2("compare_and_swap_advance")
-    now = int(time.time())
+    now = int(now if now is not None else time.time())
     branch = f"refs/heads/campaign/{campaign_id}"
 
-    # Step 0a (follow-up #4 item 4): refuse integration from a blocked
-    # campaign state. Safe operation must not depend on the caller
-    # remembering a preflight helper.
-    _assert_campaign_integratable(db, campaign_id=campaign_id)
+    # Step 0a (follow-up #5 item 1): enforce the FULL campaign
+    # continuation authority at the consequential API itself — blocked
+    # campaign state, active/non-revoked/non-expired grant, trusted
+    # budget headroom, and global PAUSED. We REUSE
+    # ``check_campaign_continuation`` so there is one authority definition
+    # (no divergent duplicate) and safe operation never depends on the
+    # caller having run a preflight.
+    _crow = db._conn.execute(
+        "SELECT grant_id FROM campaigns WHERE campaign_id=?", (campaign_id,)
+    ).fetchone()
+    if _crow is None:
+        raise SafetyError(f"campaign {campaign_id!r} not registered")
+    from .admission import check_campaign_continuation
+    check_campaign_continuation(
+        db, campaign_id=campaign_id, grant_id=_crow["grant_id"], now=now
+    )
 
     # Step 0b: gather the receipt ids (list takes precedence).
     receipts = list(validation_receipt_ids or [])
@@ -631,6 +654,7 @@ def compare_and_swap_advance(
         chunk_id=chunk_id,
         admission_id=chunk_auth["admission_id"],
         holder_fence_generation=holder_fence_generation,
+        now=now,
     )
 
     # Step 1: read LIVE ref (this is the source of truth for what the
