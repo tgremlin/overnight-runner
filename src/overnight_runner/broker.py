@@ -169,6 +169,7 @@ class Broker:
         approved_repo_head: str | None = None,
         artifact_dir: Path | None = None,
         on_mutation: Callable[[MutationJournalEntry], None] | None = None,
+        on_apply_receipt: "Callable[[dict[str, Any]], str] | None" = None,
     ) -> None:
         self.repo_root = repo_root.resolve()
         self.registry = registry or default_registry()
@@ -189,6 +190,11 @@ class Broker:
         self.approved_repo_head = approved_repo_head
         self.artifact_dir = artifact_dir
         self.on_mutation = on_mutation
+        # Optional runner-owned receipt mint callback. Invoked at apply
+        # boundary; the same callable is invoked by validator boundary
+        # in worker.py for the validation kind. Callers MUST NOT mint
+        # receipts directly: this callback is the only mint surface.
+        self.on_apply_receipt = on_apply_receipt
         self.usage = Usage()
         self.proposals: dict[str, Proposal] = {}
         self.journal: list[MutationJournalEntry] = []
@@ -400,6 +406,11 @@ class Broker:
           - after/<path>
           - preview.diff + actual.diff
           - mutation-journal.jsonl
+        Mints a runner-owned ``mutation/apply`` receipt when receipts are
+        enabled. The receipt id is returned to the caller as
+        ``receipt_id`` in the result dict; callers should treat it as an
+        opaque reference. The mutation/apply receipt is NOT the
+        P05-A06 trusted validation receipt.
         """
         prop = self.proposals.get(proposal_id)
         if prop is None:
@@ -494,7 +505,7 @@ class Broker:
 
         # Single-use proposal.
         del self.proposals[proposal_id]
-        return {
+        out: dict[str, Any] = {
             "proposal_id": proposal_id,
             "path": prop.path,
             "op": prop.op,
@@ -503,6 +514,35 @@ class Broker:
             "pre_sha256": pre_sha,
             "post_sha256": post_sha,
         }
+
+        # Mint a runner-owned mutation/apply receipt ONLY at this layer.
+        # The receipt is intentionally distinct from the validation
+        # receipt minted later (worker validator boundary). It binds to
+        # pre_sha256 (single-file precondition), not to a tree-wide
+        # candidate snapshot.
+        receipt_id = ""
+        if self.on_apply_receipt is not None:
+            try:
+                # Capture tree-wide candidate state AFTER the apply so
+                # callers can bind to it independently of pre_sha.
+                from .safety import git_worktree_sha
+                candidate_snapshot = git_worktree_sha(self.repo_root) if self.repo_root.exists() else ""
+                receipt_id = self.on_apply_receipt({
+                    "proposal_id": proposal_id,
+                    "path": prop.path,
+                    "op": prop.op,
+                    "pre_sha256": pre_sha,
+                    "post_sha256": post_sha,
+                    "bytes_written": written_bytes,
+                    "candidate_snapshot_digest": candidate_snapshot,
+                })
+            except Exception:
+                # Receipt minting is best-effort, never fails an apply.
+                receipt_id = ""
+        if receipt_id:
+            out["receipt_id"] = receipt_id
+            out["receipt_kind"] = "mutation/apply"
+        return out
 
     def _write_evidence(self, prop: Proposal) -> None:
         """Persist before/<path>, proposed/<path>, preview.diff BEFORE the write."""

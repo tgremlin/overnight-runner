@@ -149,7 +149,9 @@ class Worker:
     def run(self, manifest: TaskManifest, *, dry_run: bool = False,
             approval: Approval | None = None,
             artifact_dir: Path | None = None,
-            on_metrics=None) -> RunResult:
+            on_metrics=None,
+            on_mutation_receipt=None,
+            on_validation_receipt=None) -> RunResult:
         """Manual single-task run.
 
         If `approval` is None we derive one ONLY for ad-hoc local runs (Phase 1).
@@ -161,6 +163,13 @@ class Worker:
 
         If `on_metrics(snapshot)` is provided, it is called after each Ollama
         turn with cumulative metric counters. Worker is decoupled from DB.
+
+        If `on_mutation_receipt(payload)` is provided, the broker calls it
+        at apply boundary to mint a ``mutation/apply`` receipt. If
+        `on_validation_receipt(payload)` is provided, the worker calls it
+        after each required validator runs to mint a
+        ``validation`` receipt. Both callbacks MUST be runner-owned;
+        the worker holds no signing secret itself.
         """
         started = time.time()
         repo_root = Path(manifest.repo.path).resolve()
@@ -175,6 +184,15 @@ class Worker:
         (artifact_dir / "manifest.json").write_bytes(_canonical(manifest))
 
         result = RunResult(status="RUNNING", artifacts_dir=str(artifact_dir))
+
+        # Carry receipt-mint callbacks into Worker.run extras so the
+        # broker / finalise callable to them. Both must be runner-owned;
+        # a forge worker (or any caller) cannot supply a callback that
+        # both mints and verifies.
+        if on_mutation_receipt is not None:
+            self.receipts_mint_mutation = on_mutation_receipt  # type: ignore[attr-defined]
+        if on_validation_receipt is not None:
+            result.extra["validation_receipt_mint"] = on_validation_receipt
 
         if approval is None:
             # Phase 1 ad-hoc: derive ephemeral envelope (NOT stored as
@@ -360,13 +378,17 @@ class Worker:
                 result.reason_code = "MAX_TURNS_REACHED"
                 result.reason_text = "model never reported disposition"
 
-            final_status, reason_code, reason_text = _finalise(
+            final_status, reason_code, reason_text, validation_receipt_ids = _finalise(
                 manifest, broker, disposition, artifact_dir,
                 applied_proposals=applied_proposals,
+                on_validation_receipt=result.extra.get("validation_receipt_mint"),
+                env_digest=result.extra.get("env_digest", ""),
+                profile_digest=result.extra.get("profile_digest", ""),
             )
             result.status = final_status
             result.reason_code = reason_code
             result.reason_text = reason_text
+            result.extra["validation_receipt_ids"] = list(validation_receipt_ids)
 
             (artifact_dir / "result.json").write_text(json.dumps({
                 "status": result.status,
@@ -380,6 +402,7 @@ class Worker:
                 "approval": approval.to_dict(),
                 "approval_ephemeral": result.extra.get("approval_ephemeral", False),
                 "journal_entries": [je.__dict__ for je in broker.journal],
+                "validation_receipt_ids": list(validation_receipt_ids),
             }, indent=2, default=str))
             return result
 
@@ -407,6 +430,11 @@ class Worker:
     def _build_broker(
         self, manifest: TaskManifest, repo_root: Path, artifact_dir: Path, approval: Approval,
     ) -> Broker:
+        # The broker may optionally mint a ``mutation/apply`` receipt at
+        # apply boundary. Pass the runner-owned mint callback only when
+        # the caller has supplied one via ``result.extra``; the V1 default
+        # is None, which leaves the apply evidence path completely
+        # unchanged.
         return Broker(
             repo_root=repo_root,
             registry=self.registry,
@@ -425,7 +453,27 @@ class Worker:
             max_written_bytes=manifest.limits.max_written_bytes,
             approved_repo_head=approval.approved_repo_head,
             artifact_dir=artifact_dir,
+            on_apply_receipt=self._mutation_receipt_minter(),
         )
+
+    def _mutation_receipt_minter(self):
+        """Return a runner-owned mint callback for the broker's mutation
+        /apply receipts, or ``None`` if receipts are disabled.
+
+        The callback forwards to ``self.receipts_mint_mutation``; that
+        callable is supplied by the runtime (the only place that holds
+        durable-store write authority). When unset, no mutation receipt
+        is minted and V1 behaviour is preserved exactly.
+        """
+        fn = getattr(self, "receipts_mint_mutation", None)
+        if fn is None:
+            return None
+        def _cb(payload: dict) -> str:
+            try:
+                return fn(payload)
+            except Exception:
+                return ""
+        return _cb
 
     # ---------- Dispatch ----------
 
@@ -472,71 +520,169 @@ def _finalise(
     artifact_dir: Path,
     *,
     applied_proposals: list[str],
-) -> tuple[str, str, str]:
+    on_validation_receipt: "Callable[[dict[str, Any]], str] | None" = None,
+    env_digest: str = "",
+    profile_digest: str = "",
+) -> tuple[str, str, str, list[str]]:
+    """Run required validators against the ACTUAL candidate and mint
+    runner-owned validation receipts.
+
+    Returns ``(status, reason_code, reason_text, validation_receipt_ids)``.
+    Each validator is invoked exactly once in declared order; a
+    validation receipt is minted for every invocation so the durable
+    evidence captures both PASS and FAIL outcomes. Receipt minting is
+    best-effort and never fails the task.
+
+    The validation receipt binds to the candidate snapshot/tree
+    captured BEFORE the validator runs (so verification checks the
+    actual candidate state the validator saw). It is distinguished
+    from the broker's ``mutation/apply`` receipt and from any
+    forge-worker local receipt (``trio_workers.validators``).
+    """
     if disposition == Disposition.BLOCKED:
-        return "BLOCKED", "MODEL_BLOCKED", "model reported BLOCKED"
+        return "BLOCKED", "MODEL_BLOCKED", "model reported BLOCKED", []
     if disposition == Disposition.REVIEW_REQUIRED:
-        return "REVIEW_REQUIRED", "MODEL_REVIEW_REQUIRED", "model reported REVIEW_REQUIRED"
+        return "REVIEW_REQUIRED", "MODEL_REVIEW_REQUIRED", "model reported REVIEW_REQUIRED", []
     if disposition != Disposition.DONE:
-        return "REVIEW_REQUIRED", "MODEL_DISPOSITION_UNKNOWN", f"unknown disposition: {disposition}"
+        return "REVIEW_REQUIRED", "MODEL_DISPOSITION_UNKNOWN", f"unknown disposition: {disposition}", []
 
     # source_mutation MUST mutate unless allow_no_mutation=True.
     if manifest.execution_class == ExecutionClass.SOURCE_MUTATION:
         if not applied_proposals and not manifest.commands.allow_no_mutation:
             return "REVIEW_REQUIRED", "NO_MUTATION_APPLIED", (
                 "source_mutation DONE with zero applied proposals"
-            )
+            ), []
 
     repo_root = Path(manifest.repo.path).resolve()
     failures: list[str] = []
+    validation_receipt_ids: list[str] = []
     for vid in manifest.commands.required_validator_ids:
         if vid not in broker.registry._cmds:  # type: ignore[attr-defined]
             if vid == "python_compile":
+                detail = ""
+                ok = True
                 for wp in manifest.paths.write_paths:
                     p = (repo_root / wp).resolve()
                     if not p.exists():
-                        failures.append(f"python_compile missing: {wp}")
-                        continue
+                        ok = False
+                        detail = f"python_compile missing: {wp}"
+                        failures.append(detail)
+                        break
                     import py_compile
                     try:
                         py_compile.compile(str(p), doraise=True)
                     except py_compile.PyCompileError as e:
-                        failures.append(f"python_compile {wp}: {e}")
+                        ok = False
+                        detail = f"python_compile {wp}: {e}"
+                        failures.append(detail)
+                        break
+                outcome = "pass" if ok else "fail"
+                # Mint a single validation receipt for python_compile if
+                # we have a mint callback; otherwise V1 behaviour.
+                _maybe_mint_validation_receipt(
+                    on_validation_receipt=on_validation_receipt,
+                    validator_id=vid,
+                    validator_command=vid,
+                    repo_root=repo_root,
+                    artifact_dir=artifact_dir,
+                    exit_code=0 if ok else 1,
+                    signal_name="",
+                    timed_out=False,
+                    outcome=outcome,  # type: ignore[arg-type]
+                    detail=detail,
+                    env_digest=env_digest,
+                    profile_digest=profile_digest,
+                    validation_receipt_ids=validation_receipt_ids,
+                    manifest=manifest,
+                )
+                if not ok:
+                    continue
                 continue
             if vid == "no_op" or vid == "noop":
+                # A no_op validator ALWAYS passes. Mint a positive receipt.
+                _maybe_mint_validation_receipt(
+                    on_validation_receipt=on_validation_receipt,
+                    validator_id=vid,
+                    validator_command=vid,
+                    repo_root=repo_root,
+                    artifact_dir=artifact_dir,
+                    exit_code=0,
+                    signal_name="",
+                    timed_out=False,
+                    outcome="pass",
+                    detail="no_op validator: pass",
+                    env_digest=env_digest,
+                    profile_digest=profile_digest,
+                    validation_receipt_ids=validation_receipt_ids,
+                    manifest=manifest,
+                )
                 continue
         # Registry-backed validator (worker can run them; model cannot).
         # Use the same owned-process-group helper the broker uses for
         # model-invoked commands so timeouts kill only the validator's pgid.
         spec = broker.registry.get(vid)
-        # Non-mutating validators: capture worktree fingerprint for drift check.
+        # CAPTURE candidate snapshot BEFORE running the validator so the
+        # validation receipt binds to exactly what the validator saw.
+        candidate_snapshot_digest = ""
+        if repo_root.exists():
+            candidate_snapshot_digest = git_worktree_sha(repo_root)
         pre_wt = None
         if spec.side_effects in ("none", "read"):
-            pre_wt = git_worktree_sha(repo_root)
+            pre_wt = candidate_snapshot_digest
+        outcome = "error"
+        exit_code = 0
+        signal_name = ""
+        timed_out = False
+        detail = ""
         try:
             from .broker import _spawn_own_pgrp, _TimeoutExpired
-            if pre_wt is not None:
-                proc = _spawn_own_pgrp(list(spec.argv), cwd=repo_root,
-                                       timeout=spec.timeout_seconds)
-            else:
-                # For mutating validators we don't capture pre/post; allow
-                # them through the safe primitive too. They get a new pgid
-                # so a runaway can be killed precisely.
-                proc = _spawn_own_pgrp(list(spec.argv), cwd=repo_root,
-                                       timeout=spec.timeout_seconds)
+            proc = _spawn_own_pgrp(list(spec.argv), cwd=repo_root,
+                                   timeout=spec.timeout_seconds)
             (artifact_dir / "commands" / vid).mkdir(parents=True, exist_ok=True)
             (artifact_dir / "commands" / vid / "stdout.txt").write_text(proc.stdout or "")
             (artifact_dir / "commands" / vid / "stderr.txt").write_text(proc.stderr or "")
-            if proc.returncode != 0:
-                failures.append(f"{vid} exit={proc.returncode}")
+            exit_code = int(proc.returncode or 0)
+            if exit_code != 0:
+                failures.append(f"{vid} exit={exit_code}")
+                outcome = "fail"
+                detail = f"exit={exit_code}"
+            else:
+                outcome = "pass"
+                detail = "exit=0"
             if pre_wt is not None:
                 post_wt = git_worktree_sha(repo_root)
                 if pre_wt != post_wt:
                     failures.append(f"{vid} non_mutating_command_drift ({pre_wt[:8]}->{post_wt[:8]})")
+                    outcome = "fail"
+                    detail = (detail + f"; drift {pre_wt[:8]}->{post_wt[:8]}").strip("; ")
         except _TimeoutExpired as e:
             failures.append(f"{vid} timed_out: {e}")
+            outcome = "timeout"
+            timed_out = True
+            detail = f"timed_out: {e}"
         except Exception as e:
             failures.append(f"{vid} error={type(e).__name__}: {e}")
+            outcome = "error"
+            detail = f"error={type(e).__name__}: {e}"
+
+        # Mint validation receipt for THIS validator (PASS or FAIL).
+        _maybe_mint_validation_receipt(
+            on_validation_receipt=on_validation_receipt,
+            validator_id=vid,
+            validator_command=spec.command_id,
+            repo_root=repo_root,
+            artifact_dir=artifact_dir,
+            candidate_snapshot_digest=candidate_snapshot_digest,
+            exit_code=exit_code,
+            signal_name=signal_name,
+            timed_out=timed_out,
+            outcome=outcome,  # type: ignore[arg-type]
+            detail=detail,
+            env_digest=env_digest,
+            profile_digest=profile_digest,
+            validation_receipt_ids=validation_receipt_ids,
+            manifest=manifest,
+        )
 
     if manifest.execution_class == ExecutionClass.SOURCE_MUTATION:
         for wp in manifest.paths.write_paths:
@@ -545,8 +691,65 @@ def _finalise(
                 failures.append(f"write target not produced: {wp}")
 
     if failures:
-        return "FAILED", "VALIDATORS_FAILED", "; ".join(failures)
-    return "PASSED", "OK", "all validators passed"
+        return "FAILED", "VALIDATORS_FAILED", "; ".join(failures), validation_receipt_ids
+    return "PASSED", "OK", "all validators passed", validation_receipt_ids
+
+
+def _maybe_mint_validation_receipt(
+    *,
+    on_validation_receipt,
+    validator_id: str,
+    validator_command: str,
+    repo_root: Path,
+    artifact_dir: Path,
+    candidate_snapshot_digest: str = "",
+    exit_code: int,
+    signal_name: str,
+    timed_out: bool,
+    outcome: str,
+    detail: str,
+    env_digest: str,
+    profile_digest: str,
+    validation_receipt_ids: list[str],
+    manifest: TaskManifest,
+) -> None:
+    """Helper: call the runner-owned mint callback if non-None, appending
+    the resulting opaque receipt id. Never raises; minting is best-effort
+    so V1 callers without ``on_validation_receipt`` are unaffected.
+    """
+    if on_validation_receipt is None:
+        return
+    raw_artifact_ref = ""
+    try:
+        rel = (artifact_dir / "commands" / validator_id).relative_to(repo_root)
+        raw_artifact_ref = rel.as_posix()
+    except ValueError:
+        raw_artifact_ref = f"commands/{validator_id}"
+    payload = {
+        "validator_id": validator_id,
+        "validator_command": validator_command,
+        "candidate_snapshot_digest": candidate_snapshot_digest,
+        "candidate_tree_state": "post-apply",
+        "chunk_id": manifest.task_id,  # manifest.task_id doubles as the
+                                       # receive-side chunk/request identifier
+                                       # (always non-empty)
+        "request_id": "",
+        "proposal_id": "",
+        "exit_code": exit_code,
+        "signal_name": signal_name,
+        "timed_out": timed_out,
+        "outcome": outcome,
+        "detail": detail,
+        "raw_artifact_ref": raw_artifact_ref,
+        "env_digest": env_digest,
+        "profile_digest": profile_digest,
+    }
+    try:
+        rid = on_validation_receipt(payload)
+    except Exception:
+        return
+    if rid:
+        validation_receipt_ids.append(rid)
 
 
 # ----------------------------- Approval binding -----------------------------
