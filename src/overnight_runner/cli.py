@@ -290,13 +290,41 @@ def cmd_hermes_capacity(args: argparse.Namespace) -> int:
 
 
 def cmd_hermes_wake(args: argparse.Namespace) -> int:
-    """P07 bounded control: re-evaluate + at most one advancement (thin)."""
+    """P07 bounded control: re-evaluate + at most one REAL claim (thin)."""
     from .p07 import wake_tick
     db = _p07_db()
     try:
-        out = wake_tick(db, campaign_id=args.campaign_id, window_key=args.window_key)
+        out = wake_tick(db, campaign_id=args.campaign_id,
+                        trigger_id=args.trigger_id or "")
     finally:
         db.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_hermes_tick(args: argparse.Namespace) -> int:
+    """P07 bounded control: runner-owned due-work tick over active campaigns."""
+    from .p07 import hermes_tick
+    db = _p07_db()
+    try:
+        out = hermes_tick(db, trigger_id=args.trigger_id or "")
+    finally:
+        db.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_hermes_job(args: argparse.Namespace) -> int:
+    """P07 read-only: public durable job polling surface (thin)."""
+    from .p07 import job_state
+    db = _p07_db()
+    try:
+        out = job_state(db, args.job_id)
+    finally:
+        db.close()
+    if out is None:
+        print(json.dumps({"job_id": args.job_id, "state": "UNKNOWN"}, indent=2))
+        return 1
     print(json.dumps(out, indent=2))
     return 0
 
@@ -381,16 +409,24 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("hermes-capacity", help="P07: provider/account cooldown state")
     s.set_defaults(func=cmd_hermes_capacity)
 
-    s = sub.add_parser("hermes-wake", help="P07: bounded wake/tick (idempotent)")
+    s = sub.add_parser("hermes-wake", help="P07: bounded wake (one real claim per obligation)")
     s.add_argument("campaign_id")
-    s.add_argument("window_key")
+    s.add_argument("--trigger-id", dest="trigger_id", default=None, help="external evidence id")
     s.set_defaults(func=cmd_hermes_wake)
+
+    s = sub.add_parser("hermes-tick", help="P07: runner-owned due-work tick over active campaigns")
+    s.add_argument("--trigger-id", dest="trigger_id", default=None)
+    s.set_defaults(func=cmd_hermes_tick)
 
     s = sub.add_parser("hermes-control", help="P07: short-control request -> durable job id")
     s.add_argument("operation")
     s.add_argument("--campaign-id", dest="campaign_id", default=None)
     s.add_argument("--window-key", dest="window_key", default=None)
     s.set_defaults(func=cmd_hermes_control)
+
+    s = sub.add_parser("hermes-job", help="P07: public durable job polling surface")
+    s.add_argument("job_id")
+    s.set_defaults(func=cmd_hermes_job)
 
     s = sub.add_parser("hermes-adapters", help="P07: schema-defined adapter surface")
     s.set_defaults(func=cmd_hermes_adapters)

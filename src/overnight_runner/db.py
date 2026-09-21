@@ -334,6 +334,62 @@ CREATE TABLE IF NOT EXISTS wake_jobs (
     wake_generation INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS wake_jobs_campaign ON wake_jobs(campaign_id);
+
+-- Append-only normalized capacity outcome history (P07-A02 follow-up).
+-- EVERY classified consequential outcome is persisted here, regardless of
+-- kind; ``provider_cooldowns`` is only a projection for cooling kinds.
+CREATE TABLE IF NOT EXISTS capacity_outcomes (
+    outcome_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    account TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    http_status INTEGER,
+    error_code TEXT NOT NULL DEFAULT '',
+    retry_after_seconds INTEGER,
+    reset_at INTEGER,
+    transport_class TEXT NOT NULL DEFAULT '',
+    occurred_at INTEGER NOT NULL,
+    campaign_id TEXT NOT NULL DEFAULT '',
+    chunk_id TEXT NOT NULL DEFAULT '',
+    obligation TEXT NOT NULL DEFAULT '',
+    evidence_ref TEXT NOT NULL DEFAULT '',
+    classification_source TEXT NOT NULL DEFAULT '',
+    classification_version TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS capacity_outcomes_kind ON capacity_outcomes(kind);
+CREATE INDEX IF NOT EXISTS capacity_outcomes_campaign ON capacity_outcomes(campaign_id);
+
+-- Runner-owned authoritative wake/obligation claim. Idempotency key is
+-- derived from runner state (campaign + obligation + generation), NOT the
+-- caller's external trigger id (which is evidence only).
+CREATE TABLE IF NOT EXISTS wake_claims (
+    claim_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    obligation_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    claimed_at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    caller_trigger_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS wake_claims_campaign ON wake_claims(campaign_id);
+
+-- Runner-owned approved fallback registry (trusted operator surface).
+-- Fallback authority is derived from this + the active grant, never from
+-- a caller-fabricated policy object.
+CREATE TABLE IF NOT EXISTS approved_fallbacks (
+    role TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    runtime_digest TEXT NOT NULL,
+    egress_policy_id TEXT NOT NULL,
+    paid INTEGER NOT NULL DEFAULT 0,
+    cost_microusd INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (role, profile_id)
+);
 """
 
 # Migration log for forward-compatible schema versioning. Each versioned
@@ -396,6 +452,7 @@ class Database:
         self._record_migration("p06-followup3-0004-lease-process-identity")
         # P07 (Hermes foreman) — runner-owned capacity/cooldown/wait/job tables.
         self._record_migration("p07-0001-hermes-foreman-tables")
+        self._record_migration("p07-0002-capacity-outcomes-wake-claims-fallbacks")
         for _tbl, _col, _decl in (
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
