@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,59 @@ class LeaseRequest:
     ttl_seconds: int
 
 
+# ---------------------------------------------------------------------------
+# Process identity (P06 follow-up #3 A06, item 9)
+# ---------------------------------------------------------------------------
+
+def host_boot_id() -> str:
+    """Return the host boot id (``/proc/sys/kernel/random/boot_id``).
+
+    Returns ``""`` when unavailable (non-Linux / restricted /proc).
+    The boot id changes across a host reboot, so a stored boot id that
+    no longer matches the live host proves the lease predates a reboot
+    and can never be held by a live process.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def proc_start_time(pid: int) -> str:
+    """Return field 22 (starttime) of ``/proc/<pid>/stat`` as a string.
+
+    ``starttime`` is expressed in clock ticks since boot; combined with
+    the boot id it is a stable process identity that survives PID
+    reuse detection (a reused PID has a different starttime). Returns
+    ``""`` when the process is gone or the field is unreadable.
+    """
+    if pid <= 0:
+        return ""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            line = f.read()
+    except OSError:
+        return ""
+    # The comm field may contain spaces/parentheses; split after the
+    # last ')'.
+    try:
+        rest = line.rsplit(")", 1)[-1].strip().split()
+    except Exception:
+        return ""
+    # After comm, field 3 is state (index 0 here); starttime is field
+    # 22 overall => index 22 - 3 + 1 = 20 in ``rest``.
+    idx = 22 - 3
+    if len(rest) <= idx:
+        return ""
+    return rest[idx]
+
+
+def process_identity(pid: int) -> dict[str, str]:
+    """Return ``{"boot_id":..., "start_time":...}`` for ``pid``."""
+    return {"boot_id": host_boot_id(), "start_time": proc_start_time(pid)}
+
+
 def acquire_lease(
     db: Database,
     *,
@@ -59,86 +113,137 @@ def acquire_lease(
     owner_pid: int,
     fence_generation: int,
     ttl_seconds: int,
+    owner_start_time: str | None = None,
 ) -> Lease:
     """Acquire a fresh lease for ``resource_id`` in ``campaign_id``.
 
     A live lease for the same resource blocks acquisition. The caller
     is responsible for ensuring the supplied ``fence_generation``
     matches the campaign's current fence (see ``current_fence``).
+
+    P06 follow-up #3 (A06 item 9): the lease records the EXACT process
+    identity. We prefer the live host boot id and the process
+    start-time (from ``/proc``) so a reused PID cannot impersonate the
+    old worker. Callers may still pass a legacy ``owner_boot_id``; when
+    the host boot id is readable it is authoritative.
+    """
+    with db.transaction() as cur:
+        return _acquire_lease_cur(
+            cur, db,
+            campaign_id=campaign_id,
+            resource_id=resource_id,
+            owner_id=owner_id,
+            owner_boot_id=owner_boot_id,
+            owner_pid=owner_pid,
+            fence_generation=fence_generation,
+            ttl_seconds=ttl_seconds,
+            owner_start_time=owner_start_time,
+        )
+
+
+def _acquire_lease_cur(
+    cur: Any,
+    db: Database,
+    *,
+    campaign_id: str,
+    resource_id: str,
+    owner_id: str,
+    owner_boot_id: str,
+    owner_pid: int,
+    fence_generation: int,
+    ttl_seconds: int,
+    owner_start_time: str | None = None,
+) -> Lease:
+    """Lease acquisition that runs on an EXISTING cursor/transaction.
+
+    Used by the single-transaction derivation path
+    (``admission.derive_admission``) so the reservation, lease, chunk,
+    and admission rows commit atomically (P06 follow-up #3 A03 item 2).
     """
     if ttl_seconds <= 0:
         raise SafetyError("ttl_seconds must be > 0")
-    # Initialise fence on first use.
     fence = current_fence(db, campaign_id)
     if fence.current_generation != fence_generation:
         raise SafetyError(
             f"fence_mismatch: campaign fence={fence.current_generation} != "
             f"requested={fence_generation}"
         )
-
+    real_boot = host_boot_id()
+    stored_boot = real_boot or owner_boot_id
+    stored_start = (
+        owner_start_time if owner_start_time is not None
+        else proc_start_time(owner_pid)
+    )
     now = int(time.time())
     expires_at = now + int(ttl_seconds)
     lease_id = f"lse-{uuid.uuid4().hex[:16]}"
-
-    with db.transaction() as cur:
-        # Reject if a LIVE lease exists for the same resource OR an
-        # expired-but-unreleased lease whose holder is still alive
-        # (P06 follow-up #2 A06).
-        cur.execute(
-            """
-            SELECT lease_id, expires_at, released_at, owner_pid,
-                   owner_boot_id, fence_generation FROM leases
-            WHERE campaign_id=? AND resource_id=? AND released_at=0
-            """,
-            (campaign_id, resource_id),
-        )
-        live = cur.fetchone()
-        if live is not None:
-            if live["expires_at"] > now:
-                # Fresh live lease; reject immediately.
-                raise SafetyError(
-                    f"resource busy: lease {live['lease_id']} still live "
-                    f"(expires_at={live['expires_at']})"
-                )
-            # Lease is expired but UNRELEASED. The holder remains an
-            # authority object requiring explicit reconciliation. If
-            # the holder is still alive, direct acquire must fail.
-            if holder_process_alive(
-                owner_pid=int(live["owner_pid"]),
-                owner_boot_id=live["owner_boot_id"],
-                fence_generation=int(live["fence_generation"]),
-            ):
-                raise SafetyError(
-                    f"expired_but_live: lease {live['lease_id']} expired "
-                    f"but holder pid={live['owner_pid']} is still alive; "
-                    f"explicit takeover required"
-                )
-        cur.execute(
-            """
-            INSERT INTO leases (
-                lease_id, campaign_id, resource_id, owner_id,
-                owner_boot_id, owner_pid, fence_generation,
-                acquired_at, expires_at, released_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,0)
-            """,
-            (
-                lease_id, campaign_id, resource_id, owner_id,
-                owner_boot_id, owner_pid, fence_generation,
-                now, expires_at,
-            ),
-        )
+    # Reject if a LIVE lease exists for the same resource OR an
+    # expired-but-unreleased lease whose holder is still alive
+    # (P06 follow-up #2 A06).
+    cur.execute(
+        """
+        SELECT lease_id, expires_at, released_at, owner_pid,
+               owner_boot_id, owner_start_time, fence_generation
+        FROM leases
+        WHERE campaign_id=? AND resource_id=? AND released_at=0
+        """,
+        (campaign_id, resource_id),
+    )
+    live = cur.fetchone()
+    if live is not None:
+        if live["expires_at"] > now:
+            raise SafetyError(
+                f"resource busy: lease {live['lease_id']} still live "
+                f"(expires_at={live['expires_at']})"
+            )
+        if holder_process_alive(
+            owner_pid=int(live["owner_pid"]),
+            owner_boot_id=live["owner_boot_id"],
+            fence_generation=int(live["fence_generation"]),
+            owner_start_time=_row_get(live, "owner_start_time") or None,
+        ):
+            raise SafetyError(
+                f"expired_but_live: lease {live['lease_id']} expired "
+                f"but holder pid={live['owner_pid']} is still alive; "
+                f"explicit takeover required"
+            )
+    cur.execute(
+        """
+        INSERT INTO leases (
+            lease_id, campaign_id, resource_id, owner_id,
+            owner_boot_id, owner_pid, fence_generation,
+            acquired_at, expires_at, released_at, owner_start_time
+        ) VALUES (?,?,?,?,?,?,?,?,?,0,?)
+        """,
+        (
+            lease_id, campaign_id, resource_id, owner_id,
+            stored_boot, owner_pid, fence_generation,
+            now, expires_at, stored_start,
+        ),
+    )
     return Lease(
         lease_id=lease_id,
         campaign_id=campaign_id,
         resource_id=resource_id,
         owner_id=owner_id,
-        owner_boot_id=owner_boot_id,
+        owner_boot_id=stored_boot,
         owner_pid=owner_pid,
         fence_generation=fence_generation,
         acquired_at=now,
         expires_at=expires_at,
         released_at=0,
     )
+
+
+def _row_get(row: Any, key: str) -> Any:
+    """Return ``row[key]`` or ``None`` when the column is absent."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return None
+    if key not in keys:
+        return None
+    return row[key]
 
 
 def release_lease(db: Database, *, lease_id: str) -> None:
@@ -212,14 +317,31 @@ def enforce_fence(
 
 
 def holder_process_alive(
-    *, owner_pid: int, owner_boot_id: str, fence_generation: int,
+    *,
+    owner_pid: int,
+    owner_boot_id: str,
+    fence_generation: int,
+    owner_start_time: str | None = None,
 ) -> bool:
     """Best-effort check whether the lease holder's process is alive.
 
-    In our test fixture the holder is the same process that opened
-    the lease; we use ``/proc/<pid>`` on Linux. ``status`` field in
-    ``/proc/<pid>/stat`` is 'Z' for zombie (defunct) and 'X' for
-    dead. Any other state is live.
+    Identity checks (P06 follow-up #3 A06 item 9), applied in order:
+
+      1. ``owner_pid`` must be > 0 and signalable.
+      2. ``/proc/<pid>/stat`` must exist and its state must not be
+         ``Z`` (zombie) or ``X`` (dead).
+      3. If ``owner_start_time`` is provided (a lease that recorded a
+         real process identity), the live host boot id must equal
+         ``owner_boot_id`` when both are readable, and the live
+         ``starttime`` must equal ``owner_start_time``. A mismatch
+         proves the PID was reused or the lease predates a reboot.
+
+    Step 3 is the anti-PID-reuse guarantee. Callers that pass only a
+    legacy synthetic boot id (no start time) retain the historical
+    PID-liveness behaviour, since no authoritative host identity is
+    available to compare against.
+
+    We never broad-kill by process name; identity is specific.
     """
     try:
         if owner_pid <= 0:
@@ -237,6 +359,17 @@ def holder_process_alive(
         state = parts[0]
         if state in ("Z", "X"):
             return False
+
+        if owner_start_time is not None:
+            real_boot = host_boot_id()
+            if owner_boot_id and real_boot and owner_boot_id != real_boot:
+                # Recorded identity predates a reboot (or the holder is
+                # not the same host): not the lease holder.
+                return False
+            live_start = proc_start_time(owner_pid)
+            if live_start and live_start != owner_start_time:
+                # PID was reused by a different process.
+                return False
         return True
     except Exception:
         return False
@@ -280,7 +413,8 @@ def expire_overdue_leases(db: Database, *, now: int | None = None) -> list[str]:
     with db.transaction() as cur:
         cur.execute(
             """
-            SELECT lease_id, owner_pid, owner_boot_id, fence_generation
+            SELECT lease_id, owner_pid, owner_boot_id, owner_start_time,
+                   fence_generation
             FROM leases WHERE released_at=0 AND expires_at > 0 AND expires_at <= ?
             """,
             (now,),
@@ -291,6 +425,7 @@ def expire_overdue_leases(db: Database, *, now: int | None = None) -> list[str]:
                 owner_pid=int(r["owner_pid"]),
                 owner_boot_id=r["owner_boot_id"],
                 fence_generation=int(r["fence_generation"]),
+                owner_start_time=r.get("owner_start_time") or None,
             )
             if alive:
                 # Holder still alive; refuse to silently release.
@@ -303,6 +438,67 @@ def expire_overdue_leases(db: Database, *, now: int | None = None) -> list[str]:
     return released
 
 
+def load_lease_row(db: Database, lease_id: str) -> dict[str, Any] | None:
+    """Return the raw lease row (including identity columns) or ``None``."""
+    cur = db._conn.execute("SELECT * FROM leases WHERE lease_id=?", (lease_id,))
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def live_lease_for_campaign(
+    db: Database,
+    campaign_id: str,
+    *,
+    resource_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the live (unreleased) lease row for a campaign, if any.
+
+    P06 follow-up #3 (A06 item 11): ``apply_campaign_patch`` resolves
+    the caller's lease against this durable record so a fence
+    generation alone (a released worker's stale token) cannot author a
+    campaign mutation.
+    """
+    if resource_id is not None:
+        cur = db._conn.execute(
+            "SELECT * FROM leases WHERE campaign_id=? AND resource_id=? AND released_at=0 "
+            "ORDER BY acquired_at DESC LIMIT 1",
+            (campaign_id, resource_id),
+        )
+    else:
+        cur = db._conn.execute(
+            "SELECT * FROM leases WHERE campaign_id=? AND released_at=0 "
+            "ORDER BY acquired_at DESC LIMIT 1",
+            (campaign_id,),
+        )
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+@contextmanager
+def campaign_mutation_lock(db: Database):
+    """Hold the runner DB write lock across a short consequential write.
+
+    P06 follow-up #3 (A06 item 10): the campaign patch apply and the
+    takeover/fence increment MUST be serialized so there is no ordering
+    in which a stale writer mutates the worktree AFTER the new fence is
+    established. SQLite ``BEGIN IMMEDIATE`` acquires the database write
+    lock; ``revoke_for_takeover`` uses the same lock, so the two are
+    mutually exclusive.
+
+    The lock is deliberately short-lived: it must NOT span model
+    inference or long validators — only the fence re-check + atomic
+    file apply + durable apply evidence.
+    """
+    cur = db._conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        yield cur
+        cur.execute("COMMIT")
+    except Exception:
+        cur.execute("ROLLBACK")
+        raise
+
+
 __all__ = [
     "LeaseRequest",
     "acquire_lease",
@@ -311,6 +507,12 @@ __all__ = [
     "current_fence",
     "enforce_fence",
     "holder_process_alive",
+    "host_boot_id",
+    "proc_start_time",
+    "process_identity",
     "load_lease",
+    "load_lease_row",
+    "live_lease_for_campaign",
+    "campaign_mutation_lock",
     "expire_overdue_leases",
 ]

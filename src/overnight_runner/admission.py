@@ -57,7 +57,8 @@ from .plans import (
     load_plan,
     load_plan_digest,
 )
-from .resources import acquire_lease, current_fence
+from .failpoints import failpoint_armed, raise_failpoint
+from .resources import _acquire_lease_cur, current_fence
 from .safety import SafetyError
 
 
@@ -259,25 +260,26 @@ def derive_admission(
 
     chunk_checksum = _checksum_chunk(chunk)
 
-    # ----- (E+A03) Atomic idempotency reservation BEFORE any lease.
-    # A SINGLE transaction:
-    #   - inspect the race_admissions row for the idem_key
-    #   - if existing SAME content: return/reload same admission
-    #   - if existing DIFFERENT content: raise AdmissionConflict
-    #   - if absent: insert a RESERVED race_admissions row that wins
-    #     only if no other inserter beat us. Then proceed to lease
-    #     allocation only if THIS transaction wins the durable insert.
-    # Concurrent same-content callers all resolve to the same
-    # admission; losers retry and observe the existing winner.
+    # ----- (E+A03) Atomic idempotency reservation, lease, chunk, and
+    # admission in ONE transaction (P06 follow-up #3 A03 item 2).
+    #
+    # The prior design committed the reservation first and inserted the
+    # admission in a LATER transaction. A crash in between left a
+    # permanent idempotency row pointing at a missing admission, which
+    # poisoned every same-content replay forever ("idempotency record
+    # references missing admission"). Committing the reservation, the
+    # authority lease, the chunk row, and the admission row together
+    # means a crash before the admission is durable rolls the entire
+    # reservation back: a later same-content retry then legitimately
+    # mints exactly one admission and exactly one lease.
+    #
+    # Concurrent same-content callers all resolve to the same admission
+    # because SQLite serializes the ``BEGIN IMMEDIATE`` transactions and
+    # the ``race_admissions`` PRIMARY KEY is the durable winner record.
     fence = current_fence(db, chunk.campaign_id)
     new_generation = fence.current_generation
 
-    reservation_id = f"adm-{chunk.chunk_id}-{uuid.uuid4().hex[:12]}"
-    winner_admission_id: str | None = None
-    ledger: BudgetLedgerEntry | None = None
-
-    # Initial pass: load or load-or-create ledger. Ledger is a
-    # precondition for the durable reservation.
+    # Ledger is a precondition for the durable reservation.
     ledger = _load_or_create_ledger(
         db, chunk.campaign_id, stored.grant_id,
         family_id=chunk.package_id, grant=stored,
@@ -286,6 +288,9 @@ def derive_admission(
     if exhaustion is not None:
         raise SafetyError(f"budget: {exhaustion}")
 
+    reservation_id = f"adm-{chunk.chunk_id}-{uuid.uuid4().hex[:12]}"
+    required_validator_ids_json = json.dumps(list(chunk.required_validator_ids or []))
+
     with db.transaction() as cur:
         cur.execute(
             "SELECT admission_id, content_sha256 FROM race_admissions WHERE idem_key=?",
@@ -293,89 +298,73 @@ def derive_admission(
         )
         existing = cur.fetchone()
         if existing is not None:
-            stored_sha = existing["content_sha256"]
-            if stored_sha == chunk_checksum:
-                # Idempotent replay — return the prior receipt.
-                winner_admission_id = existing["admission_id"]
-                cur.execute(
-                    "SELECT * FROM admissions WHERE admission_id=?",
-                    (winner_admission_id,),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    raise SafetyError("idempotency record references missing admission")
-                rec = _row_to_admission(dict(row))
-                if ledger is None or ledger.ledger_id != rec.budget_ledger_id:
-                    ledger = _load_ledger(db, rec.budget_ledger_id)
-                if ledger is None:
-                    raise SafetyError("idempotency record references missing budget ledger")
-                # Skip the lease allocation + INSERT block below.
-                cur.execute("SELECT 1")
-            else:
+            if existing["content_sha256"] != chunk_checksum:
                 raise AdmissionConflict(
                     f"idempotency_key {chunk.idempotency_key} presented with DIFFERENT content"
                 )
-        else:
-            # RESERVED winner inserted atomically; if a concurrent
-            # caller already inserted the same idem_key we raise
-            # ClaimConflict so the caller retries. The durable row is
-            # the winner record; lease allocation follows.
-            try:
-                cur.execute(
-                    "INSERT INTO race_admissions (idem_key, admission_id, content_sha256, issued_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (chunk.idempotency_key, reservation_id, chunk_checksum, now),
-                )
-            except Exception as e:
-                # PRIMARY KEY collision means a concurrent inserter
-                # already won; surface as a retryable conflict.
-                raise SafetyError(
-                    f"idempotency reservation conflict: another worker "
-                    f"already inserted idem_key={chunk.idempotency_key} "
-                    f"({type(e).__name__})"
-                )
+            # Idempotent replay — reload the prior admission + ledger.
+            cur.execute(
+                "SELECT * FROM admissions WHERE admission_id=?",
+                (existing["admission_id"],),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise SafetyError("idempotency record references missing admission")
+            rec = _row_to_admission(dict(row))
+            led = _load_ledger(db, rec.budget_ledger_id)
+            if led is None:
+                raise SafetyError("idempotency record references missing budget ledger")
+            return rec, led
 
-    if winner_admission_id is not None:
-        return rec, ledger
+        # Durable winner: the reservation row is inserted in the SAME
+        # transaction as the lease + chunk + admission below.
+        cur.execute(
+            "INSERT INTO race_admissions (idem_key, admission_id, content_sha256, issued_at) "
+            "VALUES (?, ?, ?, ?)",
+            (chunk.idempotency_key, reservation_id, chunk_checksum, now),
+        )
+        # Authority lease, cursor-scoped, same transaction.
+        lease = _acquire_lease_cur(
+            cur, db,
+            campaign_id=chunk.campaign_id,
+            resource_id=f"admission:{chunk.chunk_id}",
+            owner_id=worker_id,
+            owner_boot_id=os.environ.get("TR_BOOT_ID", "boot-static"),
+            owner_pid=int(os.getpid()),
+            fence_generation=new_generation,
+            ttl_seconds=300,
+        )
+        # Failpoint: reservation + lease are staged but the admission
+        # row is not yet durable. The transaction rolls back, leaving NO
+        # dangling reservation (A03/A16 crash-safety).
+        if failpoint_armed("reserve_before_admission_durable"):
+            raise_failpoint("reserve_before_admission_durable")
 
-    # ----- Lease allocation only for the durable winner.
-    lease = acquire_lease(
-        db,
-        campaign_id=chunk.campaign_id,
-        resource_id=f"admission:{chunk.chunk_id}",
-        owner_id=worker_id,
-        owner_boot_id=os.environ.get("TR_BOOT_ID", "boot-static"),
-        owner_pid=int(os.getpid()),
-        fence_generation=new_generation,
-        ttl_seconds=300,
-    )
-
-    admission_id = reservation_id
-    receipt = AdmissionReceipt(
-        schema_version="trio.admission.v1",
-        admission_id=admission_id,
-        grant_id=stored.grant_id,
-        grant_revision=stored.plan_revision,
-        chunk_id=chunk.chunk_id,
-        chunk_revision=chunk.revision,
-        accepted_predecessor_snapshot=current_accepted_snapshot,
-        runtime_digest=current_runtime_digest,
-        model_name=stored.model_name,
-        model_digest=stored.model_digest,
-        policy_profile_id=stored.policy_profile_id,
-        validator_profile_ids=list(stored.validator_profile_ids),
-        provider_profile_id=stored.provider_profile_id,
-        worker_id=worker_id,
-        budget_ledger_id=ledger.ledger_id,
-        fence_generation=new_generation,
-        lease_id=lease.lease_id,
-        idempotency_key=chunk.idempotency_key,
-        issued_at=now,
-        issuer="runner",
-    )
-    receipt_payload = json.dumps(receipt.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    snap_payload = json.dumps(current_accepted_snapshot.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    with db.transaction() as cur:
+        admission_id = reservation_id
+        receipt = AdmissionReceipt(
+            schema_version="trio.admission.v1",
+            admission_id=admission_id,
+            grant_id=stored.grant_id,
+            grant_revision=stored.plan_revision,
+            chunk_id=chunk.chunk_id,
+            chunk_revision=chunk.revision,
+            accepted_predecessor_snapshot=current_accepted_snapshot,
+            runtime_digest=current_runtime_digest,
+            model_name=stored.model_name,
+            model_digest=stored.model_digest,
+            policy_profile_id=stored.policy_profile_id,
+            validator_profile_ids=list(stored.validator_profile_ids),
+            provider_profile_id=stored.provider_profile_id,
+            worker_id=worker_id,
+            budget_ledger_id=ledger.ledger_id,
+            fence_generation=new_generation,
+            lease_id=lease.lease_id,
+            idempotency_key=chunk.idempotency_key,
+            issued_at=now,
+            issuer="runner",
+        )
+        receipt_payload = json.dumps(receipt.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        snap_payload = json.dumps(current_accepted_snapshot.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         cur.execute(
             """
             INSERT INTO chunks (
@@ -383,8 +372,9 @@ def derive_admission(
                 idempotency_key, state,
                 snapshot_commit, snapshot_tree_digest,
                 accepted_predecessor_commit, accepted_predecessor_tree,
-                admission_id, created_at, updated_at, idempotency_content_sha256
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                admission_id, created_at, updated_at, idempotency_content_sha256,
+                required_validator_ids_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 chunk.chunk_id, chunk.campaign_id, chunk.package_id, chunk.parent_chunk_id,
@@ -392,6 +382,7 @@ def derive_admission(
                 None, None,
                 current_accepted_snapshot.commit, current_accepted_snapshot.tree_digest,
                 receipt.admission_id, now, now, chunk_checksum,
+                required_validator_ids_json,
             ),
         )
         cur.execute(
@@ -601,7 +592,7 @@ def check_campaign_continuation(
     # admission; a continuation check that runs BEFORE any admission
     # is allowed to see no ledger.
     cur = db._conn.execute(
-        "SELECT bounds_json FROM budget_ledgers WHERE campaign_id=? "
+        "SELECT ledger_id, bounds_json FROM budget_ledgers WHERE campaign_id=? "
         "ORDER BY revision DESC LIMIT 1",
         (campaign_id,),
     )
@@ -613,16 +604,29 @@ def check_campaign_continuation(
         bounds = None
         chunks_so_far = 0
     else:
-        bounds = Budget.model_validate(json.loads(row["bounds_json"]))
-        cur = db._conn.execute(
-            "SELECT COUNT(*) AS n FROM chunks WHERE campaign_id=?",
-            (campaign_id,),
-        )
-        chunks_so_far = int(cur.fetchone()["n"])
-        if chunks_so_far >= bounds.max_chunks:
+        # Trusted durable ledger totals/bounds — NOT an incidental
+        # ``COUNT(*) FROM chunks`` (P06 follow-up #3 item 13).
+        ledger = _load_ledger(db, row["ledger_id"])
+        if ledger is None:
             raise SafetyError(
-                f"campaign {campaign_id!r} has exhausted its chunk budget "
-                f"({chunks_so_far}/{bounds.max_chunks})"
+                f"campaign {campaign_id!r} ledger {row['ledger_id']!r} vanished"
+            )
+        bounds = ledger.bounds
+        chunks_so_far = ledger.cumulative_chunks
+        # Block continuation when any already-consumed dimension leaves
+        # no permitted capacity required by the next operation. We
+        # require headroom for at least one more chunk plus the minimal
+        # per-chunk model/tool/active-time deltas.
+        reason = ledger.would_exceed(
+            delta_chunks=1,
+            delta_model_calls=1,
+            delta_tool_calls=1,
+            delta_active_seconds=1,
+        )
+        if reason is not None:
+            raise SafetyError(
+                f"campaign {campaign_id!r} has no budget headroom for the next "
+                f"operation: {reason}"
             )
     # PAUSED sentinel.
     from .runtime import is_paused

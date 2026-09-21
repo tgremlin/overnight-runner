@@ -249,7 +249,9 @@ class TestMigrationFromPreP06(unittest.TestCase):
             cur = db2._conn.execute(
                 "SELECT COUNT(*) AS n FROM schema_migrations"
             )
-            self.assertEqual(cur.fetchone()["n"], 3)
+            n_first = cur.fetchone()["n"]
+            # At least the three P06 migration families are recorded.
+            self.assertGreaterEqual(n_first, 3)
             # V1 rows still byte-equivalent.
             cur = db2._conn.execute(
                 "SELECT COUNT(*) AS n FROM tasks"
@@ -257,6 +259,15 @@ class TestMigrationFromPreP06(unittest.TestCase):
             self.assertEqual(cur.fetchone()["n"], 2)
         finally:
             db2.close()
+        # Reopening again records no duplicate migration rows.
+        db3 = Database(db_path)
+        try:
+            cur = db3._conn.execute(
+                "SELECT COUNT(*) AS n FROM schema_migrations"
+            )
+            self.assertEqual(cur.fetchone()["n"], n_first)
+        finally:
+            db3.close()
 
 
 if __name__ == "__main__":

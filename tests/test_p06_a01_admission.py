@@ -310,23 +310,13 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
             base = _head_sha_padded(repo)
             # Insert a draft grant (no protected approval activation).
             _insert_draft_grant_directly(db, grant_pinned)
-            # The campaign can still be created (its durable metadata
-            # is resolved from the registered plan and the draft grant
-            # row, since activate_grant is not required for create).
-            camp = create_campaign(
-                db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
-                base_commit=base, base_tree_digest="b" * 64,
-            )
-            activate_campaign(db, campaign_id=camp.campaign_id)
+            # P06 follow-up #3 (item 1/14): a non-active grant may not
+            # create a campaign — campaign creation now carries the
+            # grant-state authority check.
             with self.assertRaises(Exception) as ctx:
-                derive_admission(
-                    db, grant=grant_pinned, chunk=_valid_chunk(camp.campaign_id),
-                    worker_id="wkr-1",
-                    policy_profile_id=grant_pinned.policy_profile_id,
-                    validator_profile_ids=list(grant_pinned.validator_profile_ids),
-                    provider_profile_id=grant_pinned.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
-                    **_required_kwargs(grant_pinned),
+                create_campaign(
+                    db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
+                    base_commit=base, base_tree_digest="b" * 64,
                 )
             self.assertIn("grant state", str(ctx.exception).lower())
         finally:
@@ -433,21 +423,12 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
             stored = load_grant(db, grant_pinned.grant_id)
             self.assertEqual(stored.state, "revoked")
             base = _head_sha_padded(repo)
-            camp = create_campaign(
-                db, plan_id=grant.plan_id, grant_id=grant.grant_id,
-                base_commit=base, base_tree_digest="b" * 64,
-            )
-            activate_campaign(db, campaign_id=camp.campaign_id)
+            # P06 follow-up #3 (item 1/14): a revoked grant may not
+            # create a campaign; the rejection fires at creation.
             with self.assertRaises(Exception) as ctx:
-                derive_admission(
-                    db, grant=stored, chunk=_valid_chunk(camp.campaign_id),
-
-                    worker_id="wkr-1",
-                    policy_profile_id=stored.policy_profile_id,
-                    validator_profile_ids=list(stored.validator_profile_ids),
-                    provider_profile_id=stored.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
-                    **_required_kwargs(stored),
+                create_campaign(
+                    db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+                    base_commit=base, base_tree_digest="b" * 64,
                 )
             self.assertIn("grant state", str(ctx.exception).lower())
         finally:

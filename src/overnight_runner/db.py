@@ -325,12 +325,52 @@ class Database:
         self._record_migration("p06-followup2-0001-wall-seconds-budget-column")
         # Forward migration: ensure cumulative_wall_seconds column exists
         # in legacy DBs that predate the P06 follow-up #2 followup.
+        self._ensure_column(
+            "budget_ledgers", "cumulative_wall_seconds", "INTEGER NOT NULL DEFAULT 0"
+        )
+        # P06 follow-up #3 (A04/A05/A06) additive columns.
+        #   * campaigns.repo_root / worktree_path: durable repository
+        #     identity so reconciliation inspects the ACTUAL campaign
+        #     repo, not the runner state dir (A05 item 7).
+        #   * chunks.required_validator_ids_json: durable chunk authority
+        #     for the REQUIRED validator/profile set (A04 item 4).
+        #   * crash_windows.repo_root/worktree_path/integration_branch/
+        #     evidence_json: enough durable intent + repo identity for
+        #     restart reconciliation to inspect the real ref (A05 items
+        #     6/7).
+        #   * leases.owner_start_time: process start-time identity so a
+        #     reused PID cannot impersonate an old worker (A06 item 9).
+        self._record_migration("p06-followup3-0001-campaign-repo-identity")
+        self._record_migration("p06-followup3-0002-chunk-required-validators")
+        self._record_migration("p06-followup3-0003-crash-window-repo-identity")
+        self._record_migration("p06-followup3-0004-lease-process-identity")
+        for _tbl, _col, _decl in (
+            ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
+            ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
+            ("chunks", "required_validator_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("crash_windows", "repo_root", "TEXT NOT NULL DEFAULT ''"),
+            ("crash_windows", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
+            ("crash_windows", "integration_branch", "TEXT NOT NULL DEFAULT ''"),
+            ("crash_windows", "evidence_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("leases", "owner_start_time", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            self._ensure_column(_tbl, _col, _decl)
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        """Idempotently add ``column`` to ``table`` if it does not exist.
+
+        SQLite has no ``ADD COLUMN IF NOT EXISTS``; we inspect
+        ``PRAGMA table_info`` so the migration is safe to apply to
+        both fresh and legacy databases.
+        """
         try:
-            self._conn.execute(
-                "ALTER TABLE budget_ledgers ADD COLUMN cumulative_wall_seconds INTEGER NOT NULL DEFAULT 0"
-            )
+            cur = self._conn.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in cur.fetchall()}
+            if column in existing:
+                return
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         except Exception:
-            pass  # column already exists
+            pass  # best-effort forward migration
 
     def close(self) -> None:
         try:

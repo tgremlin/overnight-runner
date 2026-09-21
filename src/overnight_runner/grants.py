@@ -117,8 +117,10 @@ def activate_grant(
         raise SafetyError(
             "approval grant_digest_target does not match the supplied grant digest"
         )
-    # (3) All three identity checks passed. Consume the approval.
-    consume_protected_approval(db, approval_id)
+    # (3) All identity checks passed. Consume the approval AND insert
+    # the active grant in ONE transaction (P06 follow-up #3 item 15):
+    # a crash between consumption and grant insert must NOT burn the
+    # one-shot approval without producing a grant.
     ts = int(activated_at if activated_at is not None else time.time())
     active = grant.model_copy(
         update={
@@ -130,7 +132,18 @@ def activate_grant(
     )
     digest = _grant_digest(active)
     payload = json.dumps(grant_payload(active), sort_keys=True, separators=(",", ":"))
+    from .failpoints import failpoint_armed, raise_failpoint
     with db.transaction() as cur:
+        # Atomic one-shot consumption: refuse if already consumed.
+        cur.execute(
+            "UPDATE protected_approvals SET consumed_at=? "
+            "WHERE approval_id=? AND consumed_at=0",
+            (ts, approval_id),
+        )
+        if cur.rowcount == 0:
+            raise SafetyError(
+                f"approval {approval_id} already consumed; one-shot consumption enforced"
+            )
         cur.execute(
             """
             INSERT INTO grants (
@@ -148,6 +161,11 @@ def activate_grant(
                 payload,
             ),
         )
+        # Failpoint: crash after consume but before the transaction
+        # commits. The whole transaction rolls back, so the approval is
+        # NOT burned (transactional activation).
+        if failpoint_armed("activate_grant_before_commit"):
+            raise_failpoint("activate_grant_before_commit")
     return GrantActivationResult(
         grant_id=active.grant_id,
         activated_at=active.activated_at,
@@ -248,7 +266,24 @@ def expire_orphan_grants(db: Database, *, now: int | None = None) -> list[str]:
 
 
 def derive_initial_ledger(db: Database, *, campaign_id: str, grant: AutonomyGrant, family_id: str) -> BudgetLedgerEntry:
-    """Create the immutable initial budget ledger for a campaign."""
+    """Create the immutable initial budget ledger for a campaign.
+
+    P06 follow-up #3 item 12: V1 of campaign-v2 has exactly ONE
+    authoritative budget ledger per campaign — the single campaign
+    ledger IS the family ledger. We refuse to create a second ledger
+    for the same campaign so an unbounded second family can never be
+    minted; rechunks/revisions reuse the same ledger.
+    """
+    existing = db._conn.execute(
+        "SELECT ledger_id FROM budget_ledgers WHERE campaign_id=? LIMIT 1",
+        (campaign_id,),
+    ).fetchone()
+    if existing is not None:
+        raise SafetyError(
+            f"campaign {campaign_id!r} already has budget ledger "
+            f"{existing['ledger_id']!r}; the single campaign ledger is the "
+            f"authoritative family ledger (no second family)"
+        )
     ledger = BudgetLedgerEntry(
         ledger_id=f"bl-{campaign_id}",
         campaign_id=campaign_id,

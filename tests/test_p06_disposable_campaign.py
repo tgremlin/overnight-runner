@@ -153,12 +153,9 @@ def _required_kwargs(grant: AutonomyGrant) -> dict:
 
 def _run_real_validator(
     *,
-    repo_root: Path,
     worktree: Path,
     artifact_dir: Path,
-    manifest_path: Path,
     validator_command: str,
-    candidate_snapshot_digest: str,
     chunk_id: str,
 ) -> str:
     """Traverse the real required-validator boundary.
@@ -166,9 +163,19 @@ def _run_real_validator(
     Builds a minimal ``Broker`` with a noop validator and invokes
     ``Worker._finalise`` so a real ``kind=validation`` receipt is
     minted bound to the EXACT candidate snapshot.
+
+    P06 follow-up #3 (A04 items 3/5):
+
+      * ``_finalise`` runs against the ACTUAL campaign worktree, so its
+        ``git_worktree_sha(worktree)`` candidate snapshot is the real
+        canonical candidate.
+      * The manifest passed to ``_finalise`` points at the campaign
+        worktree (NOT the main fixture repo).
+      * The mint callback uses ``payload["candidate_snapshot_digest"]``
+        from ``_finalise`` — it NEVER substitutes a caller-supplied
+        Git tree SHA.
     """
     from overnight_runner.schemas import TaskManifest, ExecutionClass, Disposition
-    from overnight_runner.worker import Worker
 
     # Build a registry whose only validator is the one we want.
     reg = CommandRegistry()
@@ -190,31 +197,36 @@ def _run_real_validator(
     minted_ids: list[str] = []
 
     def _mint(payload):
+        # Use the ACTUAL payload from _finalise, bound to the campaign
+        # worktree candidate snapshot.
         rid = mint_validation_receipt(
-            validator_id=validator_command,
-            validator_command=validator_command,
-            validator_profile=validator_command,
-            candidate_snapshot_digest=candidate_snapshot_digest,
-            candidate_tree_state="post-apply",
-            chunk_id=chunk_id,
-            proposal_id="",
-            request_id="",
-            outcome="pass",
-            detail="real validator run",
-            env_digest="env-dc",
-            profile_digest="prof-dc",
+            validator_id=payload["validator_id"],
+            validator_command=payload["validator_command"],
+            validator_profile=payload.get("validator_profile")
+            or payload["validator_command"],
+            candidate_snapshot_digest=payload["candidate_snapshot_digest"],
+            candidate_tree_state=payload.get("candidate_tree_state", "post-apply"),
+            chunk_id=payload.get("chunk_id", ""),
+            proposal_id=payload.get("proposal_id", ""),
+            request_id=payload.get("request_id", ""),
+            outcome=payload["outcome"],
+            detail=payload.get("detail", ""),
+            env_digest=payload.get("env_digest", ""),
+            profile_digest=payload.get("profile_digest", ""),
             receipts_dir=receipts_dir,
         )
         minted_ids.append(rid)
         return rid
 
-    # Build a minimal manifest that drives _finalise.
+    # Build a minimal manifest that drives _finalise. The repo path is
+    # the CAMPAIGN WORKTREE so the candidate snapshot is bound to the
+    # bytes being integrated.
     manifest = TaskManifest(
         task_id=chunk_id,
         title=f"chunk {chunk_id}",
         objective="produce a validation receipt",
         execution_class=ExecutionClass.SOURCE_MUTATION,
-        repo={"path": str(repo_root)},
+        repo={"path": str(worktree)},
         paths={
             "write_paths": ["src/app.py"],
             "create_paths": [],
@@ -310,11 +322,12 @@ class TestDisposableCampaignProof(unittest.TestCase):
             base_commit=padded_base, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
-        # 3) Open the disposable campaign worktree.
+        # 3) Open the disposable campaign worktree (persist its identity).
         wt = ensure_campaign_worktree(
             repo_root=self._repo,
             campaign_id=camp.campaign_id,
             base_commit=padded_base,
+            db=self._db,
         )
 
         committed: list[str] = []
@@ -378,35 +391,35 @@ class TestDisposableCampaignProof(unittest.TestCase):
                 ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
             ).stdout.strip()
             s_i = capture_current_snapshot(wt)
-            # 3d) Compute the candidate tree digest for the new commit.
-            new_tree = subprocess.run(
-                ["git", "rev-parse", f"{new_commit}^{{tree}}"],
-                cwd=str(wt), capture_output=True, text=True, check=True,
-            ).stdout.strip()
-            # 3e) Run the REAL required validator through Worker._finalise.
+            # 3d) Canonical candidate identity: the ACTUAL campaign
+            # worktree fingerprint (git_worktree_sha). This is the ONE
+            # scheme that proves "the bytes validated are the bytes
+            # integrated" (P06 follow-up #3 A04 item 3).
+            candidate = git_worktree_sha(wt)
+            # 3e) Run the REAL required validator through Worker._finalise
+            # against the CAMPAIGN WORKTREE. The mint callback uses the
+            # payload's candidate_snapshot_digest (no substitution).
             artifact_dir = self._tmp / f"artifacts-{i}"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             v_receipt = _run_real_validator(
-                repo_root=self._repo,
                 worktree=wt,
                 artifact_dir=artifact_dir,
-                manifest_path=artifact_dir / "manifest.json",
                 validator_command="noop",
-                candidate_snapshot_digest=new_tree,
                 chunk_id=chunk.chunk_id,
             )
             # 3f) Sanity-verify the receipt via verify_receipt with
-            # strict binding.
+            # strict binding to the canonical candidate.
             self.assertTrue(
                 verify_receipt(
                     v_receipt, expected_kind=KIND_VALIDATION,
                     validator_id="noop", validator_command="noop",
                     chunk_id=f"chk-{i}",
                     outcome="pass",
-                    candidate_snapshot_digest=new_tree,
+                    candidate_snapshot_digest=candidate,
                 )
             )
-            # 3g) CAS advance with the receipt bound to candidate.
+            # 3g) CAS advance recomputing the SAME candidate fingerprint
+            # from the campaign worktree.
             expected_old = "" if i == 1 else committed[i - 2]
             result = compare_and_swap_advance(
                 self._db,
@@ -417,16 +430,14 @@ class TestDisposableCampaignProof(unittest.TestCase):
                 holder_fence_generation=receipt.fence_generation,
                 actor="runner",
                 idempotency_key=f"idem-dc-{i}",
-                validation_receipt_id=v_receipt,
+                validation_receipt_ids=[v_receipt],
                 expected_old=expected_old or None,
-                expected_tree_digest=new_tree,
-                expected_chunk_id=f"chk-{i}",
-                expected_validator_id="noop",
+                campaign_worktree=wt,
             )
             record_chunk_accepted(
                 self._db, chunk_id=f"chk-{i}",
                 accepted_commit=new_commit,
-                accepted_tree_digest=new_tree,
+                accepted_tree_digest=candidate,
             )
             # 3h) Update budget via the trusted API.
             totals = update_budget_after_chunk(

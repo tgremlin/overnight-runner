@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .broker import Broker, default_registry
+from .failpoints import failpoint_armed, trigger_crash_failpoint
 from .ollama_client import OllamaClient
 from .runtime import is_paused, require_not_paused, runtime_fingerprint, state_dir
 from .safety import SafetyError, git_head, git_is_clean, git_worktree_sha
@@ -521,6 +522,7 @@ def _finalise(
     *,
     applied_proposals: list[str],
     on_validation_receipt: "Callable[[dict[str, Any]], str] | None" = None,
+    on_crash_intent: "Callable[[dict[str, Any]], None] | None" = None,
     env_digest: str = "",
     profile_digest: str = "",
 ) -> tuple[str, str, str, list[str]]:
@@ -566,6 +568,19 @@ def _finalise(
         candidate_snapshot_digest = (
             git_worktree_sha(repo_root) if repo_root.exists() else ""
         )
+        # A05 item 6: when the validator-boundary failpoint is armed,
+        # record durable intent BEFORE the validator executes so a
+        # simulated crash is discoverable on restart.
+        if (
+            failpoint_armed("validator_executed_before_receipt_state_durable")
+            and on_crash_intent is not None
+        ):
+            on_crash_intent({
+                "boundary": "validator_executed_before_receipt_state_durable",
+                "validator_id": vid,
+                "chunk_id": manifest.task_id,
+                "candidate_snapshot_digest": candidate_snapshot_digest,
+            })
         if vid not in broker.registry._cmds:  # type: ignore[attr-defined]
             if vid == "python_compile":
                 detail = ""
@@ -589,6 +604,9 @@ def _finalise(
                         failures.append(detail)
                         break
                 outcome = "pass" if ok else "fail"
+                # Failpoint: validator executed, receipt/state not yet
+                # durable (A05 item 6). Durable intent was recorded above.
+                trigger_crash_failpoint("validator_executed_before_receipt_state_durable")
                 # Mint a single validation receipt for python_compile
                 # bound to the pre-validator candidate snapshot.
                 _maybe_mint_validation_receipt(
@@ -614,6 +632,7 @@ def _finalise(
             if vid == "no_op" or vid == "noop":
                 # A no_op validator ALWAYS passes. Mint a positive receipt
                 # bound to the pre-validator candidate snapshot.
+                trigger_crash_failpoint("validator_executed_before_receipt_state_durable")
                 _maybe_mint_validation_receipt(
                     on_validation_receipt=on_validation_receipt,
                     validator_id=vid,
@@ -678,6 +697,8 @@ def _finalise(
             outcome = "error"
             detail = f"error={type(e).__name__}: {e}"
 
+        # Failpoint: validator executed, receipt/state not yet durable.
+        trigger_crash_failpoint("validator_executed_before_receipt_state_durable")
         # Mint validation receipt for THIS validator (PASS or FAIL).
         _maybe_mint_validation_receipt(
             on_validation_receipt=on_validation_receipt,

@@ -87,14 +87,11 @@ def create_campaign(
     base_commit: str,
     base_tree_digest: str,
     repo_path_text: str = "local",
+    repo_root: str | None = None,
+    worktree_path: str | None = None,
 ) -> CampaignRecord:
     """Create a new campaign record (DRAFT). Activation follows in
     ``activate_campaign``.
-
-    The grant is referenced by ``grant_id`` only; the runner does NOT
-    need to find the grant in the durable store at campaign-create
-    time. The campaign's lifecycle is governed by ``activate_campaign``
-    (DRAFT -> ACTIVE) which is what binds to the store.
 
     P06 follow-up #2 (A01): ``campaigns.grant_digest`` MUST contain the
     actual grant digest (NOT a plan_id string), and
@@ -102,10 +99,21 @@ def create_campaign(
     digest (NOT a plan_id string). We resolve both by reading the
     durable stores at insert time; unknown grant/plan refuses the
     insert and raises ``SafetyError``.
+
+    P06 follow-up #3 (A01 item 1 / A14 item 14): the campaign MUST be
+    created with the grant's OWN plan. We require, before the insert:
+
+      * the grant exists and its state is ``active``;
+      * ``plan_id == stored_grant.plan_id``;
+      * ``load_plan_digest(plan_id) == stored_grant.approved_plan_digest``.
+
+    ``repo_root`` / ``worktree_path`` persist the durable repository
+    identity so a later crash-window reconciliation inspects the real
+    campaign repo (A05 item 7).
     """
     from .feature_gate import require_campaign_v2
-    from .grants import load_grant_by_digest, load_grant
-    from .plans import load_plan
+    from .grants import load_grant
+    from .plans import load_plan_digest
     require_not_paused_or_raise()
     require_campaign_v2("create_campaign")
     # Resolve grant_digest and plan_digest from the durable stores.
@@ -114,14 +122,30 @@ def create_campaign(
     stored_grant = load_grant(db, grant_id)
     if stored_grant is None:
         raise SafetyError(f"grant {grant_id!r} not registered in durable store")
-    stored_plan = load_plan(db, plan_id)
-    if stored_plan is None:
+    if stored_grant.state != "active":
+        raise SafetyError(
+            f"grant {grant_id!r} is not active (grant state={stored_grant.state}); "
+            f"refusing to create a campaign"
+        )
+    # A01/A14: the campaign plan MUST be the grant-pinned plan.
+    if plan_id != stored_grant.plan_id:
+        raise SafetyError(
+            f"campaign plan/grant mismatch: supplied plan_id={plan_id!r} != "
+            f"grant-pinned plan_id={stored_grant.plan_id!r}"
+        )
+    stored_plan_digest = load_plan_digest(db, plan_id)
+    if stored_plan_digest is None:
         raise SafetyError(f"plan {plan_id!r} not registered in durable store")
+    if stored_plan_digest != stored_grant.approved_plan_digest:
+        raise SafetyError(
+            f"campaign plan digest mismatch: registered plan "
+            f"{stored_plan_digest[:8]} != grant pinned "
+            f"{stored_grant.approved_plan_digest[:8]}"
+        )
     grant_digest = content_sha256(stored_grant)
-    # Plan digest is content_sha256 of the canonical plan JSON
-    # (matches the value stored in approved_plans.plan_digest).
-    plan_payload = json.dumps(stored_plan, sort_keys=True, separators=(",", ":"))
-    plan_digest = hashlib.sha256(plan_payload.encode("utf-8")).hexdigest()
+    # The grant-pinned approved plan digest is the authoritative content
+    # binding (NOT a recomputed value that could drift from the pin).
+    plan_digest = stored_grant.approved_plan_digest
     now = int(time.time())
     campaign_id = f"cmp-{plan_id}-{uuid.uuid4().hex[:8]}"
     integration_branch = f"refs/heads/campaign/{campaign_id}"
@@ -138,8 +162,8 @@ def create_campaign(
                 campaign_id, grant_id, plan_id, state,
                 integration_branch, current_commit, current_tree_digest,
                 current_fence, created_at, updated_at, completed_at,
-                grant_digest, plan_digest
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)
+                grant_digest, plan_digest, repo_root, worktree_path
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)
             """,
             (
                 campaign_id, grant_id, plan_id, CampaignState.DRAFT.value,
@@ -147,6 +171,8 @@ def create_campaign(
                 1, now, now,
                 grant_digest,
                 plan_digest,
+                repo_root or "",
+                worktree_path or "",
             ),
         )
     return CampaignRecord(
