@@ -16,7 +16,10 @@ interchangeable:
     ARE the P05-A06 trusted validator receipts.
 
 Receipts live at ``<state_dir>/receipts/<kind>/<receipt_id>.json`` and
-are content-addressed via the opaque ``receipt_id``. Verify rejects
+are addressed by opaque runner-owned receipt ids
+(``secrets.token_urlsafe(18)``). The ``receipt_id`` is an opaque,
+non-guessable durable-store reference backed by the runner-owned
+evidence store; it is NOT a content-addressed hash. Verify rejects
 unknown / tampered / kind-mismatched ids without crashing.
 
 The worker (P05 trio-workers) holds NO secret and NO durable-store

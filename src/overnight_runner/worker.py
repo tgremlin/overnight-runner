@@ -557,14 +557,25 @@ def _finalise(
     failures: list[str] = []
     validation_receipt_ids: list[str] = []
     for vid in manifest.commands.required_validator_ids:
+        # Capture the candidate snapshot BEFORE running any validator.
+        # The validation receipt binds to the exact tree the validator
+        # saw, NOT to a post-validator state (which would let the
+        # validator itself influence the digest). Compute this once per
+        # required-validator invocation and forward it to the receipt
+        # mint helper.
+        candidate_snapshot_digest = (
+            git_worktree_sha(repo_root) if repo_root.exists() else ""
+        )
         if vid not in broker.registry._cmds:  # type: ignore[attr-defined]
             if vid == "python_compile":
                 detail = ""
                 ok = True
+                exit_code = 0
                 for wp in manifest.paths.write_paths:
                     p = (repo_root / wp).resolve()
                     if not p.exists():
                         ok = False
+                        exit_code = 1
                         detail = f"python_compile missing: {wp}"
                         failures.append(detail)
                         break
@@ -573,19 +584,21 @@ def _finalise(
                         py_compile.compile(str(p), doraise=True)
                     except py_compile.PyCompileError as e:
                         ok = False
+                        exit_code = 1
                         detail = f"python_compile {wp}: {e}"
                         failures.append(detail)
                         break
                 outcome = "pass" if ok else "fail"
-                # Mint a single validation receipt for python_compile if
-                # we have a mint callback; otherwise V1 behaviour.
+                # Mint a single validation receipt for python_compile
+                # bound to the pre-validator candidate snapshot.
                 _maybe_mint_validation_receipt(
                     on_validation_receipt=on_validation_receipt,
                     validator_id=vid,
                     validator_command=vid,
                     repo_root=repo_root,
                     artifact_dir=artifact_dir,
-                    exit_code=0 if ok else 1,
+                    candidate_snapshot_digest=candidate_snapshot_digest,
+                    exit_code=exit_code,
                     signal_name="",
                     timed_out=False,
                     outcome=outcome,  # type: ignore[arg-type]
@@ -599,13 +612,15 @@ def _finalise(
                     continue
                 continue
             if vid == "no_op" or vid == "noop":
-                # A no_op validator ALWAYS passes. Mint a positive receipt.
+                # A no_op validator ALWAYS passes. Mint a positive receipt
+                # bound to the pre-validator candidate snapshot.
                 _maybe_mint_validation_receipt(
                     on_validation_receipt=on_validation_receipt,
                     validator_id=vid,
                     validator_command=vid,
                     repo_root=repo_root,
                     artifact_dir=artifact_dir,
+                    candidate_snapshot_digest=candidate_snapshot_digest,
                     exit_code=0,
                     signal_name="",
                     timed_out=False,
@@ -621,11 +636,9 @@ def _finalise(
         # Use the same owned-process-group helper the broker uses for
         # model-invoked commands so timeouts kill only the validator's pgid.
         spec = broker.registry.get(vid)
-        # CAPTURE candidate snapshot BEFORE running the validator so the
-        # validation receipt binds to exactly what the validator saw.
-        candidate_snapshot_digest = ""
-        if repo_root.exists():
-            candidate_snapshot_digest = git_worktree_sha(repo_root)
+        # ``candidate_snapshot_digest`` is the loop-level value
+        # captured BEFORE this validator runs (see the start of the
+        # for-loop); the validation receipt below binds to it.
         pre_wt = None
         if spec.side_effects in ("none", "read"):
             pre_wt = candidate_snapshot_digest

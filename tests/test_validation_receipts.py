@@ -659,6 +659,383 @@ class TestMutationReceiptAdditive(unittest.TestCase):
         )
 
 
+# ----------------------------- 11. Built-in validator branches in _finalise -----------------------------
+
+class TestBuiltinValidatorsMintReceipts(unittest.TestCase):
+    """Regression: the built-in validator branches in ``_finalise``
+    (``no_op`` / ``noop`` and ``python_compile``) MUST capture the
+    candidate snapshot BEFORE invoking the validator and mint a
+    ``kind=validation`` receipt bound to that snapshot.
+
+    These tests exercise ``_finalise`` end-to-end (they MUST NOT
+    shortcut the boundary by calling ``mint_validation_receipt``
+    directly) so we prove the actual required-validator path creates
+    the receipt.
+
+    The shared ``mint_through_callback`` helper wires
+    ``on_validation_receipt`` to the runner-owned ``mint_validation_receipt``
+    via the live ``overnight_runner.receipts`` module so the durable
+    store path is exercised exactly as it would be in production.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._old_state = os.environ.get("OVERNIGHT_STATE_DIR")
+        self._old_flag = os.environ.get("OVERNIGHT_RECEIPTS")
+        os.environ["OVERNIGHT_STATE_DIR"] = self._tmp
+        os.environ["OVERNIGHT_RECEIPTS"] = "1"
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        os.environ.pop("OVERNIGHT_STATE_DIR", None)
+        os.environ.pop("OVERNIGHT_RECEIPTS", None)
+        if self._old_state is not None:
+            os.environ["OVERNIGHT_STATE_DIR"] = self._old_state
+        if self._old_flag is not None:
+            os.environ["OVERNIGHT_RECEIPTS"] = self._old_flag
+
+    # ---------- 1. required ``no_op`` validator -> exactly one PASS validation receipt ----------
+
+    def test_required_noop_mints_pass_validation_receipt(self):
+        """A required ``no_op`` validator that runs through ``_finalise``
+        produces exactly one ``kind=validation`` trusted receipt; the
+        receipt verifies against the pre-validator candidate snapshot
+        and records ``outcome=pass``."""
+        from overnight_runner.safety import git_init_empty, git_commit_all, git_worktree_sha, sha256_file
+        from overnight_runner.schemas import ReplaceExactArgs, ToolCall, Disposition
+        from overnight_runner.worker import _finalise
+
+        repo = Path(self._tmp) / "repo"
+        repo.mkdir()
+        git_init_empty(repo)
+        (repo / "hello.py").write_text("def hello():\n    return 'ok'\n")
+        (repo / "test_hello.py").write_text(
+            "from hello import hello\nassert hello() == 'ok'\n"
+        )
+        git_commit_all(repo, "init")
+
+        # Set up a real broker so the apply boundary can resolve.
+        reg = default_registry()
+        b = Broker(
+            repo_root=repo,
+            registry=reg,
+            allowed_write_paths=["hello.py"],
+            allowed_read_paths=["hello.py", "test_hello.py"],
+        )
+        sha = sha256_file(repo / "hello.py")
+        # Apply a small in-place change so applied_proposals is
+        # populated AND the candidate snapshot reflects the post-apply
+        # state. The validator examines THIS state, so the receipt
+        # must bind to ``git_worktree_sha(repo)`` captured AFTER
+        # ``apply_proposal``.
+        out = b.handle(ToolCall(call_id="c1", args=ReplaceExactArgs(
+            path="hello.py", expected_sha256=sha,
+            old_text="return 'ok'", new_text="return 'OK'",
+        )))
+        b.apply_proposal(out["proposal_id"])
+        expected_snapshot = git_worktree_sha(repo)
+
+        # Use a /tmp artifact dir to avoid further drift in the repo
+        # worktree (artifact_dir is a sibling, not inside repo).
+        art = Path(self._tmp) / "artifacts"
+
+        # Wire the runner-owned receipts module as the mint callback so
+        # the receipt lands in the durable evidence store (not in
+        # memory). This proves ``_finalise`` itself produced the receipt
+        # — we only forward ``payload`` to ``mint_validation_receipt``.
+        from overnight_runner import receipts as rm
+        def on_val(payload):
+            return rm.mint_validation_receipt(
+                validator_id=payload["validator_id"],
+                validator_command=payload["validator_command"],
+                candidate_snapshot_digest=payload["candidate_snapshot_digest"],
+                candidate_tree_state=payload.get("candidate_tree_state", "post-apply"),
+                proposal_id=payload.get("proposal_id", ""),
+                chunk_id=payload.get("chunk_id", ""),
+                request_id=payload.get("request_id", ""),
+                patch_ref=payload.get("patch_ref", ""),
+                patch_sha256=payload.get("patch_sha256", ""),
+                exit_code=payload.get("exit_code", 0),
+                signal_name=payload.get("signal_name", ""),
+                timed_out=payload.get("timed_out", False),
+                outcome=payload.get("outcome", "pass"),
+                detail=payload.get("detail", ""),
+                raw_artifact_ref=payload.get("raw_artifact_ref", ""),
+                env_digest=payload.get("env_digest", ""),
+                profile_digest=payload.get("profile_digest", ""),
+            )
+
+        manifest = _make_manifest(
+            repo, "noop-finalise",
+            required_validator_ids=["no_op"],
+            execution_class="source_mutation",
+        )
+        status, reason, text, receipts = _finalise(
+            manifest, b, Disposition.DONE, art,
+            applied_proposals=[out["proposal_id"]],
+            on_validation_receipt=on_val,
+            env_digest="env-" + "f" * 64,
+            profile_digest="prof-" + "f" * 64,
+        )
+
+        # 1. ``_finalise`` reports PASS for the no_op validator.
+        self.assertEqual(status, "PASSED",
+                         f"no_op validator must pass; got {status}: {text}")
+        # 2. Exactly one trusted validation receipt was minted.
+        self.assertEqual(len(receipts), 1, "exactly one validation receipt")
+        rid = receipts[0]
+        self.assertTrue(rid.startswith("rec-val-"),
+                        f"validation receipt id expected, got {rid}")
+        # 3. The receipt verifies against the pre-validator snapshot.
+        self.assertTrue(
+            verify_receipt(
+                rid, expected_kind=KIND_VALIDATION,
+                validator_id="no_op",
+                validator_command="no_op",
+                candidate_snapshot_digest=expected_snapshot,
+                outcome="pass",
+            ),
+            "no_op PASS receipt must verify against expected identity",
+        )
+
+    # ---------- 2. required ``python_compile`` PASS -> one validation receipt ----------
+
+    def test_required_python_compile_pass_mints_validation_receipt(self):
+        """A required ``python_compile`` validator that PASSES produces
+        exactly one trusted validation receipt with non-empty
+        candidate snapshot and ``outcome=pass``."""
+        from overnight_runner.safety import git_init_empty, git_commit_all, git_worktree_sha
+        from overnight_runner.worker import _finalise
+        from overnight_runner.schemas import Disposition
+
+        repo = Path(self._tmp) / "repo"
+        repo.mkdir()
+        git_init_empty(repo)
+        (repo / "hello.py").write_text("def hello():\n    return 'ok'\n")
+        git_commit_all(repo, "init")
+
+        expected_snapshot = git_worktree_sha(repo)
+        reg = default_registry()
+        # python_compile path is the special built-in in _finalise, so
+        # we do NOT register it; required_validator_ids=["python_compile"]
+        # below forces the special branch.
+        b = Broker(
+            repo_root=repo,
+            registry=reg,
+            allowed_write_paths=["hello.py"],
+            allowed_read_paths=["hello.py"],
+        )
+
+        from overnight_runner import receipts as rm
+        def on_val(payload):
+            return rm.mint_validation_receipt(
+                validator_id=payload["validator_id"],
+                validator_command=payload["validator_command"],
+                candidate_snapshot_digest=payload["candidate_snapshot_digest"],
+                candidate_tree_state=payload.get("candidate_tree_state", "post-apply"),
+                exit_code=payload.get("exit_code", 0),
+                outcome=payload.get("outcome", "pass"),
+                detail=payload.get("detail", ""),
+                env_digest=payload.get("env_digest", ""),
+                profile_digest=payload.get("profile_digest", ""),
+            )
+
+        manifest = _make_manifest(
+            repo, "pyc-pass",
+            required_validator_ids=["python_compile"],
+            execution_class="source_mutation",
+            write_paths=["hello.py"],
+        )
+        # ``_make_manifest`` always includes a write_paths entry of
+        # ``hello.py`` and creates the manifest with execution_class
+        # source_mutation by default.
+        art = Path(self._tmp) / "artifacts"
+        status, reason, text, receipts = _finalise(
+            manifest, b, Disposition.DONE, art,
+            applied_proposals=["c-py-pass"],
+            on_validation_receipt=on_val,
+            env_digest="env-" + "f" * 64,
+            profile_digest="prof-" + "f" * 64,
+        )
+        self.assertEqual(status, "PASSED",
+                         f"python_compile must pass on valid source; got {status}: {text}")
+        self.assertEqual(len(receipts), 1, "exactly one validation receipt")
+        rid = receipts[0]
+        self.assertTrue(rid.startswith("rec-val-"))
+        # candidate snapshot is non-empty and matches the pre-validator state.
+        rec = rm.load_receipt(rid)
+        self.assertTrue(rec is not None and rec.get("candidate_snapshot_digest"),
+                        "candidate_snapshot_digest must be present and non-empty")
+        self.assertEqual(rec["candidate_snapshot_digest"], expected_snapshot)
+        self.assertTrue(
+            verify_receipt(
+                rid, expected_kind=KIND_VALIDATION,
+                validator_id="python_compile",
+                validator_command="python_compile",
+                candidate_snapshot_digest=expected_snapshot,
+                outcome="pass",
+            ),
+        )
+
+    # ---------- 3. required ``python_compile`` FAIL -> receipt still exists, outcome=FAIL ----------
+
+    def test_required_python_compile_fail_mints_failure_receipt(self):
+        """A required ``python_compile`` validator that FAILS (broken
+        Python source) still produces a trusted validation receipt; the
+        receipt outcome is ``fail`` and the candidate snapshot binding is
+        preserved."""
+        from overnight_runner.safety import git_init_empty, git_commit_all, git_worktree_sha
+        from overnight_runner.worker import _finalise
+        from overnight_runner.schemas import Disposition
+
+        repo = Path(self._tmp) / "repo"
+        repo.mkdir()
+        git_init_empty(repo)
+        # Broken Python: a function declaration that lacks ``:``.
+        (repo / "hello.py").write_text("def hello()\n    return 'ok'\n")
+        git_commit_all(repo, "init")
+
+        expected_snapshot = git_worktree_sha(repo)
+        reg = default_registry()
+        b = Broker(
+            repo_root=repo,
+            registry=reg,
+            allowed_write_paths=["hello.py"],
+            allowed_read_paths=["hello.py"],
+        )
+
+        minted: list[dict] = []
+        from overnight_runner import receipts as rm
+        def on_val(payload):
+            minted.append(dict(payload))
+            return rm.mint_validation_receipt(
+                validator_id=payload["validator_id"],
+                validator_command=payload["validator_command"],
+                candidate_snapshot_digest=payload["candidate_snapshot_digest"],
+                candidate_tree_state=payload.get("candidate_tree_state", "post-apply"),
+                exit_code=payload.get("exit_code", 1),
+                outcome=payload.get("outcome", "fail"),
+                detail=payload.get("detail", ""),
+                env_digest=payload.get("env_digest", ""),
+                profile_digest=payload.get("profile_digest", ""),
+            )
+
+        manifest = _make_manifest(
+            repo, "pyc-fail",
+            required_validator_ids=["python_compile"],
+            execution_class="source_mutation",
+            write_paths=["hello.py"],
+        )
+        art = Path(self._tmp) / "artifacts"
+        status, reason, text, receipts = _finalise(
+            manifest, b, Disposition.DONE, art,
+            applied_proposals=["c-py-fail"],
+            on_validation_receipt=on_val,
+            env_digest="env-" + "f" * 64,
+            profile_digest="prof-" + "f" * 64,
+        )
+        # The task MUST FAIL because the validator failed.
+        self.assertEqual(status, "FAILED")
+        # reason_code is the classification; reason_text carries the
+        # per-validator detail (joined with ``; ``).
+        self.assertEqual(reason, "VALIDATORS_FAILED")
+        self.assertIn("python_compile", text or "")
+        # ... but a trusted validation receipt still exists.
+        self.assertEqual(len(receipts), 1,
+                         "FAIL path must still mint exactly one receipt")
+        rid = receipts[0]
+        self.assertTrue(rid.startswith("rec-val-"))
+        # Same candidate snapshot binding as the pre-validator state.
+        rec = rm.load_receipt(rid)
+        self.assertTrue(rec is not None)
+        self.assertEqual(rec["candidate_snapshot_digest"], expected_snapshot)
+        self.assertEqual(rec["outcome"], "fail")
+        # Verify: outcome=fail MUST verify; outcome=pass MUST NOT.
+        self.assertTrue(
+            verify_receipt(
+                rid, expected_kind=KIND_VALIDATION,
+                validator_id="python_compile",
+                validator_command="python_compile",
+                candidate_snapshot_digest=expected_snapshot,
+                outcome="fail",
+            ),
+        )
+        self.assertFalse(
+            verify_receipt(
+                rid, expected_kind=KIND_VALIDATION,
+                candidate_snapshot_digest=expected_snapshot,
+                outcome="pass",
+            ),
+            "FAIL receipt must NOT verify with outcome=pass",
+        )
+
+    # ---------- 4. wrong candidate snapshot for either built-in receipt is rejected ----------
+
+    def test_wrong_snapshot_rejected_for_builtin_receipt(self):
+        """A receipt produced by the ``no_op`` path is rejected when the
+        caller supplies the wrong candidate snapshot. This proves the
+        receipt IS bound to the candidate state the validator actually
+        examined."""
+        from overnight_runner.safety import git_init_empty, git_commit_all, git_worktree_sha
+        from overnight_runner.worker import _finalise
+        from overnight_runner.schemas import Disposition
+
+        repo = Path(self._tmp) / "repo"
+        repo.mkdir()
+        git_init_empty(repo)
+        (repo / "hello.py").write_text("def hello():\n    return 'ok'\n")
+        git_commit_all(repo, "init")
+
+        reg = default_registry()
+        b = Broker(repo_root=repo, registry=reg,
+                   allowed_write_paths=["hello.py"],
+                   allowed_read_paths=["hello.py"])
+
+        from overnight_runner import receipts as rm
+        def on_val(payload):
+            return rm.mint_validation_receipt(
+                validator_id=payload["validator_id"],
+                validator_command=payload["validator_command"],
+                candidate_snapshot_digest=payload["candidate_snapshot_digest"],
+                candidate_tree_state=payload.get("candidate_tree_state", "post-apply"),
+                exit_code=payload.get("exit_code", 0),
+                outcome=payload.get("outcome", "pass"),
+                detail=payload.get("detail", ""),
+                env_digest=payload.get("env_digest", ""),
+                profile_digest=payload.get("profile_digest", ""),
+            )
+
+        manifest = _make_manifest(
+            repo, "noop-snap",
+            required_validator_ids=["no_op"],
+            execution_class="source_mutation",
+        )
+        art = Path(self._tmp) / "artifacts"
+        status, reason, text, receipts = _finalise(
+            manifest, b, Disposition.DONE, art,
+            applied_proposals=["c-noop-snap"],
+            on_validation_receipt=on_val,
+            env_digest="env-" + "f" * 64,
+            profile_digest="prof-" + "f" * 64,
+        )
+        self.assertEqual(status, "PASSED")
+        self.assertEqual(len(receipts), 1)
+        rid = receipts[0]
+        # Wrong snapshot must NOT verify; correct snapshot verifies.
+        self.assertFalse(
+            verify_receipt(rid, expected_kind=KIND_VALIDATION,
+                           validator_id="no_op",
+                           candidate_snapshot_digest="0" * 64),
+            "wrong candidate snapshot must not verify",
+        )
+        correct_snapshot = git_worktree_sha(repo)
+        self.assertTrue(
+            verify_receipt(rid, expected_kind=KIND_VALIDATION,
+                           validator_id="no_op",
+                           candidate_snapshot_digest=correct_snapshot),
+        )
+
+
 # ----------------------------- helpers -----------------------------
 
 class _NoChat:
@@ -669,11 +1046,13 @@ class _NoChat:
 
 
 def _make_manifest(repo: Path, tag: str, **kw) -> TaskManifest:
+    write_paths = kw.get("write_paths", ["hello.py"])
     base = {
         "schema_version": "1.0", "task_id": f"rec-{tag}", "title": "rec",
-        "execution_class": "source_mutation", "objective": "receipt",
+        "execution_class": kw.get("execution_class", "source_mutation"),
+        "objective": "receipt",
         "repo": {"path": str(repo)},
-        "paths": {"write_paths": ["hello.py"], "read_paths": ["hello.py"]},
+        "paths": {"write_paths": write_paths, "read_paths": ["hello.py"]},
         "commands": {"required_validator_ids": kw.get("required_validator_ids", ["noop"])},
     }
     if "extra_validator" in kw:
