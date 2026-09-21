@@ -248,6 +248,82 @@ def cmd_run_nightly(args: argparse.Namespace) -> int:
     return 0
 
 
+def _p07_db():
+    from .db import Database, default_db_path
+    return Database(default_db_path())
+
+
+def cmd_hermes_status(args: argparse.Namespace) -> int:
+    """P07 read-only: authoritative campaign/status projection (thin)."""
+    from .p07 import project_campaign_status
+    db = _p07_db()
+    try:
+        out = project_campaign_status(db, campaign_id=args.campaign_id)
+    finally:
+        db.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_hermes_cards(args: argparse.Namespace) -> int:
+    """P07 read-only: rebuildable NON-authoritative projection cards (thin)."""
+    from .p07 import project_hermes_cards
+    db = _p07_db()
+    try:
+        out = project_hermes_cards(db, campaign_id=args.campaign_id)
+    finally:
+        db.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_hermes_capacity(args: argparse.Namespace) -> int:
+    """P07 read-only: provider/account cooldown state (thin)."""
+    from .p07 import list_cooldowns
+    db = _p07_db()
+    try:
+        out = list_cooldowns(db)
+    finally:
+        db.close()
+    print(json.dumps({"cooldowns": out}, indent=2))
+    return 0
+
+
+def cmd_hermes_wake(args: argparse.Namespace) -> int:
+    """P07 bounded control: re-evaluate + at most one advancement (thin)."""
+    from .p07 import wake_tick
+    db = _p07_db()
+    try:
+        out = wake_tick(db, campaign_id=args.campaign_id, window_key=args.window_key)
+    finally:
+        db.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_hermes_control(args: argparse.Namespace) -> int:
+    """P07 bounded control: short-control request -> durable job id (thin)."""
+    from .p07 import job_state, request_control
+    db = _p07_db()
+    try:
+        job_id = request_control(db, operation=args.operation,
+                                 campaign_id=args.campaign_id or "",
+                                 window_key=args.window_key or "")
+        out = job_state(db, job_id)
+    finally:
+        db.close()
+    print(json.dumps({"job_id": job_id, "state": (out or {}).get("state", ""),
+                      "schema_version": "trio.hermes-control.v1"}, indent=2))
+    return 0
+
+
+def cmd_hermes_adapters(args: argparse.Namespace) -> int:
+    """P07 read-only: the schema-defined adapter surface Hermes may call."""
+    from .p07 import ADAPTER_SCHEMA
+    print(json.dumps(ADAPTER_SCHEMA, indent=2))
+    return 0
+
+
 def _csha(m: TaskManifest) -> str:
     from .schemas import canonical_sha
     return canonical_sha(m)
@@ -292,6 +368,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("doctor", help="Check Ollama + Python")
     s.set_defaults(func=cmd_doctor)
+
+    # ---- P07 Hermes foreman adapter surfaces (narrow, schema-defined) ----
+    s = sub.add_parser("hermes-status", help="P07: authoritative campaign status projection")
+    s.add_argument("campaign_id")
+    s.set_defaults(func=cmd_hermes_status)
+
+    s = sub.add_parser("hermes-cards", help="P07: rebuildable non-authoritative projection cards")
+    s.add_argument("campaign_id")
+    s.set_defaults(func=cmd_hermes_cards)
+
+    s = sub.add_parser("hermes-capacity", help="P07: provider/account cooldown state")
+    s.set_defaults(func=cmd_hermes_capacity)
+
+    s = sub.add_parser("hermes-wake", help="P07: bounded wake/tick (idempotent)")
+    s.add_argument("campaign_id")
+    s.add_argument("window_key")
+    s.set_defaults(func=cmd_hermes_wake)
+
+    s = sub.add_parser("hermes-control", help="P07: short-control request -> durable job id")
+    s.add_argument("operation")
+    s.add_argument("--campaign-id", dest="campaign_id", default=None)
+    s.add_argument("--window-key", dest="window_key", default=None)
+    s.set_defaults(func=cmd_hermes_control)
+
+    s = sub.add_parser("hermes-adapters", help="P07: schema-defined adapter surface")
+    s.set_defaults(func=cmd_hermes_adapters)
 
     return p
 

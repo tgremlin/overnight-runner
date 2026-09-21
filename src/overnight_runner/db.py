@@ -284,6 +284,56 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
     applied_at INTEGER NOT NULL,
     integrity_ok INTEGER NOT NULL DEFAULT 1
 );
+
+-- -------------------- P07 (Hermes foreman) additions --------------------
+-- Runner-owned provider/account cooldown. Identity is scoped so one
+-- rate-limited model/account does not poison unrelated work.
+CREATE TABLE IF NOT EXISTS provider_cooldowns (
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL,              -- '' when account is not material
+    model TEXT NOT NULL,                -- '' when model is not material
+    kind TEXT NOT NULL,                 -- normalized capacity outcome
+    reason TEXT NOT NULL DEFAULT '',
+    until_at INTEGER NOT NULL,          -- epoch seconds; 0 = no known reset
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider, account, model)
+);
+
+-- Durable capacity wait (WAIT_CAPACITY). Never consumes a repair merely
+-- because capacity was unavailable.
+CREATE TABLE IF NOT EXISTS capacity_waits (
+    wait_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL DEFAULT '',
+    obligation TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    account TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    reason_kind TEXT NOT NULL,
+    entered_at INTEGER NOT NULL,
+    next_eligible_at INTEGER NOT NULL DEFAULT 0,
+    retry_provenance TEXT NOT NULL DEFAULT '',
+    grant_id TEXT NOT NULL DEFAULT '',
+    budget_ledger_id TEXT NOT NULL DEFAULT '',
+    wake_generation INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1,
+    resolved_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS capacity_waits_campaign ON capacity_waits(campaign_id);
+CREATE INDEX IF NOT EXISTS capacity_waits_active ON capacity_waits(active);
+
+-- Durable short-control job identity. A short-control request returns a
+-- durable job id; long execution remains runner-owned.
+CREATE TABLE IF NOT EXISTS wake_jobs (
+    job_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    campaign_id TEXT NOT NULL DEFAULT '',
+    requested_at INTEGER NOT NULL,
+    state TEXT NOT NULL,                -- ACCEPTED | COMPLETED | NOOP | REFUSED
+    detail TEXT NOT NULL DEFAULT '',
+    wake_generation INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS wake_jobs_campaign ON wake_jobs(campaign_id);
 """
 
 # Migration log for forward-compatible schema versioning. Each versioned
@@ -344,6 +394,8 @@ class Database:
         self._record_migration("p06-followup3-0002-chunk-required-validators")
         self._record_migration("p06-followup3-0003-crash-window-repo-identity")
         self._record_migration("p06-followup3-0004-lease-process-identity")
+        # P07 (Hermes foreman) — runner-owned capacity/cooldown/wait/job tables.
+        self._record_migration("p07-0001-hermes-foreman-tables")
         for _tbl, _col, _decl in (
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
