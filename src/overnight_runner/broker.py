@@ -169,6 +169,7 @@ class Broker:
         approved_repo_head: str | None = None,
         artifact_dir: Path | None = None,
         on_mutation: Callable[[MutationJournalEntry], None] | None = None,
+        receipt_mint: Callable[[dict], str] | None = None,
     ) -> None:
         self.repo_root = repo_root.resolve()
         self.registry = registry or default_registry()
@@ -189,6 +190,7 @@ class Broker:
         self.approved_repo_head = approved_repo_head
         self.artifact_dir = artifact_dir
         self.on_mutation = on_mutation
+        self.receipt_mint = receipt_mint
         self.usage = Usage()
         self.proposals: dict[str, Proposal] = {}
         self.journal: list[MutationJournalEntry] = []
@@ -494,7 +496,7 @@ class Broker:
 
         # Single-use proposal.
         del self.proposals[proposal_id]
-        return {
+        result = {
             "proposal_id": proposal_id,
             "path": prop.path,
             "op": prop.op,
@@ -503,6 +505,22 @@ class Broker:
             "pre_sha256": pre_sha,
             "post_sha256": post_sha,
         }
+        # Runner-owned trusted receipt (opaque durable evidence reference).
+        if self.receipt_mint is not None:
+            try:
+                result["receipt_id"] = self.receipt_mint(
+                    {
+                        "proposal_id": proposal_id,
+                        "path": prop.path,
+                        "snapshot_digest": pre_sha,
+                        "chunk_id": prop.path,  # caller may refine via adapter
+                        "request_id": proposal_id,
+                        "result": result,
+                    }
+                )
+            except Exception as e:  # mint is advisory evidence, never blocks apply
+                result["receipt_mint_error"] = str(e)
+        return result
 
     def _write_evidence(self, prop: Proposal) -> None:
         """Persist before/<path>, proposed/<path>, preview.diff BEFORE the write."""
