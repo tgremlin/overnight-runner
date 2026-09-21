@@ -136,6 +136,15 @@ def derive_admission(
     require_campaign_v2("derive_admission")
     now = int(now if now is not None else time.time())
 
+    # P06 follow-up #4 (item 4): enforce the campaign continuation
+    # authority INSIDE the admission API. Safe operation must not depend
+    # on the caller remembering to invoke a preflight helper. This
+    # refuses blocked campaign states, inactive/expired grants, and
+    # exhausted budget headroom before any authority is minted.
+    check_campaign_continuation(
+        db, campaign_id=chunk.campaign_id, grant_id=grant.grant_id, now=now
+    )
+
     # ----- (A) Grant state -----
     stored = load_grant(db, grant.grant_id)
     if stored is None:
@@ -578,7 +587,7 @@ def check_campaign_continuation(
         raise SafetyError(f"campaign {campaign_id!r} not registered")
     state = row["state"]
     blocking = {
-        "EFFECT_UNKNOWN", "CANCELLED", "EXPIRED", "COMPLETE",
+        "EFFECT_UNKNOWN", "NEEDS_DECISION", "CANCELLED", "EXPIRED", "COMPLETE",
         "BUDGET_EXHAUSTED", "PAUSED_OPERATOR",
     }
     if state in blocking:

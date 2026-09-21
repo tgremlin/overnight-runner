@@ -187,6 +187,25 @@ def _mint(chunk_id: str, candidate: str, validator_id: str = "noop",
     )
 
 
+def _admit_chunk(db, grant, camp, *, chunk_id, validators=None, idem=None):
+    """Admit a chunk (durable authority) for integration tests."""
+    validators = validators or ["noop"]
+    cur_commit = db._conn.execute(
+        "SELECT current_commit FROM campaigns WHERE campaign_id=?",
+        (camp.campaign_id,)).fetchone()["current_commit"]
+    receipt, _ = derive_admission(
+        db, grant=grant,
+        chunk=_chunk(camp.campaign_id, chunk_id=chunk_id, idem=idem,
+                     required_validators=validators),
+        worker_id="wkr-1",
+        policy_profile_id=grant.policy_profile_id,
+        validator_profile_ids=list(grant.validator_profile_ids),
+        provider_profile_id=grant.provider_profile_id,
+        current_accepted_snapshot=_snap(commit=cur_commit),
+        **_id_kwargs(grant))
+    return receipt
+
+
 def _commit_in(worktree: Path, content: str, msg: str) -> str:
     (worktree / "src" / "app.py").write_text(content)
     subprocess.run(["git", "add", "-A"], cwd=str(worktree), check=True, capture_output=True)
@@ -519,16 +538,17 @@ class TestA05FailpointsDurableIntent(unittest.TestCase):
         ).fetchall()
         return [r["kind"] for r in rows]
 
-    def _cas(self, camp, wt, *, receipt_validator="noop", expect_commit=None):
+    def _cas(self, grant, camp, wt, *, chunk_id="chk-fp", idem=None,
+             receipt_validator="noop"):
+        _admit_chunk(self._db, grant, camp, chunk_id=chunk_id, idem=idem)
         new_commit = _commit_in(wt, "FP\n", "fp")
         candidate = git_worktree_sha(wt)
-        rid = _mint("chk-fp", candidate, validator_id=receipt_validator)
+        rid = _mint(chunk_id, candidate, validator_id=receipt_validator)
         return compare_and_swap_advance(
             self._db, repo_root=self._repo, campaign_id=camp.campaign_id,
-            chunk_id="chk-fp", new_commit=new_commit,
+            chunk_id=chunk_id, new_commit=new_commit,
             holder_fence_generation=1, actor="runner", idempotency_key="ifp",
             validation_receipt_ids=[rid], campaign_worktree=wt,
-            expected_validator_id=None,
         ), new_commit
 
     def test_all_four_cas_failpoints_reach_and_record(self):
@@ -545,7 +565,8 @@ class TestA05FailpointsDurableIntent(unittest.TestCase):
                 os.environ[f"TR_FAILPOINT_{name}"] = "raise"
                 try:
                     with self.assertRaises(RuntimeError):
-                        self._cas(camp, wt)
+                        self._cas(grant, camp, wt, chunk_id=f"chk-{name}",
+                                  idem=f"idem-{name}")
                 finally:
                     os.environ.pop(f"TR_FAILPOINT_{name}")
                 # Durable EFFECT_UNKNOWN intent row with the failpoint name.
@@ -561,7 +582,7 @@ class TestA05FailpointsDurableIntent(unittest.TestCase):
         os.environ["TR_FAILPOINT_ref_advanced_before_integration_journal_event"] = "raise"
         try:
             with self.assertRaises(RuntimeError):
-                result, new_commit = self._cas(camp, wt)
+                result, new_commit = self._cas(grant, camp, wt)
         finally:
             os.environ.pop("TR_FAILPOINT_ref_advanced_before_integration_journal_event")
         # The real campaign ref DID advance.
@@ -600,13 +621,15 @@ class TestA05FailpointsDurableIntent(unittest.TestCase):
                               owner_boot_id="boot", owner_pid=os.getpid(),
                               fence_generation=fence.current_generation,
                               ttl_seconds=300)
+        ident = process_identity(os.getpid())
         os.environ["TR_FAILPOINT_candidate_changed_before_state_durable"] = "raise"
         try:
             with self.assertRaises(RuntimeError):
                 apply_campaign_patch(
                     self._db, broker, str(self._repo), camp.campaign_id, "prop-x",
                     admission_fence_generation=fence.current_generation,
-                    lease_id=lease.lease_id)
+                    lease_id=lease.lease_id, owner_id="wkr",
+                    owner_pid=os.getpid(), owner_start_time=ident["start_time"])
         finally:
             os.environ.pop("TR_FAILPOINT_candidate_changed_before_state_durable")
         self.assertIn("candidate_changed_before_state_durable",
@@ -692,6 +715,7 @@ class TestA05Reconciliation(unittest.TestCase):
         wt = ensure_campaign_worktree(repo_root=self._repo,
                                       campaign_id=camp.campaign_id,
                                       base_commit=padded, db=self._db)
+        _admit_chunk(self._db, grant, camp, chunk_id="chk-rec")
         new_commit = _commit_in(wt, "REC\n", "rec")
         candidate = git_worktree_sha(wt)
         rid = _mint("chk-rec", candidate)
@@ -874,10 +898,13 @@ class TestA06SerializationAndLeaseBinding(unittest.TestCase):
         # Takeover first (deterministic stale case).
         revoke_for_takeover(self._db, campaign_id=camp.campaign_id, reason="t")
         before = (wt / "src" / "app.py").read_text()
+        ident = process_identity(os.getpid())
         with self.assertRaises(SafetyError) as ctx:
             apply_campaign_patch(self._db, broker, str(self._repo), camp.campaign_id,
                                  "prop-x", admission_fence_generation=old_gen,
-                                 lease_id=lease.lease_id)
+                                 lease_id=lease.lease_id, owner_id="w",
+                                 owner_pid=os.getpid(),
+                                 owner_start_time=ident["start_time"])
         self.assertIn("fence_stale", str(ctx.exception).lower())
         # No stale mutation happened.
         self.assertEqual((wt / "src" / "app.py").read_text(), before)
@@ -891,10 +918,13 @@ class TestA06SerializationAndLeaseBinding(unittest.TestCase):
                               resource_id="chunk:c", owner_id="w", owner_boot_id="b",
                               owner_pid=os.getpid(), fence_generation=gen, ttl_seconds=300)
         release_lease(self._db, lease_id=lease.lease_id)
+        ident = process_identity(os.getpid())
         with self.assertRaises(SafetyError) as ctx:
             apply_campaign_patch(self._db, broker, str(self._repo), camp.campaign_id,
                                  "prop-x", admission_fence_generation=gen,
-                                 lease_id=lease.lease_id)
+                                 lease_id=lease.lease_id, owner_id="w",
+                                 owner_pid=os.getpid(),
+                                 owner_start_time=ident["start_time"])
         self.assertIn("released", str(ctx.exception).lower())
 
     def test_concurrent_takeover_never_allows_stale_mutation(self):
@@ -916,6 +946,8 @@ class TestA06SerializationAndLeaseBinding(unittest.TestCase):
             barrier = threading.Barrier(2)
             outcomes: dict[str, str] = {}
 
+            ident = process_identity(os.getpid())
+
             def _apply():
                 db2 = Database(dbfile)
                 try:
@@ -923,7 +955,9 @@ class TestA06SerializationAndLeaseBinding(unittest.TestCase):
                     apply_campaign_patch(db2, broker, str(self._repo),
                                          camp.campaign_id, "prop-x",
                                          admission_fence_generation=old_gen,
-                                         lease_id=lease.lease_id)
+                                         lease_id=lease.lease_id, owner_id="w",
+                                         owner_pid=os.getpid(),
+                                         owner_start_time=ident["start_time"])
                     outcomes["apply"] = "ok"
                 except Exception as e:  # noqa: BLE001
                     outcomes["apply"] = f"err:{type(e).__name__}"

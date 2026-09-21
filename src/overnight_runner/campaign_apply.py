@@ -56,12 +56,24 @@ def _lease_authorises_apply(
     campaign_id: str,
     lease_id: str,
     admission_fence_generation: int,
+    owner_id: str | None,
+    owner_pid: int | None,
+    owner_start_time: str | None,
 ) -> None:
-    """Prove ``lease_id`` is a live, current, campaign-scoped lease.
+    """Prove ``lease_id`` is a live, current, campaign-scoped lease that
+    is being presented by ITS OWNER.
 
-    Raises ``SafetyError`` when the lease is missing, released,
-    campaign-mismatched, out of scope, at a different fence
-    generation, or held by a dead / impersonated process.
+    P06 follow-up #4 A06:
+
+      * item 7: an EXPIRED lease has NO mutation authority. ``expires_at
+        <= now`` rejects unconditionally (a dead process is not
+        transferable lease authority; the runner must reconcile/revoke
+        and acquire a new lease, or perform a fenced takeover).
+      * item 8: the apply is bound to the presenting owner identity. A
+        different process that merely knows the ``lease_id`` and fence
+        generation must not inherit the lease.
+
+    Raises ``SafetyError`` on any mismatch.
     """
     row = load_lease_row(db, lease_id)
     if row is None:
@@ -87,37 +99,49 @@ def _lease_authorises_apply(
             f"lease_fence_stale: lease {lease_id} fence_generation="
             f"{row['fence_generation']} != required {admission_fence_generation}"
         )
-    # Lease must not be expired unless the caller holds a still-live
-    # owner identity AND the fence still matches (bounded operation).
+    # item 7: an expired lease never authorizes a mutation.
     now = int(time.time())
-    expired = int(row["expires_at"]) > 0 and int(row["expires_at"]) <= now
-    if expired:
-        # An expired lease is only permitted when its holder is dead
-        # and the fence still matches — otherwise it is an authority
-        # object awaiting explicit takeover.
-        if holder_process_alive(
-            owner_pid=int(row["owner_pid"]),
-            owner_boot_id=row["owner_boot_id"],
-            fence_generation=int(row["fence_generation"]),
-            owner_start_time=row.get("owner_start_time") or None,
-        ):
-            raise SafetyError(
-                f"lease_expired_but_live: lease {lease_id} expired but its holder "
-                f"pid={row['owner_pid']} is still alive; refusing mutation"
-            )
-    else:
-        # Live lease: the presenting identity must be the recorded
-        # holder (a released/dead holder cannot mutate).
-        if not holder_process_alive(
-            owner_pid=int(row["owner_pid"]),
-            owner_boot_id=row["owner_boot_id"],
-            fence_generation=int(row["fence_generation"]),
-            owner_start_time=row.get("owner_start_time") or None,
-        ):
-            raise SafetyError(
-                f"lease_holder_dead: lease {lease_id} holder pid={row['owner_pid']} "
-                f"is not alive; refusing to mutate campaign worktree"
-            )
+    if int(row["expires_at"]) > 0 and int(row["expires_at"]) <= now:
+        raise SafetyError(
+            f"lease_expired: lease {lease_id} expired at {row['expires_at']}; "
+            f"an expired lease has no mutation authority — perform a fenced "
+            f"takeover or acquire a fresh lease"
+        )
+    # item 8: bind to the presenting owner identity.
+    if not owner_id:
+        raise SafetyError(
+            f"lease_owner_missing: a presenting owner_id is REQUIRED to author "
+            f"a campaign mutation with lease {lease_id}"
+        )
+    if str(owner_id) != str(row["owner_id"]):
+        raise SafetyError(
+            f"lease_owner_mismatch: presenting owner_id={owner_id!r} != lease "
+            f"owner {row['owner_id']!r}; refusing mutation"
+        )
+    if owner_pid is not None and int(owner_pid) != int(row["owner_pid"]):
+        raise SafetyError(
+            f"lease_owner_identity_mismatch: presenting pid={owner_pid} != lease "
+            f"pid={row['owner_pid']}; refusing mutation"
+        )
+    if owner_start_time is not None and str(owner_start_time) != str(
+        row.get("owner_start_time") or ""
+    ):
+        raise SafetyError(
+            f"lease_owner_identity_mismatch: presenting process start-time does "
+            f"not match the lease holder; refusing mutation"
+        )
+    # The recorded holder must still be a live process (a dead owner
+    # cannot present the lease).
+    if not holder_process_alive(
+        owner_pid=int(row["owner_pid"]),
+        owner_boot_id=row["owner_boot_id"],
+        fence_generation=int(row["fence_generation"]),
+        owner_start_time=row.get("owner_start_time") or None,
+    ):
+        raise SafetyError(
+            f"lease_holder_dead: lease {lease_id} holder pid={row['owner_pid']} "
+            f"is not alive; refusing to mutate campaign worktree"
+        )
 
 
 def apply_campaign_patch(
@@ -129,26 +153,30 @@ def apply_campaign_patch(
     *,
     admission_fence_generation: int,
     lease_id: str | None = None,
-    expected_holder_pid: int | None = None,
-    expected_holder_boot_id: str | None = None,
+    owner_id: str | None = None,
+    owner_pid: int | None = None,
+    owner_start_time: str | None = None,
 ) -> dict[str, Any]:
     """Apply a proposal atomically AND enforce the campaign fence.
 
-    P06 follow-up #3 A06:
+    P06 follow-up #3/#4 A06:
 
       * A single runner DB IMMEDIATE transaction (the campaign mutation
         lock) is held across: current-fence re-check -> lease authority
         check -> broker atomic file apply -> durable apply evidence.
         ``revoke_for_takeover`` takes the same lock, so a takeover can
         never interleave between the fence check and the file write.
-      * When ``lease_id`` is supplied, the apply is bound to that live
-        lease, not merely to the fence generation.
+      * The apply is bound to a LIVE lease presented by ITS OWNER
+        (``lease_id`` + ``owner_id`` + optional process identity). An
+        expired lease has no mutation authority (item 7), and a
+        different process that merely knows the lease id cannot inherit
+        it (item 8).
       * A durable ``campaign_patch_applied`` evidence row is written in
         the same transaction as the file apply.
 
     Returns the broker's apply dict (with ``receipt_id`` etc.).
-    Raises ``SafetyError`` on fence mismatch, invalid lease, dead
-    holder, or apply failure.
+    Raises ``SafetyError`` on fence mismatch, invalid/expired lease,
+    owner mismatch, or apply failure.
     """
     # A05 item 6: durable intent BEFORE the candidate change so a crash
     # between the worktree write and the durable evidence is
@@ -172,26 +200,22 @@ def apply_campaign_patch(
                 f"{admission_fence_generation} current_generation="
                 f"{fence.current_generation}; refusing stale writer patch"
             )
-        # Lease authority check (A06 item 11), when a lease is supplied.
-        if lease_id is not None:
-            _lease_authorises_apply(
-                db,
-                campaign_id=campaign_id,
-                lease_id=lease_id,
-                admission_fence_generation=admission_fence_generation,
+        # Lease authority check (A06 items 7/8): campaign-v2 mutation
+        # REQUIRES a live, non-expired lease presented by its owner.
+        if not lease_id:
+            raise SafetyError(
+                "lease_required: campaign-v2 patch apply REQUIRES a live "
+                "lease_id (a fence generation alone is not an active lease)"
             )
-        # Holder liveness check (legacy path).
-        if expected_holder_pid is not None:
-            alive = holder_process_alive(
-                owner_pid=expected_holder_pid,
-                owner_boot_id=expected_holder_boot_id or "",
-                fence_generation=admission_fence_generation,
-            )
-            if not alive:
-                raise SafetyError(
-                    f"holder_dead: owner_pid={expected_holder_pid} is not alive; "
-                    f"refusing to mutate campaign worktree"
-                )
+        _lease_authorises_apply(
+            db,
+            campaign_id=campaign_id,
+            lease_id=lease_id,
+            admission_fence_generation=admission_fence_generation,
+            owner_id=owner_id,
+            owner_pid=owner_pid,
+            owner_start_time=owner_start_time,
+        )
 
         # Apply via the broker — the atomic file write happens INSIDE
         # the mutation lock.

@@ -41,13 +41,18 @@ FAILPOINTS: dict[str, str] = {
     ),
 }
 
-# Failpoints that are internal to the single-transaction admission path
-# (not one of the named six). They exist to prove crash-safety of the
-# idempotency reservation; they do not require durable intent because
-# the whole transaction rolls back.
+# Failpoints that are internal to single-transaction boundaries (not one
+# of the named six). They exist to prove atomicity/crash-safety; they do
+# not require durable intent because the whole transaction rolls back.
 INTERNAL_FAILPOINTS: dict[str, str] = {
     "reserve_before_admission_durable": (
         "idempotency reservation exists but admission row not yet durable"
+    ),
+    "crash_window_before_commit": (
+        "crash window INSERT staged but EFFECT_UNKNOWN transition not yet committed"
+    ),
+    "activate_grant_before_commit": (
+        "protected approval consumed but active grant not yet committed"
     ),
 }
 

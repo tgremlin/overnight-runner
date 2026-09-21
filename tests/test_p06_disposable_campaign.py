@@ -74,9 +74,9 @@ from overnight_runner.receipts import (
     receipts_enabled,
     _receipts_root,
 )
-from overnight_runner.resources import acquire_lease, current_fence
+from overnight_runner.resources import acquire_lease, current_fence, process_identity
 from overnight_runner.worker import Worker, _finalise, _maybe_mint_validation_receipt
-from overnight_runner.broker import Broker, CommandRegistry, CommandSpec
+from overnight_runner.broker import Broker, CommandRegistry, CommandSpec, Proposal
 from overnight_runner.safety import (
     git_commit_all,
     git_init_empty,
@@ -383,8 +383,24 @@ class TestDisposableCampaignProof(unittest.TestCase):
                 fence_generation=receipt.fence_generation,
                 ttl_seconds=300,
             )
-            # 3c) Worker mutates the candidate and commits.
-            (wt / "src" / "app.py").write_text(f"CHUNK{i}\n")
+            # 3c) Worker mutates the candidate through the ACTUAL campaign
+            # mutation boundary (apply_campaign_patch) — NO direct
+            # filesystem write bypass in the canonical proof.
+            broker = _worktree_broker(wt, self._tmp / f"broker-{i}")
+            before = (wt / "src" / "app.py").read_text()
+            broker.proposals["prop-dc"] = Proposal(
+                proposal_id="prop-dc", op="replace_file", path="src/app.py",
+                abs_path=wt / "src" / "app.py", before_text=before,
+                proposed_text=f"CHUNK{i}\n", preview_diff="", changed_lines=1,
+                proposed_bytes=len(f"CHUNK{i}\n"))
+            ident = process_identity(os.getpid())
+            apply_campaign_patch(
+                self._db, broker, str(self._repo), camp.campaign_id, "prop-dc",
+                admission_fence_generation=receipt.fence_generation,
+                lease_id=lease.lease_id, owner_id="wkr-dc",
+                owner_pid=os.getpid(), owner_start_time=ident["start_time"],
+            )
+            # Runner-owned commit fixture step for the mutated candidate.
             subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", f"chunk {i}"], cwd=str(wt), check=True, capture_output=True)
             new_commit = subprocess.run(
@@ -485,6 +501,21 @@ class TestDisposableCampaignProof(unittest.TestCase):
         self.assertNotEqual(row["plan_digest"], grant.plan_id)
         self.assertEqual(row["grant_digest"], content_sha256(grant_active))
         self.assertEqual(row["plan_digest"], load_plan_digest(self._db, grant.plan_id))
+
+
+def _worktree_broker(worktree: Path, artifact_dir: Path,
+                     validator_command: str = "noop") -> Broker:
+    """A minimal broker bound to the campaign worktree."""
+    reg = CommandRegistry()
+    reg.register(CommandSpec(validator_command, ["true"], "repo", 5, "read"))
+    return Broker(
+        repo_root=worktree, registry=reg,
+        allowed_write_paths=["src/app.py"], allowed_create_paths=[],
+        allowed_read_paths=["src/app.py"], allowed_protected_read_paths=[],
+        model_allowed_command_ids=[validator_command],
+        required_validator_ids=[validator_command],
+        artifact_dir=artifact_dir,
+    )
 
 
 def receipts_root_for():

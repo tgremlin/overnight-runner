@@ -60,6 +60,7 @@ from overnight_runner.resources import (
     current_fence,
     expire_overdue_leases,
     holder_process_alive,
+    process_identity,
     release_lease,
     revoke_for_takeover,
 )
@@ -75,6 +76,7 @@ from overnight_runner.safety import (
     git_commit_all,
     git_init_empty,
     git_head,
+    git_worktree_sha,
 )
 
 
@@ -169,6 +171,51 @@ def _make_repo(tmp_path: Path) -> Path:
     (repo / "src" / "app.py").write_text("BASE\n")
     git_commit_all(repo, "init")
     return repo
+
+
+def _chunk_auth(campaign_id: str, chunk_id: str, validators=("noop",)) -> ChunkSpec:
+    """A chunk with the given id + durable required validators."""
+    return ChunkSpec(
+        schema_version="trio.chunk.v1",
+        chunk_id=chunk_id, campaign_id=campaign_id, package_id="pkg-1",
+        revision=1, title="c", objective="c",
+        permitted_signature_paths=["src/app.py"],
+        permitted_write_paths=["src/app.py"],
+        permitted_read_paths=["src/app.py"],
+        permitted_command_ids=list(validators),
+        permitted_validator_ids=list(validators),
+        required_validator_ids=list(validators),
+        required_receipt_profiles=list(validators),
+        criterion_ids=["crit-1"],
+        idempotency_key=f"idem-{chunk_id}",
+    )
+
+
+def _admit_auth(db, grant, camp, chunk_id: str, validators=("noop",)):
+    """Admit a chunk so integration has durable authority."""
+    cur_commit = db._conn.execute(
+        "SELECT current_commit FROM campaigns WHERE campaign_id=?",
+        (camp.campaign_id,)).fetchone()["current_commit"]
+    receipt, _ = derive_admission(
+        db, grant=grant, chunk=_chunk_auth(camp.campaign_id, chunk_id, validators),
+        worker_id="wkr-1",
+        policy_profile_id=grant.policy_profile_id,
+        validator_profile_ids=list(grant.validator_profile_ids),
+        provider_profile_id=grant.provider_profile_id,
+        current_accepted_snapshot=_snap(commit=cur_commit),
+        **_id_kwargs(grant))
+    return receipt
+
+
+def _commit_candidate(wt: Path, content: str = "CAND\n") -> tuple[str, str]:
+    """Commit a candidate in the worktree; return (commit, worktree_sha)."""
+    (wt / "src" / "app.py").write_text(content)
+    subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=str(wt), check=True, capture_output=True)
+    new_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
+    ).stdout.strip()
+    return new_commit, git_worktree_sha(wt)
 
 
 # ============================================================
@@ -370,16 +417,22 @@ class TestA04ReceiptCandidateBinding(unittest.TestCase):
     def test_cross_chunk_receipt_rejects(self):
         """A PASS receipt from chunk A MUST NOT authorize chunk B."""
         grant = _grant_active(self._db, plan_id="pl-ccr", grant_id="gr-ccr")
+        base = self._head + "0" * 24
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
-            base_commit=self._head + "0" * 24, base_tree_digest="b" * 64,
+            base_commit=base, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
-        # Mint a receipt claiming chunk_id=chk-A.
+        wt = ensure_campaign_worktree(repo_root=self._repo, campaign_id=camp.campaign_id,
+                                      base_commit=base, db=self._db)
+        _admit_auth(self._db, grant, camp, "chk-A")
+        _admit_auth(self._db, grant, camp, "chk-B")
+        new_commit, candidate = _commit_candidate(wt)
+        # Receipt bound to chunk A.
         rid = mint_validation_receipt(
             validator_id="noop", validator_command="noop",
             validator_profile="noop",
-            candidate_snapshot_digest="a" * 64,
+            candidate_snapshot_digest=candidate,
             candidate_tree_state="post-apply",
             chunk_id="chk-A",
             outcome="pass",
@@ -389,22 +442,25 @@ class TestA04ReceiptCandidateBinding(unittest.TestCase):
             compare_and_swap_advance(
                 self._db, repo_root=self._repo,
                 campaign_id=camp.campaign_id, chunk_id="chk-B",
-                new_commit="0" * 64, holder_fence_generation=1, actor="runner",
+                new_commit=new_commit, holder_fence_generation=1, actor="runner",
                 idempotency_key="idem-ccr",
                 validation_receipt_id=rid,
-                expected_chunk_id="chk-B",
-                expected_validator_id="noop",
-                expected_tree_digest="a" * 64,
+                campaign_worktree=wt,
             )
-        self.assertIn("chunk_id", str(ctx.exception).lower())
+        self.assertIn("chunk", str(ctx.exception).lower())
 
     def test_wrong_candidate_snapshot_rejects(self):
         grant = _grant_active(self._db, plan_id="pl-wcs", grant_id="gr-wcs")
+        base = self._head + "0" * 24
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
-            base_commit=self._head + "0" * 24, base_tree_digest="b" * 64,
+            base_commit=base, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
+        wt = ensure_campaign_worktree(repo_root=self._repo, campaign_id=camp.campaign_id,
+                                      base_commit=base, db=self._db)
+        _admit_auth(self._db, grant, camp, "chk-1")
+        new_commit, _candidate = _commit_candidate(wt)
         rid = mint_validation_receipt(
             validator_id="noop", validator_command="noop",
             candidate_snapshot_digest="aa" * 32,
@@ -414,15 +470,12 @@ class TestA04ReceiptCandidateBinding(unittest.TestCase):
             compare_and_swap_advance(
                 self._db, repo_root=self._repo,
                 campaign_id=camp.campaign_id, chunk_id="chk-1",
-                new_commit="0" * 64, holder_fence_generation=1, actor="runner",
+                new_commit=new_commit, holder_fence_generation=1, actor="runner",
                 idempotency_key="idem-wcs",
                 validation_receipt_id=rid,
-                expected_tree_digest="bb" * 32,
-                expected_chunk_id="chk-1",
-                expected_validator_id="noop",
+                campaign_worktree=wt,
             )
-        self.assertIn("candidate_snapshot_digest" in str(ctx.exception).lower() or
-                       "candidate tree" in str(ctx.exception).lower(), [True])
+        self.assertIn("candidate", str(ctx.exception).lower())
 
 
 # ============================================================
@@ -520,24 +573,17 @@ class TestA05CrashFailpoints(unittest.TestCase):
             base_commit=self._head + "0" * 24, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
-        # Create a real commit to advance.
+        # Create a real commit to advance (canonical campaign worktree).
+        base = self._head + "0" * 24
         wt = ensure_campaign_worktree(
             repo_root=self._repo, campaign_id=camp.campaign_id,
-            base_commit=self._head + "0" * 24,
+            base_commit=base, db=self._db,
         )
-        (wt / "src" / "app.py").write_text("FP\n")
-        subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "fp"], cwd=str(wt), check=True, capture_output=True)
-        new_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
-        ).stdout.strip()
-        new_tree = subprocess.run(
-            ["git", "rev-parse", f"{new_commit}^{{tree}}"], cwd=str(wt),
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+        _admit_auth(self._db, grant, camp, "chk-fp")
+        new_commit, candidate = _commit_candidate(wt, "FP\n")
         rid = mint_validation_receipt(
             validator_id="noop", validator_command="noop",
-            candidate_snapshot_digest=new_tree,
+            candidate_snapshot_digest=candidate,
             outcome="pass", chunk_id="chk-fp",
         )
         os.environ["TR_FAILPOINT_ref_advanced_before_integration_journal_event"] = "raise"
@@ -549,7 +595,7 @@ class TestA05CrashFailpoints(unittest.TestCase):
                     new_commit=new_commit, holder_fence_generation=1, actor="runner",
                     idempotency_key="idem-fp",
                     validation_receipt_id=rid,
-                    expected_tree_digest=new_tree,
+                    campaign_worktree=wt,
                 )
         finally:
             os.environ.pop("TR_FAILPOINT_ref_advanced_before_integration_journal_event", None)
@@ -744,8 +790,9 @@ class TestA06FencedMutationBoundary(unittest.TestCase):
             preview_diff="", changed_lines=1, proposed_bytes=6,
         )
         # Acquire a writer lease at the current fence.
+        ident = process_identity(os.getpid())
         old_gen = current_fence(self._db, camp.campaign_id).current_generation
-        acquire_lease(
+        old_lease = acquire_lease(
             self._db, campaign_id=camp.campaign_id, resource_id="writer",
             owner_id="wkr-A", owner_boot_id="boot-A", owner_pid=os.getpid(),
             fence_generation=old_gen, ttl_seconds=300,
@@ -759,12 +806,21 @@ class TestA06FencedMutationBoundary(unittest.TestCase):
             apply_campaign_patch(
                 self._db, broker, str(self._repo), camp.campaign_id, "prop-x",
                 admission_fence_generation=old_gen,
+                lease_id=old_lease.lease_id, owner_id="wkr-A",
+                owner_pid=os.getpid(), owner_start_time=ident["start_time"],
             )
         self.assertIn("fence_stale", str(ctx.exception).lower())
-        # The NEW owner (with the bumped fence) can apply.
+        # The NEW owner (with the bumped fence + a fresh live lease) can apply.
+        new_lease = acquire_lease(
+            self._db, campaign_id=camp.campaign_id, resource_id="writer",
+            owner_id="wkr-B", owner_boot_id="boot-B", owner_pid=os.getpid(),
+            fence_generation=new_gen, ttl_seconds=300,
+        )
         apply_campaign_patch(
             self._db, broker, str(self._repo), camp.campaign_id, "prop-x",
             admission_fence_generation=new_gen,
+            lease_id=new_lease.lease_id, owner_id="wkr-B",
+            owner_pid=os.getpid(), owner_start_time=ident["start_time"],
         )
 
 

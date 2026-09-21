@@ -144,31 +144,69 @@ def capture_current_snapshot(worktree: Path) -> RepoSnapshot:
     )
 
 
-def _ordered_required_validators(db: Database, chunk_id: str) -> list[str] | None:
-    """Return the durable REQUIRED validator set for ``chunk_id``.
+def _durable_chunk_authority(
+    db: Database, *, campaign_id: str, chunk_id: str
+) -> dict[str, Any]:
+    """Return the durable admitted-chunk authority for integration.
 
-    P06 follow-up #3 (A04 item 4): integration authority comes from the
-    runner-owned admitted chunk contract, NOT from optional
-    caller-supplied hints. Returns ``None`` when the chunk row is
-    absent (legacy callers without a durable admission), in which case
-    the caller falls back to the explicit-hint path.
+    P06 follow-up #4 (A04 item 5): campaign-v2 integration REQUIRES a
+    durable admitted chunk. There is no optional caller-supplied hint
+    fallback. We require:
+
+      * the chunk row exists;
+      * the chunk belongs to ``campaign_id``;
+      * the chunk has an ``admission_id``;
+      * ``required_validator_ids_json`` is readable and authoritative.
+
+    Missing durability raises ``SafetyError`` (BLOCK).
     """
     cur = db._conn.execute(
-        "SELECT required_validator_ids_json FROM chunks WHERE chunk_id=?",
+        "SELECT campaign_id, admission_id, required_validator_ids_json "
+        "FROM chunks WHERE chunk_id=?",
         (chunk_id,),
     )
     row = cur.fetchone()
     if row is None:
-        return None
-    try:
-        raw = row["required_validator_ids_json"] or "[]"
-    except (KeyError, IndexError, TypeError):
-        raw = "[]"
+        raise SafetyError(
+            f"integration gate: no durable admitted chunk for "
+            f"chunk_id={chunk_id!r}; campaign-v2 integration REQUIRES a "
+            f"runner-owned admitted chunk (no caller-hint fallback)"
+        )
+    if (row["campaign_id"] or "") != campaign_id:
+        raise SafetyError(
+            f"integration gate: chunk {chunk_id!r} belongs to campaign "
+            f"{row['campaign_id']!r}, not {campaign_id!r}"
+        )
+    admission_id = row["admission_id"] or ""
+    if not admission_id:
+        raise SafetyError(
+            f"integration gate: chunk {chunk_id!r} has no admission_id; "
+            f"refusing integration without durable admission authority"
+        )
+    raw = row["required_validator_ids_json"]
+    if raw is None:
+        raise SafetyError(
+            f"integration gate: chunk {chunk_id!r} has no readable "
+            f"required_validator_ids_json; refusing integration"
+        )
     try:
         vals = json.loads(raw)
-    except (ValueError, TypeError):
-        vals = []
-    return [str(v) for v in vals if v]
+    except (ValueError, TypeError) as e:
+        raise SafetyError(
+            f"integration gate: chunk {chunk_id!r} required_validator_ids_json "
+            f"is not readable JSON: {e}"
+        ) from e
+    if not isinstance(vals, list) or not vals:
+        raise SafetyError(
+            f"integration gate: chunk {chunk_id!r} has an empty required "
+            f"validator set; refusing integration"
+        )
+    return {
+        "chunk_id": chunk_id,
+        "campaign_id": campaign_id,
+        "admission_id": admission_id,
+        "required_validator_ids": [str(v) for v in vals if v],
+    }
 
 
 def _git_is_clean(worktree: Path) -> bool:
@@ -185,6 +223,7 @@ def candidate_fingerprint(
     new_commit: str,
     campaign_worktree: Path | None = None,
     expected_tree_digest: str | None = None,
+    require_canonical: bool = True,
 ) -> str:
     """Canonical P05/P06 candidate identity for the integrating candidate.
 
@@ -195,10 +234,14 @@ def candidate_fingerprint(
     same fingerprint and requires it to equal the validation receipt's
     ``candidate_snapshot_digest``.
 
-    When the campaign worktree is supplied we also prove it is exactly
-    at ``new_commit`` and in a clean/bounded state (HEAD == new_commit,
-    no uncommitted drift). The legacy ``expected_tree_digest`` path is
-    retained only for callers that predate the campaign worktree.
+    P06 follow-up #4 (A04 item 6): for the campaign-v2 authoritative
+    path (``require_canonical=True``, the default) the campaign worktree
+    is REQUIRED. The caller may NOT substitute a digest via
+    ``expected_tree_digest`` and the Git tree fallback is unavailable.
+    The worktree MUST exist, have ``HEAD == new_commit``, and be clean.
+    The legacy fallbacks are only reachable with ``require_canonical=False``
+    for old unit/legacy code and are NOT used by
+    ``compare_and_swap_advance``.
     """
     if campaign_worktree is not None and Path(campaign_worktree).exists():
         wt = Path(campaign_worktree)
@@ -220,6 +263,12 @@ def candidate_fingerprint(
                 "refusing to integrate a non-clean candidate"
             )
         return git_worktree_sha(wt)
+    if require_canonical:
+        raise SafetyError(
+            "integration gate: campaign-v2 integration REQUIRES the actual "
+            "campaign worktree (caller-supplied candidate digests are not "
+            "accepted)"
+        )
     if expected_tree_digest is not None:
         return expected_tree_digest
     try:
@@ -229,6 +278,132 @@ def candidate_fingerprint(
             f"integration gate: cannot derive candidate tree for "
             f"new_commit={new_commit[:8]}: {e}"
         ) from e
+
+
+def _resolve_campaign_worktree(
+    db: Database, *, campaign_id: str, campaign_worktree: Path | None
+) -> Path:
+    """Return the campaign worktree path (explicit, else persisted).
+
+    P06 follow-up #4 (A04 item 6): loads the persisted campaign worktree
+    identity and requires the worktree to actually exist. Raises
+    ``SafetyError`` when no durable identity is available.
+    """
+    if campaign_worktree is not None:
+        wt = Path(campaign_worktree)
+    else:
+        cur = db._conn.execute(
+            "SELECT worktree_path FROM campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        )
+        row = cur.fetchone()
+        stored = (row["worktree_path"] if row is not None else "") or ""
+        if not stored:
+            raise SafetyError(
+                f"integration gate: campaign {campaign_id!r} has no persisted "
+                f"worktree identity; refusing integration"
+            )
+        wt = Path(stored)
+    if not wt.exists():
+        raise SafetyError(
+            f"integration gate: campaign worktree {wt} does not exist; "
+            f"refusing integration"
+        )
+    return wt
+
+
+# Campaign states from which no consequential integration may proceed.
+_BLOCKED_CAMPAIGN_STATES = frozenset({
+    "EFFECT_UNKNOWN", "NEEDS_DECISION", "CANCELLED", "EXPIRED",
+    "COMPLETE", "BUDGET_EXHAUSTED", "PAUSED_OPERATOR",
+})
+
+
+def _assert_campaign_integratable(db: Database, *, campaign_id: str) -> None:
+    """Refuse integration from a blocked campaign state.
+
+    P06 follow-up #4 (item 4): the consequence API itself enforces this,
+    so safe operation does not depend on the caller invoking a preflight
+    helper.
+    """
+    cur = db._conn.execute(
+        "SELECT state FROM campaigns WHERE campaign_id=?", (campaign_id,)
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise SafetyError(f"campaign {campaign_id!r} not registered")
+    if row["state"] in _BLOCKED_CAMPAIGN_STATES:
+        raise SafetyError(
+            f"campaign {campaign_id!r} is in blocking state={row['state']}; "
+            f"integration refused"
+        )
+    from .runtime import is_paused
+    if is_paused():
+        raise SafetyError("PAUSED sentinel present; integration refused")
+
+
+def _validate_admission_lease_lineage(
+    db: Database,
+    *,
+    campaign_id: str,
+    chunk_id: str,
+    admission_id: str,
+    holder_fence_generation: int,
+) -> None:
+    """Bind integration to the admitted authority lineage.
+
+    P06 follow-up #4 (item 9): chunk -> admission -> lease/fence. A
+    released/stale admission (or its lease) may not advance merely
+    because the caller knows the current integer fence.
+    """
+    cur = db._conn.execute(
+        "SELECT chunk_id, lease_id, fence_generation FROM admissions "
+        "WHERE admission_id=?",
+        (admission_id,),
+    )
+    arow = cur.fetchone()
+    if arow is None:
+        raise SafetyError(
+            f"integration gate: admission {admission_id!r} not found; "
+            f"refusing integration"
+        )
+    if (arow["chunk_id"] or "") != chunk_id:
+        raise SafetyError(
+            f"integration gate: admission {admission_id!r} is for chunk "
+            f"{arow['chunk_id']!r}, not {chunk_id!r}"
+        )
+    if int(arow["fence_generation"]) != holder_fence_generation:
+        raise SafetyError(
+            f"integration gate: admission fence_generation="
+            f"{arow['fence_generation']} != holder fence "
+            f"{holder_fence_generation}; refusing integration"
+        )
+    lease_id = arow["lease_id"] or ""
+    if not lease_id:
+        raise SafetyError(
+            f"integration gate: admission {admission_id!r} has no lease; "
+            f"refusing integration"
+        )
+    lrow = db._conn.execute(
+        "SELECT released_at, fence_generation FROM leases WHERE lease_id=?",
+        (lease_id,),
+    ).fetchone()
+    if lrow is None:
+        raise SafetyError(
+            f"integration gate: admission lease {lease_id!r} not found; "
+            f"refusing integration"
+        )
+    if int(lrow["released_at"]) != 0:
+        raise SafetyError(
+            f"integration gate: admission lease {lease_id!r} was released; "
+            f"a stale admission may not advance integration"
+        )
+    if int(lrow["fence_generation"]) != holder_fence_generation:
+        raise SafetyError(
+            f"integration gate: admission lease fence_generation="
+            f"{lrow['fence_generation']} != holder fence "
+            f"{holder_fence_generation}; refusing integration"
+        )
 
 
 def _precheck_receipts(receipt_ids: list[str]) -> None:
@@ -330,37 +505,30 @@ def _validate_required_receipts(
             )
         loaded.append(rec)
 
-    # Durable required-validator set is authoritative when present.
-    if required_validators:
-        used: list[str] = []
-        for validator in required_validators:
-            match = None
-            for rec in loaded:
-                rec_validator = rec.get("validator_id", "")
-                rec_profile = rec.get("validator_profile", "")
-                if validator in (rec_validator, rec_profile):
-                    match = rec
-                    break
-            if match is None:
-                raise SafetyError(
-                    f"integration gate: required validator {validator!r} has no "
-                    f"trusted PASS receipt bound to the integrating candidate; "
-                    f"refusing integration"
-                )
-            used.append(match.get("receipt_id", ""))
-        return used
-
-    # Legacy path (no durable chunk contract): fall back to the
-    # explicit validator hint, matching the follow-up #2 behaviour.
-    if expected_validator_id is not None:
+    # P06 follow-up #4 (A04 item 5): the durable required-validator set
+    # is the ONLY authority. There is no caller-hint fallback.
+    if not required_validators:
+        raise SafetyError(
+            "integration gate: no durable required-validator set for the "
+            "integrating chunk; refusing integration"
+        )
+    used: list[str] = []
+    for validator in required_validators:
+        match = None
         for rec in loaded:
-            if rec.get("validator_id", "") != expected_validator_id:
-                raise SafetyError(
-                    f"integration gate: validation receipt validator_id="
-                    f"{rec.get('validator_id','')!r} != required validator_id="
-                    f"{expected_validator_id!r}; rejecting cross-validator receipt"
-                )
-    return [rec.get("receipt_id", "") for rec in loaded]
+            rec_validator = rec.get("validator_id", "")
+            rec_profile = rec.get("validator_profile", "")
+            if validator in (rec_validator, rec_profile):
+                match = rec
+                break
+        if match is None:
+            raise SafetyError(
+                f"integration gate: required validator {validator!r} has no "
+                f"trusted PASS receipt bound to the integrating candidate; "
+                f"refusing integration"
+            )
+        used.append(match.get("receipt_id", ""))
+    return used
 
 
 def compare_and_swap_advance(
@@ -405,7 +573,12 @@ def compare_and_swap_advance(
     now = int(time.time())
     branch = f"refs/heads/campaign/{campaign_id}"
 
-    # Step 0a: gather the receipt ids (list takes precedence).
+    # Step 0a (follow-up #4 item 4): refuse integration from a blocked
+    # campaign state. Safe operation must not depend on the caller
+    # remembering a preflight helper.
+    _assert_campaign_integratable(db, campaign_id=campaign_id)
+
+    # Step 0b: gather the receipt ids (list takes precedence).
     receipts = list(validation_receipt_ids or [])
     if validation_receipt_id:
         receipts.append(validation_receipt_id)
@@ -417,24 +590,47 @@ def compare_and_swap_advance(
     # derivation effort.
     _precheck_receipts(receipts)
 
-    # Step 0b: canonical candidate fingerprint.
+    # Step 0c (item 5): durable admitted chunk authority. No caller-hint
+    # fallback exists for campaign-v2 integration.
+    chunk_auth = _durable_chunk_authority(
+        db, campaign_id=campaign_id, chunk_id=chunk_id
+    )
+
+    # Step 0d (item 6): the ACTUAL campaign worktree is required; the
+    # caller may not substitute a candidate digest.
+    wt = _resolve_campaign_worktree(
+        db, campaign_id=campaign_id, campaign_worktree=campaign_worktree
+    )
     candidate = candidate_fingerprint(
         repo_root=repo_root,
         new_commit=new_commit,
-        campaign_worktree=campaign_worktree,
-        expected_tree_digest=expected_tree_digest,
+        campaign_worktree=wt,
+        require_canonical=True,
     )
 
-    required_validators = _ordered_required_validators(db, chunk_id)
+    # Step 0e (item 4): all durable-required validators have a trusted
+    # PASS receipt bound to the exact candidate/chunk.
     _validate_required_receipts(
         db,
         campaign_id=campaign_id,
         chunk_id=chunk_id,
         candidate=candidate,
         receipt_ids=receipts,
-        required_validators=required_validators,
-        expected_chunk_id=expected_chunk_id,
-        expected_validator_id=expected_validator_id,
+        required_validators=chunk_auth["required_validator_ids"],
+        expected_chunk_id=None,
+        expected_validator_id=None,
+    )
+
+    # Step 0f (item 9): bind integration to the admitted authority
+    # lineage (chunk -> admission -> lease/fence). A released/stale
+    # admission may not advance merely because the caller knows the
+    # current integer fence.
+    _validate_admission_lease_lineage(
+        db,
+        campaign_id=campaign_id,
+        chunk_id=chunk_id,
+        admission_id=chunk_auth["admission_id"],
+        holder_fence_generation=holder_fence_generation,
     )
 
     # Step 1: read LIVE ref (this is the source of truth for what the
@@ -464,7 +660,7 @@ def compare_and_swap_advance(
                 (live_commit, "", now, campaign_id),
             )
 
-    worktree_path = str(campaign_worktree) if campaign_worktree else ""
+    worktree_path = str(wt)
 
     if expected_old is not None and live_commit and live_commit != expected_old and expected_old != live_commit[: len(expected_old)] and live_commit[: len(live_commit)] != expected_old[: len(expected_old)]:
         _record_crash_window(
@@ -676,38 +872,52 @@ def _record_crash_window(
     P06 follow-up #3 (A05 item 7): the window stores the exact
     repository / worktree / integration-branch identity so
     reconciliation inspects the REAL campaign repo.
+
+    P06 follow-up #4 (A05 item 1): the durable crash window AND the
+    ``EFFECT_UNKNOWN`` transition are written in ONE ``BEGIN IMMEDIATE``
+    transaction. Either BOTH exist or NEITHER does: there is never a
+    durable crash window with the campaign still ACTIVE, and never an
+    EFFECT_UNKNOWN campaign without the corresponding durable evidence.
     """
     now = int(time.time())
     wid = f"cw-{uuid.uuid4().hex[:16]}"
-    db._conn.execute(
-        """
-        INSERT INTO crash_windows (
-            window_id, campaign_id, chunk_id, kind, observed_artifact,
-            snapshot_at, recovered_at, reconciliation_reason,
-            repo_root, worktree_path, integration_branch, evidence_json
-        ) VALUES (?,?,?,?,?,?,0,'',?,?,?,?)
-        """,
-        (
-            wid, campaign_id, chunk_id, kind, observed_artifact[:2000], now,
-            repo_root, worktree_path, integration_branch,
-            json.dumps(evidence or {}),
-        ),
-    )
-    # Transition campaign to EFFECT_UNKNOWN. Refuse if already in a
-    # blocking terminal state (CANCELLED, EXPIRED, COMPLETE).
-    cur = db._conn.execute(
-        "SELECT state FROM campaigns WHERE campaign_id=?",
-        (campaign_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        return  # nothing to transition; campaign not yet registered
-    if row["state"] in ("CANCELLED", "EXPIRED", "COMPLETE", "BUDGET_EXHAUSTED"):
-        return  # don't clobber a terminal state
-    db._conn.execute(
-        "UPDATE campaigns SET state='EFFECT_UNKNOWN', updated_at=? WHERE campaign_id=? AND state NOT IN ('CANCELLED','EXPIRED','COMPLETE','BUDGET_EXHAUSTED')",
-        (now, campaign_id),
-    )
+    with db.transaction() as cur:
+        cur.execute(
+            "SELECT state FROM campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        )
+        row = cur.fetchone()
+        cur.execute(
+            """
+            INSERT INTO crash_windows (
+                window_id, campaign_id, chunk_id, kind, observed_artifact,
+                snapshot_at, recovered_at, reconciliation_reason,
+                repo_root, worktree_path, integration_branch, evidence_json
+            ) VALUES (?,?,?,?,?,?,0,'',?,?,?,?)
+            """,
+            (
+                wid, campaign_id, chunk_id, kind, observed_artifact[:2000], now,
+                repo_root, worktree_path, integration_branch,
+                json.dumps(evidence or {}),
+            ),
+        )
+        # Transition campaign to EFFECT_UNKNOWN in the SAME transaction.
+        # Refuse to clobber a terminal state (the durable window alone is
+        # a justified recovery object for those states).
+        if row is not None and row["state"] not in (
+            "CANCELLED", "EXPIRED", "COMPLETE", "BUDGET_EXHAUSTED"
+        ):
+            cur.execute(
+                "UPDATE campaigns SET state='EFFECT_UNKNOWN', updated_at=? "
+                "WHERE campaign_id=? AND state NOT IN "
+                "('CANCELLED','EXPIRED','COMPLETE','BUDGET_EXHAUSTED')",
+                (now, campaign_id),
+            )
+        # Atomicity failpoint: raise BEFORE commit so the whole
+        # transaction (window + state) rolls back together.
+        if failpoint_armed("crash_window_before_commit"):
+            raise_failpoint("crash_window_before_commit")
+    return wid
 
 
 # ----------------------------- Failpoint injection -----------------------------
@@ -761,13 +971,17 @@ def _emit_event(
 
 def _resolve_repo_for_window(
     db: Database, campaign_row: dict[str, Any], window_row: dict[str, Any]
-) -> tuple[Path, str]:
+) -> tuple[Path | None, str]:
     """Return the REAL (repo_path, integration_branch) for a window.
 
     P06 follow-up #3 (A05 item 7): prefer the identity persisted with
-    the crash window, then the campaign row, then the repo_root that
-    was persisted at campaign creation. The runner state directory is
-    only a last-resort fallback for legacy rows.
+    the crash window, then the campaign row.
+
+    P06 follow-up #4 (A05 item 2): missing repository identity returns
+    ``None`` — NOT ``Path("")`` (whose ``str()`` is ``"."`` and would
+    silently make the caller run Git against the process cwd). The
+    caller MUST treat ``None`` as fail-closed EFFECT_UNKNOWN and never
+    run Git against ``.`` / ``state_dir`` / a guessed repository.
     """
     repo_root = window_row.get("repo_root") or campaign_row.get("repo_root") or ""
     branch = (
@@ -777,10 +991,71 @@ def _resolve_repo_for_window(
     )
     if repo_root:
         return Path(repo_root), branch
-    # Legacy fallback: no durable identity. We must NOT silently use the
-    # state dir and then claim SAFE_NOT_COMPLETED; mark the path empty so
-    # the caller can refuse to make a positive safety claim.
-    return Path(""), branch
+    return None, branch
+
+
+def _ensure_integration_event(
+    db: Database, *, campaign_id: str, commit: str
+) -> bool:
+    """Ensure the integration_advanced event for ``commit`` exists.
+
+    P06 follow-up #4 (A05 item 3): reconciliation must recover the
+    REQUIRED durable audit/event evidence for the event/outbox boundary
+    before declaring SAFE_COMPLETED. Returns ``True`` when the event is
+    present (already durable or idempotently recreated); ``False`` when
+    it cannot be rebuilt (caller must remain EFFECT_UNKNOWN). Repeated
+    calls never create a duplicate event.
+    """
+    if not commit:
+        return False
+    existing = db._conn.execute(
+        "SELECT event_id FROM campaign_events WHERE campaign_id=? "
+        "AND event_type='integration_advanced' AND to_state=? LIMIT 1",
+        (campaign_id, commit),
+    ).fetchone()
+    if existing is not None:
+        return True
+    j = db._conn.execute(
+        "SELECT chunk_id, expected_old_commit, fence_generation, actor, "
+        "idempotency_key FROM integration_journal "
+        "WHERE campaign_id=? AND committed_new_commit=? "
+        "ORDER BY committed_at DESC LIMIT 1",
+        (campaign_id, commit),
+    ).fetchone()
+    if j is None:
+        return False
+    key = j["idempotency_key"]
+    event_id = f"ev-replay-{key}"
+    try:
+        with db.transaction() as cur:
+            # Re-check inside the write transaction so a concurrent or
+            # repeated reconcile cannot create a duplicate event.
+            ex = cur.execute(
+                "SELECT event_id FROM campaign_events WHERE campaign_id=? "
+                "AND event_type='integration_advanced' AND to_state=? LIMIT 1",
+                (campaign_id, commit),
+            ).fetchone()
+            if ex is not None:
+                return True
+            cur.execute(
+                """
+                INSERT INTO campaign_events (
+                    event_id, campaign_id, chunk_id, event_type,
+                    from_state, to_state, actor, payload, fence_generation,
+                    issued_at, idempotency_key
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event_id, campaign_id, j["chunk_id"], "integration_advanced",
+                    j["expected_old_commit"], commit, j["actor"],
+                    json.dumps({"replayed_by_reconciliation": True}),
+                    int(j["fence_generation"]), int(time.time()), key,
+                ),
+            )
+    except Exception:
+        # PRIMARY KEY / race: treat as already present.
+        return True
+    return True
 
 
 def reconcile_crash_window(db: Database, *, campaign_id: str) -> dict[str, Any]:
@@ -862,9 +1137,9 @@ def reconcile_crash_window(db: Database, *, campaign_id: str) -> dict[str, Any]:
     for w in rows:
         kind = w["kind"]
         repo_path, branch = _resolve_repo_for_window(db, campaign_row, w)
-        if not str(repo_path):
-            # No durable repository identity: cannot make a positive
-            # safety claim.
+        if repo_path is None:
+            # No durable repository identity: fail closed. We MUST NOT
+            # run Git against "." / state_dir / cwd / a guessed repo.
             decisions.append({
                 "window_id": w["window_id"],
                 "decision": "EFFECT_UNKNOWN",
@@ -880,13 +1155,35 @@ def reconcile_crash_window(db: Database, *, campaign_id: str) -> dict[str, Any]:
         except (ValueError, TypeError):
             evidence = {}
         intended = evidence.get("new_commit", "")
+        expected_old_ev = evidence.get("expected_old", "")
 
         if live_commit and last_journal_commit and live_commit == last_journal_commit:
-            decisions.append({
-                "window_id": w["window_id"],
-                "decision": "SAFE_COMPLETED",
-                "reason": "live ref matches integration journal; CAS is durable",
-            })
+            # P06 follow-up #4 (item 3): for the event/outbox boundary we
+            # must ensure the REQUIRED durable event evidence exists (or
+            # be idempotently restored) before declaring SAFE_COMPLETED.
+            if kind == "event_outbox_committed_before_projection_status":
+                if _ensure_integration_event(
+                    db, campaign_id=campaign_id, commit=live_commit
+                ):
+                    decisions.append({
+                        "window_id": w["window_id"],
+                        "decision": "SAFE_COMPLETED",
+                        "reason": "live ref matches journal; event/outbox evidence "
+                                  "present or restored idempotently",
+                    })
+                else:
+                    decisions.append({
+                        "window_id": w["window_id"],
+                        "decision": "EFFECT_UNKNOWN",
+                        "reason": "ref/journal durable but required event/outbox "
+                                  "evidence is missing and cannot be rebuilt",
+                    })
+            else:
+                decisions.append({
+                    "window_id": w["window_id"],
+                    "decision": "SAFE_COMPLETED",
+                    "reason": "live ref matches integration journal; CAS is durable",
+                })
         elif live_commit and intended and live_commit == intended:
             # The ref DID advance to the intended commit, but the
             # journal/event projection is missing. We cannot prove the
@@ -898,6 +1195,18 @@ def reconcile_crash_window(db: Database, *, campaign_id: str) -> dict[str, Any]:
                     "ref advanced to the intended commit but the integration "
                     "journal/event is missing; manual review required"
                 ),
+            })
+        elif (
+            live_commit and expected_old_ev
+            and live_commit == expected_old_ev and live_commit != intended
+        ):
+            # Positive evidence the ref did NOT advance: it is still at
+            # the pre-integration commit recorded at the boundary.
+            decisions.append({
+                "window_id": w["window_id"],
+                "decision": "SAFE_NOT_COMPLETED",
+                "reason": "live ref still at the recorded pre-integration commit; "
+                          "no advance occurred",
             })
         elif live_commit:
             decisions.append({
