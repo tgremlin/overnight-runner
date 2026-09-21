@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,11 @@ from .grants import (
     load_grant,
     load_grant_by_digest,
 )
-from .plans import assert_chunk_criteria_approved, load_plan
+from .plans import (
+    assert_chunk_criteria_approved,
+    load_plan,
+    load_plan_digest,
+)
 from .resources import acquire_lease, current_fence
 from .safety import SafetyError
 
@@ -93,19 +98,17 @@ def derive_admission(
     *,
     grant: AutonomyGrant,
     chunk: ChunkSpec,
-    runtime_digest: str,
+    current_runtime_digest: str,
     worker_id: str,
     policy_profile_id: str,
     validator_profile_ids: list[str],
     provider_profile_id: str,
-    plan_id: str | None = None,
-    current_runtime_digest: str | None = None,
-    current_model_name: str | None = None,
-    current_model_digest: str | None = None,
-    current_policy_profile_id: str | None = None,
-    current_validator_profile_ids: list[str] | None = None,
-    current_provider_profile_id: str | None = None,
-    current_accepted_snapshot: RepoSnapshot | None = None,
+    current_model_name: str,
+    current_model_digest: str,
+    current_policy_profile_id: str,
+    current_validator_profile_ids: list[str],
+    current_provider_profile_id: str,
+    current_accepted_snapshot: RepoSnapshot,
     now: int | None = None,
 ) -> tuple[AdmissionReceipt, BudgetLedgerEntry]:
     """Derive a trusted admission receipt for ``chunk`` under ``grant``.
@@ -117,19 +120,22 @@ def derive_admission(
     The caller passes the **current** identity pins (model/runtime/policy/...)
     so the receipt binds exactly to what the worker is observing.
 
-    All identity evidence MUST be supplied (P06-A02 follow-up;
-    missing identity -> reject closed).
+    P06 follow-up #2:
+
+    * A02: every identity kwarg is REQUIRED and non-optional. The
+      legacy ``runtime_digest`` parameter is REMOVED. There is
+      exactly ONE authoritative current-runtime argument.
+    * A01: ``chunk.plan_id`` is NOT a caller choice — the runner
+      pins the plan to the grant's ``approved_plan_digest``. A
+      mismatch refuses the admission.
+    * A03: the durable idempotency winner is inserted atomically
+      BEFORE any lease/execution authority is allocated. Concurrent
+      same-content callers all resolve to the SAME admission.
     """
     require_campaign_v2("derive_admission")
     now = int(now if now is not None else time.time())
 
     # ----- (A) Grant state -----
-    # The runner is the SOLE authority on grant state. The caller's
-    # supplied grant is treated as an identifier challenge only; the
-    # receipt binds to the STORED active grant (which captures the
-    # operator activation precisely). This avoids round-trip
-    # canonicalisation drift between Pydantic defaults and the supplied
-    # payload.
     stored = load_grant(db, grant.grant_id)
     if stored is None:
         raise SafetyError("grant not found in durable store")
@@ -137,6 +143,30 @@ def derive_admission(
         raise SafetyError(f"grant state must be 'active' (got {stored.state})")
     if stored.grant_id != grant.grant_id:
         raise SafetyError("grant_id mismatch between stored and supplied")
+
+    # ----- (A-extra) Plan binding (P06 follow-up #2 A01). The grant
+    # is pinned to an exact ``approved_plan_digest``; admission MUST
+    # consult the durable plan and refuse any drift.
+    if not getattr(stored, "approved_plan_digest", ""):
+        raise SafetyError(
+            "stored grant has no approved_plan_digest; cannot bind admission"
+        )
+    if grant.approved_plan_digest != stored.approved_plan_digest:
+        raise SafetyError(
+            "supplied grant approved_plan_digest does not match the stored "
+            "grant's pinned plan"
+        )
+    pinned_plan_digest = load_plan_digest(db, stored.plan_id)
+    if pinned_plan_digest is None:
+        raise SafetyError(
+            f"plan {stored.plan_id!r} is no longer registered"
+        )
+    if pinned_plan_digest != stored.approved_plan_digest:
+        raise SafetyError(
+            f"registered plan digest {pinned_plan_digest[:8]} != grant pinned "
+            f"digest {stored.approved_plan_digest[:8]}; the plan was modified "
+            f"after activation; refusing to broaden authority"
+        )
 
     # ----- (B) Containment -----
     if not _subsets(chunk.permitted_write_paths, stored.allowed_write_paths):
@@ -150,107 +180,69 @@ def derive_admission(
     if not _ids_match(chunk.required_validator_ids, stored.validator_profile_ids):
         raise SafetyError("chunk.required_validator_ids are not a subset of grant.validator_profile_ids")
 
-    # ----- (C-pre) Required identity evidence (P06-A02 follow-up).
-    # Each of these MUST be supplied as a non-None value. We reject
-    # BEFORE any drift comparison so the caller always gets an
-    # explicit "missing identity" signal.
-    if current_runtime_digest is None:
-        if runtime_digest:
-            current_runtime_digest = runtime_digest
-        else:
-            raise SafetyError("current_runtime_digest is REQUIRED (got None)")
-    if current_model_name is None:
-        raise SafetyError("current_model_name is REQUIRED (got None)")
-    if current_model_digest is None:
-        raise SafetyError("current_model_digest is REQUIRED (got None)")
-    if current_policy_profile_id is None:
-        raise SafetyError("current_policy_profile_id is REQUIRED (got None)")
-    if current_validator_profile_ids is None:
-        raise SafetyError(
-            "current_validator_profile_ids is REQUIRED (got None)"
-        )
-    if current_provider_profile_id is None:
-        raise SafetyError(
-            "current_provider_profile_id is REQUIRED (got None)"
-        )
-
     # ----- (C) Identity drift -----
+    # All identity kwargs are now REQUIRED positional kwargs (no defaults).
+    if not isinstance(current_runtime_digest, str) or not current_runtime_digest:
+        raise SafetyError("current_runtime_digest is REQUIRED (got empty/None)")
+    if not isinstance(current_model_name, str) or not current_model_name:
+        raise SafetyError("current_model_name is REQUIRED (got empty/None)")
+    if not isinstance(current_model_digest, str) or not current_model_digest:
+        raise SafetyError("current_model_digest is REQUIRED (got empty/None)")
+    if not isinstance(current_policy_profile_id, str) or not current_policy_profile_id:
+        raise SafetyError("current_policy_profile_id is REQUIRED (got empty/None)")
+    if current_validator_profile_ids is None or not isinstance(current_validator_profile_ids, list):
+        raise SafetyError("current_validator_profile_ids is REQUIRED (got None or non-list)")
+    if not isinstance(current_provider_profile_id, str) or not current_provider_profile_id:
+        raise SafetyError("current_provider_profile_id is REQUIRED (got empty/None)")
+    if current_accepted_snapshot is None:
+        raise SafetyError("current_accepted_snapshot required")
+    if stored.budget.is_expired(now):
+        raise SafetyError("grant has expired at admission")
     if current_runtime_digest != stored.runtime_digest:
         cur_substr = (current_runtime_digest or "missing")[:8]
         raise SafetyError(
             f"runtime_drift: admission runtime {cur_substr} != "
             f"grant runtime {stored.runtime_digest[:8]}"
         )
-    if current_model_name is not None and current_model_name != stored.model_name:
+    if current_model_name != stored.model_name:
         raise SafetyError(
             f"model_drift: admission model {current_model_name} != grant model {stored.model_name}"
         )
-    if current_model_digest is not None and current_model_digest != stored.model_digest:
+    if current_model_digest != stored.model_digest:
         raise SafetyError(
             f"model_digest_drift: admission {current_model_digest[:8]} != grant {stored.model_digest[:8]}"
         )
-    if current_policy_profile_id is not None and current_policy_profile_id != stored.policy_profile_id:
+    if current_policy_profile_id != stored.policy_profile_id:
         raise SafetyError(
             f"policy_drift: admission policy {current_policy_profile_id} != grant policy {stored.policy_profile_id}"
         )
-    if current_validator_profile_ids is not None and not _ids_match(
-        current_validator_profile_ids, stored.validator_profile_ids
-    ):
+    if not _ids_match(current_validator_profile_ids, stored.validator_profile_ids):
         raise SafetyError(
             f"validator_drift: admission validator profiles differ from grant"
         )
-    if current_provider_profile_id is not None and current_provider_profile_id != stored.provider_profile_id:
+    if current_provider_profile_id != stored.provider_profile_id:
         raise SafetyError(
             f"provider_drift: admission provider {current_provider_profile_id} != grant provider {stored.provider_profile_id}"
         )
-    if current_accepted_snapshot is None:
-        raise SafetyError("current_accepted_snapshot required")
-    if stored.budget.is_expired(now):
-        raise SafetyError("grant has expired at admission")
+
     # ----- (B-extra) Plan-required: chunk's package_id and
-    # criterion_ids MUST match an entry in the approved plan.
-    if not plan_id:
-        raise SafetyError("chunk.plan_id is required for admission")
+    # criterion_ids MUST match an entry in the GRANT-PINNED plan.
+    # The plan is NOT caller-selectable; we resolve it via the
+    # grant's ``plan_id`` so the caller cannot broaden authority.
     if not chunk.package_id:
         raise SafetyError("chunk.package_id is required for admission")
     chunk_crits = set(chunk.criterion_ids or [])
     if not chunk_crits:
         raise SafetyError("chunk.criterion_ids must be non-empty (per P06-A01)")
     assert_chunk_criteria_approved(
-        db, plan_id=plan_id,
+        db, plan_id=stored.plan_id,
         package_id=chunk.package_id,
         chunk_criterion_ids=chunk_crits,
     )
-    # ----- (C-bonus) Identity-drift: REQUIRED (not optional). Each
-    # admission MUST present evidence of every pinned identity. Any
-    # ``None`` -> reject.
-    if current_runtime_digest is None:
-        # Fall back ONLY if a runtime_digest was explicitly passed; do
-        # NOT substitute the bare argument ``runtime_digest`` when
-        # ``current_runtime_digest`` is required-but-None.
-        if runtime_digest:
-            current_runtime_digest = runtime_digest
-        else:
-            raise SafetyError("current_runtime_digest is REQUIRED (got None)")
-    if current_model_name is None:
-        raise SafetyError("current_model_name is REQUIRED (got None)")
-    if current_model_digest is None:
-        raise SafetyError("current_model_digest is REQUIRED (got None)")
-    if current_policy_profile_id is None:
-        raise SafetyError("current_policy_profile_id is REQUIRED (got None)")
-    if current_validator_profile_ids is None:
-        raise SafetyError(
-            "current_validator_profile_ids is REQUIRED (got None)"
-        )
-    if current_provider_profile_id is None:
-        raise SafetyError(
-            "current_provider_profile_id is REQUIRED (got None)"
-        )
+
     # ----- Baseline-mismatch check: an existing campaign whose current
     # committed snapshot is a different commit than the supplied one
-    # rejects (external ref change / wrong predecessor). We compare
-    # only on the common left-anchored prefix so a 64-char padded
-    # campaign baseline matches a 40-char git SHA-1 cleanly.
+    # rejects (external ref change / wrong predecessor).
     cur = db._conn.execute(
         "SELECT current_commit FROM campaigns WHERE campaign_id=?",
         (chunk.campaign_id,),
@@ -265,8 +257,35 @@ def derive_admission(
                 f"admission commit={supplied[:8]}"
             )
 
-    # ----- (E) Idempotency -----
     chunk_checksum = _checksum_chunk(chunk)
+
+    # ----- (E+A03) Atomic idempotency reservation BEFORE any lease.
+    # A SINGLE transaction:
+    #   - inspect the race_admissions row for the idem_key
+    #   - if existing SAME content: return/reload same admission
+    #   - if existing DIFFERENT content: raise AdmissionConflict
+    #   - if absent: insert a RESERVED race_admissions row that wins
+    #     only if no other inserter beat us. Then proceed to lease
+    #     allocation only if THIS transaction wins the durable insert.
+    # Concurrent same-content callers all resolve to the same
+    # admission; losers retry and observe the existing winner.
+    fence = current_fence(db, chunk.campaign_id)
+    new_generation = fence.current_generation
+
+    reservation_id = f"adm-{chunk.chunk_id}-{uuid.uuid4().hex[:12]}"
+    winner_admission_id: str | None = None
+    ledger: BudgetLedgerEntry | None = None
+
+    # Initial pass: load or load-or-create ledger. Ledger is a
+    # precondition for the durable reservation.
+    ledger = _load_or_create_ledger(
+        db, chunk.campaign_id, stored.grant_id,
+        family_id=chunk.package_id, grant=stored,
+    )
+    exhaustion = ledger.would_exceed(delta_chunks=1)
+    if exhaustion is not None:
+        raise SafetyError(f"budget: {exhaustion}")
+
     with db.transaction() as cur:
         cur.execute(
             "SELECT admission_id, content_sha256 FROM race_admissions WHERE idem_key=?",
@@ -277,36 +296,49 @@ def derive_admission(
             stored_sha = existing["content_sha256"]
             if stored_sha == chunk_checksum:
                 # Idempotent replay — return the prior receipt.
+                winner_admission_id = existing["admission_id"]
                 cur.execute(
                     "SELECT * FROM admissions WHERE admission_id=?",
-                    (existing["admission_id"],),
+                    (winner_admission_id,),
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise SafetyError("idempotency record references missing admission")
                 rec = _row_to_admission(dict(row))
-                ledger = _load_ledger(db, rec.budget_ledger_id)
+                if ledger is None or ledger.ledger_id != rec.budget_ledger_id:
+                    ledger = _load_ledger(db, rec.budget_ledger_id)
                 if ledger is None:
                     raise SafetyError("idempotency record references missing budget ledger")
-                return rec, ledger
-            raise AdmissionConflict(
-                f"idempotency_key {chunk.idempotency_key} presented with DIFFERENT content"
-            )
+                # Skip the lease allocation + INSERT block below.
+                cur.execute("SELECT 1")
+            else:
+                raise AdmissionConflict(
+                    f"idempotency_key {chunk.idempotency_key} presented with DIFFERENT content"
+                )
+        else:
+            # RESERVED winner inserted atomically; if a concurrent
+            # caller already inserted the same idem_key we raise
+            # ClaimConflict so the caller retries. The durable row is
+            # the winner record; lease allocation follows.
+            try:
+                cur.execute(
+                    "INSERT INTO race_admissions (idem_key, admission_id, content_sha256, issued_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chunk.idempotency_key, reservation_id, chunk_checksum, now),
+                )
+            except Exception as e:
+                # PRIMARY KEY collision means a concurrent inserter
+                # already won; surface as a retryable conflict.
+                raise SafetyError(
+                    f"idempotency reservation conflict: another worker "
+                    f"already inserted idem_key={chunk.idempotency_key} "
+                    f"({type(e).__name__})"
+                )
 
-    # ----- (D) Budget -----
-    ledger = _load_or_create_ledger(
-        db, chunk.campaign_id, stored.grant_id,
-        family_id=chunk.package_id, grant=stored,
-    )
-    exhaustion = ledger.would_exceed(delta_chunks=1)
-    if exhaustion is not None:
-        raise SafetyError(f"budget: {exhaustion}")
+    if winner_admission_id is not None:
+        return rec, ledger
 
-    fence = current_fence(db, chunk.campaign_id)
-    new_generation = fence.current_generation
-
-    # Acquire an initial lease for the admission phase itself. Worker
-    # acquires the writer lease later.
+    # ----- Lease allocation only for the durable winner.
     lease = acquire_lease(
         db,
         campaign_id=chunk.campaign_id,
@@ -318,7 +350,7 @@ def derive_admission(
         ttl_seconds=300,
     )
 
-    admission_id = f"adm-{chunk.chunk_id}-{int(time.time())}"
+    admission_id = reservation_id
     receipt = AdmissionReceipt(
         schema_version="trio.admission.v1",
         admission_id=admission_id,
@@ -389,10 +421,6 @@ def derive_admission(
                 snap_payload, receipt_payload,
             ),
         )
-        cur.execute(
-            "INSERT INTO race_admissions (idem_key, admission_id, content_sha256, issued_at) VALUES (?,?,?,?)",
-            (chunk.idempotency_key, receipt.admission_id, chunk_checksum, now),
-        )
     return receipt, ledger
 
 
@@ -423,6 +451,7 @@ def _load_or_create_ledger(
             cumulative_rechunks=row["cumulative_rechunks"],
             cumulative_escalations=row["cumulative_escalations"],
             cumulative_active_seconds=row["cumulative_active_seconds"],
+            cumulative_wall_seconds=row["cumulative_wall_seconds"] if "cumulative_wall_seconds" in row.keys() else 0,
             cumulative_cost_microusd=row["cumulative_cost_microusd"],
             cumulative_chunks=row["cumulative_chunks"],
             cumulative_context_tokens=row["cumulative_context_tokens"],
@@ -456,6 +485,7 @@ def _load_ledger(db: Database, ledger_id: str) -> BudgetLedgerEntry | None:
         cumulative_rechunks=row["cumulative_rechunks"],
         cumulative_escalations=row["cumulative_escalations"],
         cumulative_active_seconds=row["cumulative_active_seconds"],
+        cumulative_wall_seconds=row["cumulative_wall_seconds"] if "cumulative_wall_seconds" in row.keys() else 0,
         cumulative_cost_microusd=row["cumulative_cost_microusd"],
         cumulative_chunks=row["cumulative_chunks"],
         cumulative_context_tokens=row["cumulative_context_tokens"],
@@ -506,10 +536,114 @@ def transition_chunk(
             )
 
 
+def require_active_grant_or_raise(db: Database, *, grant_id: str, now: int | None = None) -> AutonomyGrant:
+    """Return the active grant for ``grant_id`` or raise SafetyError.
+
+    The check enforces state='active' AND non-expired AND non-revoked.
+    Used at every admission boundary so a continuation cannot silently
+    proceed against a stale grant.
+    """
+    now = int(now if now is not None else time.time())
+    stored = load_grant(db, grant_id)
+    if stored is None:
+        raise SafetyError(f"grant {grant_id!r} not found")
+    if stored.state != "active":
+        raise SafetyError(f"grant {grant_id!r} not active (state={stored.state})")
+    if stored.budget.is_expired(now):
+        raise SafetyError(f"grant {grant_id!r} expired at {stored.budget.grant_expires_at}")
+    if stored.revoked_at and stored.revoked_at > 0:
+        raise SafetyError(f"grant {grant_id!r} revoked at {stored.revoked_at}")
+    return stored
+
+
+def check_campaign_continuation(
+    db: Database,
+    *,
+    campaign_id: str,
+    grant_id: str,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Pre-flight checks before any new admission/claim/integration.
+
+    P06 follow-up #2 (A05/A07): every consequential continuation
+    checks state, grant, budget, and lease/fence authority BEFORE
+    allocating any new authority. Returns a dict summarising what
+    was checked so callers can surface it in evidence.
+
+    Refuses when any of:
+      * campaign state is EFFECT_UNKNOWN, CANCELLED, EXPIRED, COMPLETE,
+        BUDGET_EXHAUSTED, or PAUSED_OPERATOR
+      * grant not active / revoked / expired
+      * ledger would exceed its bounds for delta_chunks=1
+      * the caller did not supply a valid fence/lease authority
+    """
+    now = int(now if now is not None else time.time())
+    cur = db._conn.execute(
+        "SELECT state, current_fence FROM campaigns WHERE campaign_id=?",
+        (campaign_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise SafetyError(f"campaign {campaign_id!r} not registered")
+    state = row["state"]
+    blocking = {
+        "EFFECT_UNKNOWN", "CANCELLED", "EXPIRED", "COMPLETE",
+        "BUDGET_EXHAUSTED", "PAUSED_OPERATOR",
+    }
+    if state in blocking:
+        raise SafetyError(
+            f"campaign {campaign_id!r} is in blocking state={state}; "
+            f"continuation refused"
+        )
+    # Grant authority.
+    require_active_grant_or_raise(db, grant_id=grant_id, now=now)
+    # Budget headroom. The ledger is created lazily on the first
+    # admission; a continuation check that runs BEFORE any admission
+    # is allowed to see no ledger.
+    cur = db._conn.execute(
+        "SELECT bounds_json FROM budget_ledgers WHERE campaign_id=? "
+        "ORDER BY revision DESC LIMIT 1",
+        (campaign_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        # No ledger yet: this is the pre-flight check before the
+        # first admission. The actual budget check fires inside
+        # ``derive_admission`` once the ledger is created.
+        bounds = None
+        chunks_so_far = 0
+    else:
+        bounds = Budget.model_validate(json.loads(row["bounds_json"]))
+        cur = db._conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks WHERE campaign_id=?",
+            (campaign_id,),
+        )
+        chunks_so_far = int(cur.fetchone()["n"])
+        if chunks_so_far >= bounds.max_chunks:
+            raise SafetyError(
+                f"campaign {campaign_id!r} has exhausted its chunk budget "
+                f"({chunks_so_far}/{bounds.max_chunks})"
+            )
+    # PAUSED sentinel.
+    from .runtime import is_paused
+    if is_paused():
+        raise SafetyError("PAUSED sentinel present; continuation refused")
+    return {
+        "campaign_id": campaign_id,
+        "grant_id": grant_id,
+        "state": state,
+        "chunks_so_far": chunks_so_far,
+        "max_chunks": bounds.max_chunks if bounds else None,
+        "checked_at": now,
+    }
+
+
 __all__ = [
     "AdmissionConflict",
     "derive_admission",
     "load_admission",
     "chunk_state",
     "transition_chunk",
+    "require_active_grant_or_raise",
+    "check_campaign_continuation",
 ]

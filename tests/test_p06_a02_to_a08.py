@@ -68,6 +68,7 @@ def _make_grant(grant_id: str = "gr-1") -> AutonomyGrant:
         schema_version="trio.grant.v1",
         grant_id=grant_id, state="draft",
         plan_id="pl-1", plan_revision=1,
+        approved_plan_digest="d" * 64,
         repository_paths=["src/app.py"],
         allowed_write_paths=["src/app.py"],
         protected_paths=[],
@@ -90,6 +91,27 @@ def _make_grant(grant_id: str = "gr-1") -> AutonomyGrant:
     )
 
 
+
+_db_pin = {}
+
+
+def _db_for_pin():
+    """Helper that returns the current isolated test DB.
+
+    Pinning happens inside ``_setup_grant_and_plan`` which already
+    creates the plan. We rely on the canonical plan JSON format
+    that ``register_plan`` writes.
+    """
+    return _db_pin["db"]
+
+
+def _pin_grant(db: Database, grant: AutonomyGrant) -> AutonomyGrant:
+    """Read the registered plan_digest from the durable store and pin the grant."""
+    from overnight_runner.plans import load_plan_digest as _lpd
+    digest = _lpd(db, grant.plan_id)
+    return grant.model_copy(update={"approved_plan_digest": digest})
+
+
 def _setup_grant_and_plan(db: Database) -> AutonomyGrant:
     grant = _make_grant()
     register_plan(
@@ -98,21 +120,22 @@ def _setup_grant_and_plan(db: Database) -> AutonomyGrant:
         approved_artifact_id=grant.plan_id,
         work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
     )
-    digest = content_sha256(grant)
+    grant_pinned = _pin_grant(db, grant)
+    digest = content_sha256(grant_pinned)
     register_protected_approval(
         db,
-        approval_id=f"appr-{grant.grant_id}",
+        approval_id=f"appr-{grant_pinned.grant_id}",
         operation="activate_grant",
         grant_digest_target=digest,
         operator_id="op-1",
-        operator_receipt={"approval_id": f"appr-{grant.grant_id}"},
+        operator_receipt={"approval_id": f"appr-{grant_pinned.grant_id}"},
     )
     activate_grant(
-        db, grant=grant,
+        db, grant=grant_pinned,
         operator_id="op-1",
-        approval_id=f"appr-{grant.grant_id}",
+        approval_id=f"appr-{grant_pinned.grant_id}",
     )
-    return grant
+    return grant_pinned
 
 
 def _make_campaign(db: Database, base_sha: str = "a" * 64) -> tuple[AutonomyGrant, str, str]:
@@ -156,9 +179,14 @@ def _snap(commit: str = "a" * 64, tree: str = "b" * 64) -> RepoSnapshot:
 
 
 def _required_id_kwargs(grant: AutonomyGrant) -> dict[str, object]:
-    """Mandatory identity kwargs for ``derive_admission`` (P06-A02 follow-up)."""
+    """Mandatory identity kwargs for ``derive_admission`` (P06-A02 follow-up #2).
+
+    No ``plan_id`` here; admission pins the plan via the grant.
+    No ``runtime_digest``; ``current_runtime_digest`` is the SINGLE
+    authoritative runtime argument.
+    """
     return {
-        "plan_id": grant.plan_id,
+        "current_runtime_digest": grant.runtime_digest,
         "current_model_name": grant.model_name,
         "current_model_digest": grant.model_digest,
         "current_policy_profile_id": grant.policy_profile_id,
@@ -185,16 +213,17 @@ class TestP06A02IdentityDrift(unittest.TestCase):
         grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
+        kw = _required_id_kwargs(grant)
+        kw["current_runtime_digest"] = "c" * 64  # drift
         with self.assertRaises(Exception) as ctx:
             derive_admission(
                 self._db, grant=grant, chunk=chunk,
-                runtime_digest="c" * 64,  # drift
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
-                **_required_id_kwargs(grant),
+                **kw,
             )
         self.assertIn("runtime", str(ctx.exception).lower())
 
@@ -205,18 +234,19 @@ class TestP06A02IdentityDrift(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             derive_admission(
                 self._db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
+
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                current_runtime_digest=grant.runtime_digest,
                 current_model_name="drifted-model:7b",
                 current_model_digest=grant.model_digest,
                 current_policy_profile_id=grant.policy_profile_id,
                 current_validator_profile_ids=list(grant.validator_profile_ids),
                 current_provider_profile_id=grant.provider_profile_id,
-                plan_id=grant.plan_id,
+
             )
         self.assertIn("model_drift", str(ctx.exception).lower())
 
@@ -227,18 +257,19 @@ class TestP06A02IdentityDrift(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             derive_admission(
                 self._db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
+
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                current_runtime_digest=grant.runtime_digest,
                 current_model_name=grant.model_name,
                 current_model_digest=grant.model_digest,
+                current_provider_profile_id=grant.provider_profile_id,
                 current_policy_profile_id="pol-other",
                 current_validator_profile_ids=list(grant.validator_profile_ids),
-                current_provider_profile_id=grant.provider_profile_id,
-                plan_id=grant.plan_id,
+
             )
         self.assertIn("policy_drift", str(ctx.exception).lower())
 
@@ -249,18 +280,19 @@ class TestP06A02IdentityDrift(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             derive_admission(
                 self._db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
+
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                current_runtime_digest=grant.runtime_digest,
                 current_model_name=grant.model_name,
                 current_model_digest=grant.model_digest,
                 current_policy_profile_id=grant.policy_profile_id,
                 current_validator_profile_ids=list(grant.validator_profile_ids),
                 current_provider_profile_id="prv-other",
-                plan_id=grant.plan_id,
+
             )
         self.assertIn("provider_drift", str(ctx.exception).lower())
 
@@ -271,18 +303,19 @@ class TestP06A02IdentityDrift(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             derive_admission(
                 self._db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
+
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                current_runtime_digest=grant.runtime_digest,
                 current_model_name=grant.model_name,
                 current_model_digest=grant.model_digest,
                 current_policy_profile_id=grant.policy_profile_id,
-                current_validator_profile_ids=["noop", "other"],
                 current_provider_profile_id=grant.provider_profile_id,
-                plan_id=grant.plan_id,
+                current_validator_profile_ids=["noop", "other"],
+
             )
         self.assertIn("validator_drift", str(ctx.exception).lower())
 
@@ -307,23 +340,23 @@ class TestP06A03Idempotency(unittest.TestCase):
         chunk = _chunk(campaign_id, idem="idem-A")
         r1, _ = derive_admission(
             self._db, grant=grant, chunk=chunk,
-            runtime_digest=grant.runtime_digest,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=base),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(commit=base),
         )
         r2, _ = derive_admission(
             self._db, grant=grant, chunk=chunk,
-            runtime_digest=grant.runtime_digest,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=base),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(commit=base),
         )
         self.assertEqual(r1.admission_id, r2.admission_id)
         # Only one lease is held for this admission (no duplicate).
@@ -339,25 +372,25 @@ class TestP06A03Idempotency(unittest.TestCase):
         chunk1 = _chunk(campaign_id, idem="idem-B", chunk_id="chk-B1")
         derive_admission(
             self._db, grant=grant, chunk=chunk1,
-            runtime_digest=grant.runtime_digest,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=base),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(commit=base),
         )
         chunk2 = _chunk(campaign_id, idem="idem-B", chunk_id="chk-B2")
         with self.assertRaises(AdmissionConflict):
             derive_admission(
                 self._db, grant=grant, chunk=chunk2,
-                runtime_digest=grant.runtime_digest,
+
                 worker_id="wkr-1",
                 policy_profile_id=grant.policy_profile_id,
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
-                current_accepted_snapshot=_snap(commit=base),
                 **_required_id_kwargs(grant),
+                current_accepted_snapshot=_snap(commit=base),
             )
 
     def test_concurrent_claims_only_one_writer_wins(self):
@@ -378,13 +411,13 @@ class TestP06A03Idempotency(unittest.TestCase):
                 loaded = load_grant(db_local, grant.grant_id)
                 r, _ = derive_admission(
                     db_local, grant=loaded, chunk=chunk,
-                    runtime_digest=loaded.runtime_digest,
+
                     worker_id=f"wkr-thread-{threading.get_ident()}",
                     policy_profile_id=loaded.policy_profile_id,
                     validator_profile_ids=list(loaded.validator_profile_ids),
                     provider_profile_id=loaded.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
                     **_required_id_kwargs(loaded),
+                    current_accepted_snapshot=_snap(commit=base),
                 )
                 winners.append(r.admission_id)
             except Exception as e:
@@ -450,10 +483,11 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         from overnight_runner.campaign_schemas import content_sha256
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-x", state="draft",
-            plan_id="pl-x", plan_revision=1,
+ plan_id="pl-x", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-x", validator_profile_ids=["noop"],
             provider_profile_id="prv-x", egress_policy_id="eg-x",
             operator_id="op-x", operator_receipt_digest="c"*64,
@@ -462,16 +496,17 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-x", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-x",
             operator_receipt={"approval_id": "appr-x"})
-        activate_grant(self._db, grant=grant, operator_id="op-x", approval_id="appr-x")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-x", approval_id="appr-x")
         real_base_sha = self._head
         padded_base = real_base_sha + "0" * 24
         camp = create_campaign(
-            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            self._db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
             base_commit=padded_base, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
@@ -510,10 +545,11 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         from overnight_runner.plans import register_plan
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-mut", state="draft",
-            plan_id="pl-mut", plan_revision=1,
+            plan_id="pl-mut", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+            model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-mut", validator_profile_ids=["noop"],
             provider_profile_id="prv-mut", egress_policy_id="eg-mut",
             operator_id="op-mut", operator_receipt_digest="c"*64,
@@ -522,23 +558,20 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-mut", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-mut",
             operator_receipt={"approval_id": "appr-mut"})
-        activate_grant(self._db, grant=grant, operator_id="op-mut", approval_id="appr-mut")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-mut", approval_id="appr-mut")
         real_base_sha = self._head
         padded_base = real_base_sha + "0" * 24
         camp = create_campaign(
-            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            self._db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
             base_commit=padded_base, base_tree_digest="b" * 64,
         )
         activate_campaign(self._db, campaign_id=camp.campaign_id)
-        # Mint a MUTATION receipt; the runner must NOT accept it as a
-        # validation receipt.
-        # First the comparison_refs are non-empty; commit a real change
-        # and try.
         mut_rid = rm.mint_mutation_receipt(
             proposal_id="prop-x", path="src/app.py", op="replace_file",
             pre_sha256="0"*64, post_sha256="1"*64, bytes_written=10,
@@ -576,10 +609,11 @@ class TestP06A05CrashWindows(unittest.TestCase):
         from overnight_runner.integration import _record_crash_window
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-cw", state="draft",
-            plan_id="pl-cw", plan_revision=1,
+ plan_id="pl-cw", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-cw", validator_profile_ids=["noop"],
             provider_profile_id="prv-cw", egress_policy_id="eg-cw",
             operator_id="op-cw", operator_receipt_digest="c"*64,
@@ -588,12 +622,13 @@ class TestP06A05CrashWindows(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-cw", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-cw",
             operator_receipt={"approval_id": "appr-cw"})
-        activate_grant(self._db, grant=grant, operator_id="op-cw", approval_id="appr-cw")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-cw", approval_id="appr-cw")
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
             base_commit="a"*64, base_tree_digest="b"*64,
@@ -666,10 +701,11 @@ class TestP06A06Fencing(unittest.TestCase):
         from overnight_runner.campaign_schemas import content_sha256
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-fc", state="draft",
-            plan_id="pl-fc", plan_revision=1,
+ plan_id="pl-fc", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-fc", validator_profile_ids=["noop"],
             provider_profile_id="prv-fc", egress_policy_id="eg-fc",
             operator_id="op-fc", operator_receipt_digest="c"*64,
@@ -678,12 +714,13 @@ class TestP06A06Fencing(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-fc", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-fc",
             operator_receipt={"approval_id": "appr-fc"})
-        activate_grant(self._db, grant=grant, operator_id="op-fc", approval_id="appr-fc")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-fc", approval_id="appr-fc")
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
             base_commit="a"*64, base_tree_digest="b"*64,
@@ -725,10 +762,11 @@ class TestP06A06Fencing(unittest.TestCase):
         from overnight_runner.campaign_schemas import content_sha256
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-fc2", state="draft",
-            plan_id="pl-fc2", plan_revision=1,
+ plan_id="pl-fc2", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-fc2", validator_profile_ids=["noop"],
             provider_profile_id="prv-fc2", egress_policy_id="eg-fc2",
             operator_id="op-fc2", operator_receipt_digest="c"*64,
@@ -737,12 +775,13 @@ class TestP06A06Fencing(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-fc2", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-fc2",
             operator_receipt={"approval_id": "appr-fc2"})
-        activate_grant(self._db, grant=grant, operator_id="op-fc2", approval_id="appr-fc2")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-fc2", approval_id="appr-fc2")
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
             base_commit="a"*64, base_tree_digest="b"*64,
@@ -784,10 +823,11 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         from overnight_runner.campaign_schemas import content_sha256
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-bd", state="draft",
-            plan_id="pl-bd", plan_revision=1,
+ plan_id="pl-bd", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-bd", validator_profile_ids=["noop"],
             provider_profile_id="prv-bd", egress_policy_id="eg-bd",
             operator_id="op-bd", operator_receipt_digest="c"*64,
@@ -796,12 +836,13 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-bd", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-bd",
             operator_receipt={"approval_id": "appr-bd"})
-        activate_grant(self._db, grant=grant, operator_id="op-bd", approval_id="appr-bd")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-bd", approval_id="appr-bd")
         # Create the campaign first so the ledger FK resolves.
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
@@ -811,14 +852,14 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         # First derive_admission creates the ledger.
         chunk = _chunk(camp.campaign_id)
         derive_admission(
-            self._db, grant=grant, chunk=chunk,
-            runtime_digest=grant.runtime_digest,
+            self._db, grant=grant_pinned, chunk=chunk,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(),
         )
         ledger_id = f"bl-{camp.campaign_id}"
         with self._db.transaction() as cur:
@@ -846,10 +887,11 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         from overnight_runner.campaign_schemas import content_sha256
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-bd2", state="draft",
-            plan_id="pl-bd2", plan_revision=1,
+ plan_id="pl-bd2", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-bd2", validator_profile_ids=["noop"],
             provider_profile_id="prv-bd2", egress_policy_id="eg-bd2",
             operator_id="op-bd2", operator_receipt_digest="c"*64,
@@ -858,12 +900,13 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-bd2", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-bd2",
             operator_receipt={"approval_id": "appr-bd2"})
-        activate_grant(self._db, grant=grant, operator_id="op-bd2", approval_id="appr-bd2")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-bd2", approval_id="appr-bd2")
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
             base_commit="a"*64, base_tree_digest="b"*64,
@@ -871,14 +914,14 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         activate_campaign(self._db, campaign_id=camp.campaign_id)
         chunk = _chunk(camp.campaign_id)
         derive_admission(
-            self._db, grant=grant, chunk=chunk,
-            runtime_digest=grant.runtime_digest,
+            self._db, grant=grant_pinned, chunk=chunk,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(),
         )
         with self._db.transaction() as cur:
             cur.execute(
@@ -903,10 +946,11 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         )
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-bd3", state="draft",
-            plan_id="pl-bd3", plan_revision=1,
+ plan_id="pl-bd3", plan_revision=1, approved_plan_digest="0" * 64,
             repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
             protected_paths=[], allowed_operations=["noop"],
-            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            runtime_digest="a" * 64,
+ model_name="gemma", model_digest="b"*64,
             policy_profile_id="pol-bd3", validator_profile_ids=["noop"],
             provider_profile_id="prv-bd3", egress_policy_id="eg-bd3",
             operator_id="op-bd3", operator_receipt_digest="c"*64,
@@ -915,12 +959,13 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         register_plan(self._db, plan_id=grant.plan_id,
                        approved_artifact_id=grant.plan_id,
                        work_package_criterion_ids={"pkg-1": {"crit-1"}})
-        digest = content_sha256(grant)
+        grant_pinned = _pin_grant(self._db, grant)
+        digest = content_sha256(grant_pinned)
         register_protected_approval(
             self._db, approval_id="appr-bd3", operation="activate_grant",
             grant_digest_target=digest, operator_id="op-bd3",
             operator_receipt={"approval_id": "appr-bd3"})
-        activate_grant(self._db, grant=grant, operator_id="op-bd3", approval_id="appr-bd3")
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-bd3", approval_id="appr-bd3")
         camp = create_campaign(
             self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
             base_commit="a"*64, base_tree_digest="b"*64,
@@ -928,14 +973,14 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         activate_campaign(self._db, campaign_id=camp.campaign_id)
         chunk = _chunk(camp.campaign_id)
         derive_admission(
-            self._db, grant=grant, chunk=chunk,
-            runtime_digest=grant.runtime_digest,
+            self._db, grant=grant_pinned, chunk=chunk,
+
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(),
             **_required_id_kwargs(grant),
+            current_accepted_snapshot=_snap(),
         )
         with self._db.transaction() as cur:
             cur.execute(
@@ -998,6 +1043,32 @@ class TestP06A08V1Preservation(unittest.TestCase):
                 base_commit="a" * 64, base_tree_digest="b" * 64,
             )
         paused.unlink()
+        # We need a real grant + plan registered before create_campaign.
+        from overnight_runner.grants import activate_grant
+        from overnight_runner.plans import register_plan
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-2", state="draft",
+            plan_id="pl-2", plan_revision=1, approved_plan_digest="0" * 64,
+            repository_paths=[], allowed_write_paths=[], protected_paths=[],
+            allowed_operations=[], runtime_digest="a" * 64,
+            model_name="gemma", model_digest="b" * 64,
+            policy_profile_id="pol-2", validator_profile_ids=["noop"],
+            provider_profile_id="prv-2", egress_policy_id="eg-2",
+            operator_id="op-2", operator_receipt_digest="c" * 64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
+        )
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        grant_pinned = _pin_grant(self._db, grant)
+        register_protected_approval(
+            self._db, approval_id="appr-2", operation="activate_grant",
+            grant_digest_target=content_sha256(grant_pinned),
+            operator_id="op-2",
+            operator_receipt={"approval_id": "appr-2"})
+        activate_grant(self._db, grant=grant_pinned, operator_id="op-2", approval_id="appr-2")
         c = create_campaign(
             self._db, plan_id="pl-2", grant_id="gr-2",
             base_commit="a" * 64, base_tree_digest="b" * 64,

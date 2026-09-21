@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS budget_ledgers (
     cumulative_rechunks INTEGER NOT NULL DEFAULT 0,
     cumulative_escalations INTEGER NOT NULL DEFAULT 0,
     cumulative_active_seconds INTEGER NOT NULL DEFAULT 0,
+    cumulative_wall_seconds INTEGER NOT NULL DEFAULT 0,
     cumulative_cost_microusd INTEGER NOT NULL DEFAULT 0,
     cumulative_chunks INTEGER NOT NULL DEFAULT 0,
     cumulative_context_tokens INTEGER NOT NULL DEFAULT 0,
@@ -321,6 +322,15 @@ class Database:
         # Apply migrations in order (idempotent).
         self._record_migration("p06-0001-campaign-v2-tables")
         self._record_migration("p06-followup-0001-protected-approvals-and-plans")
+        self._record_migration("p06-followup2-0001-wall-seconds-budget-column")
+        # Forward migration: ensure cumulative_wall_seconds column exists
+        # in legacy DBs that predate the P06 follow-up #2 followup.
+        try:
+            self._conn.execute(
+                "ALTER TABLE budget_ledgers ADD COLUMN cumulative_wall_seconds INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # column already exists
 
     def close(self) -> None:
         try:

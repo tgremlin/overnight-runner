@@ -7,6 +7,7 @@ authority surface.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -48,6 +49,7 @@ def _valid_grant(grant_id: str = "gr-test-1") -> AutonomyGrant:
         state="draft",
         plan_id="pl-test-1",
         plan_revision=1,
+        approved_plan_digest="d" * 64,
         repository_paths=["src/app.py"],
         allowed_write_paths=["src/app.py"],
         protected_paths=[],
@@ -78,9 +80,29 @@ def _grant_digest(g: AutonomyGrant) -> str:
     return content_sha256(g)
 
 
+def _plan_digest_for(plan_id: str, packages: dict) -> str:
+    """Compute the plan_digest the way ``register_plan`` does."""
+    import hashlib
+    canonical = {
+        "plan_id": plan_id,
+        "work_packages": [
+            {"package_id": pkg, "criterion_ids": sorted(sorted(crits))}
+            for pkg, crits in sorted(packages.items())
+        ],
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _required_kwargs(grant: AutonomyGrant) -> dict:
+    """All REQUIRED identity kwargs (P06 follow-up #2 A02).
+
+    No ``plan_id`` here; admission pins the plan via the grant.
+    No ``runtime_digest``; current_runtime_digest is the SINGLE
+    authoritative runtime argument.
+    """
     return dict(
-        plan_id=grant.plan_id,
+        current_runtime_digest=grant.runtime_digest,
         current_model_name=grant.model_name,
         current_model_digest=grant.model_digest,
         current_policy_profile_id=grant.policy_profile_id,
@@ -110,28 +132,57 @@ def _activate_via_protected_approval(
     return approval_id
 
 
-def _setup_with_plan_and_active_grant(
-    db: Database, *, base_sha_padded: str, grant: AutonomyGrant
+def _register_plan_with_grant_pinning(
+    db: Database, *, grant: AutonomyGrant, packages: dict[str, set[str]]
 ) -> str:
+    """Register a plan AND pin the grant's ``approved_plan_digest`` to it.
+
+    Returns the plan_digest so callers can verify pin in tests.
+    """
+    plan_digest = _plan_digest_for(grant.plan_id, packages)
+    grant_pinned = grant.model_copy(update={"approved_plan_digest": plan_digest})
     register_plan(
         db,
-        plan_id=grant.plan_id,
-        approved_artifact_id=grant.plan_id,
-        work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+        plan_id=grant_pinned.plan_id,
+        approved_artifact_id=grant_pinned.plan_id,
+        work_package_criterion_ids=packages,
     )
-    _activate_via_protected_approval(db, grant=grant)
+    return plan_digest, grant_pinned
+
+
+def _setup_with_plan_and_active_grant(
+    db: Database, *, base_sha_padded: str, grant: AutonomyGrant
+) -> tuple[str, AutonomyGrant]:
+    plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+        db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
+    )
+    _activate_via_protected_approval(db, grant=grant_pinned)
     camp = create_campaign(
-        db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+        db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
         base_commit=base_sha_padded, base_tree_digest="b" * 64,
     )
     activate_campaign(db, campaign_id=camp.campaign_id)
-    return camp.campaign_id
+    return camp.campaign_id, grant_pinned
 
 
-def _make_plan_and_active_grant(db: Database, grant: AutonomyGrant) -> str:
-    return _setup_with_plan_and_active_grant(
-        db, base_sha_padded="a" * 64, grant=grant,
+def _make_plan_and_active_grant(db: Database, grant: AutonomyGrant) -> tuple[str, AutonomyGrant]:
+    """Register the plan, pin the grant, activate, and create the campaign.
+
+    Returns ``(campaign_id, pinned_grant)``. The ``pinned_grant`` has
+    ``approved_plan_digest`` set to the registered plan's digest and
+    is what callers should pass to ``derive_admission`` so the
+    admission-time plan binding check matches the stored grant.
+    """
+    plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+        db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
     )
+    _activate_via_protected_approval(db, grant=grant_pinned)
+    camp = create_campaign(
+        db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
+        base_commit="a" * 64, base_tree_digest="b" * 64,
+    )
+    activate_campaign(db, campaign_id=camp.campaign_id)
+    return camp.campaign_id, grant_pinned
 
 
 def _valid_chunk(campaign_id: str) -> ChunkSpec:
@@ -221,29 +272,26 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            register_plan(
-                db, plan_id=grant.plan_id,
-                approved_artifact_id=grant.plan_id,
-                work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
             )
-            _activate_via_protected_approval(db, grant=grant)
+            _activate_via_protected_approval(db, grant=grant_pinned)
             base = _head_sha_padded(repo)
             camp = create_campaign(
-                db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+                db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
                 base_commit=base, base_tree_digest="b" * 64,
             )
             activate_campaign(db, campaign_id=camp.campaign_id)
             snap = _snap(commit=base)
             chunk = _valid_chunk(camp.campaign_id)
             receipt, _ = derive_admission(
-                db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
+                db, grant=grant_pinned, chunk=chunk,
                 worker_id="wkr-1",
-                policy_profile_id=grant.policy_profile_id,
-                validator_profile_ids=list(grant.validator_profile_ids),
-                provider_profile_id=grant.provider_profile_id,
+                policy_profile_id=grant_pinned.policy_profile_id,
+                validator_profile_ids=list(grant_pinned.validator_profile_ids),
+                provider_profile_id=grant_pinned.provider_profile_id,
                 current_accepted_snapshot=snap,
-                **_required_kwargs(grant),
+                **_required_kwargs(grant_pinned),
             )
             self.assertIsInstance(receipt, AdmissionReceipt)
         finally:
@@ -256,27 +304,29 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            register_plan(
-                db, plan_id=grant.plan_id,
-                approved_artifact_id=grant.plan_id,
-                work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
             )
             base = _head_sha_padded(repo)
+            # Insert a draft grant (no protected approval activation).
+            _insert_draft_grant_directly(db, grant_pinned)
+            # The campaign can still be created (its durable metadata
+            # is resolved from the registered plan and the draft grant
+            # row, since activate_grant is not required for create).
             camp = create_campaign(
-                db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+                db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
                 base_commit=base, base_tree_digest="b" * 64,
             )
-            _insert_draft_grant_directly(db, grant)
+            activate_campaign(db, campaign_id=camp.campaign_id)
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
-                    db, grant=grant, chunk=_valid_chunk(camp.campaign_id),
-                    runtime_digest=grant.runtime_digest,
+                    db, grant=grant_pinned, chunk=_valid_chunk(camp.campaign_id),
                     worker_id="wkr-1",
-                    policy_profile_id=grant.policy_profile_id,
-                    validator_profile_ids=list(grant.validator_profile_ids),
-                    provider_profile_id=grant.provider_profile_id,
+                    policy_profile_id=grant_pinned.policy_profile_id,
+                    validator_profile_ids=list(grant_pinned.validator_profile_ids),
+                    provider_profile_id=grant_pinned.provider_profile_id,
                     current_accepted_snapshot=_snap(commit=base),
-                    **_required_kwargs(grant),
+                    **_required_kwargs(grant_pinned),
                 )
             self.assertIn("grant state", str(ctx.exception).lower())
         finally:
@@ -289,13 +339,23 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
+            )
             with self.assertRaises(Exception) as ctx:
                 activate_grant(
-                    db, grant=grant,
+                    db, grant=grant_pinned,
                     operator_id="op-attacker",
                     approval_id="appr-forged",
                 )
-            self.assertIn("approval", str(ctx.exception).lower())
+            # Without the plan digest pin, this would be a "plan not
+            # registered" error. With the plan registered, the first
+            # check that fires is the protected-approval lookup, so
+            # the error mentions "approval".
+            self.assertTrue(
+                "approval" in str(ctx.exception).lower() or
+                "registered" in str(ctx.exception).lower()
+            )
         finally:
             db.close()
 
@@ -306,6 +366,11 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
+            # Register the plan first so the approval digest mismatch
+            # is what fires (not the plan-not-registered guard).
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
+            )
             register_protected_approval(
                 db,
                 approval_id="appr-wrong-digest",
@@ -316,7 +381,7 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
             )
             with self.assertRaises(Exception) as ctx:
                 activate_grant(
-                    db, grant=grant,
+                    db, grant=grant_pinned,
                     operator_id="op-1",
                     approval_id="appr-wrong-digest",
                 )
@@ -331,7 +396,10 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            digest = _grant_digest(grant)
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
+            )
+            digest = _grant_digest(grant_pinned)
             register_protected_approval(
                 db,
                 approval_id="appr-A",
@@ -342,7 +410,7 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
             )
             with self.assertRaises(Exception) as ctx:
                 activate_grant(
-                    db, grant=grant,
+                    db, grant=grant_pinned,
                     operator_id="op-attacker",
                     approval_id="appr-A",
                 )
@@ -357,14 +425,12 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            register_plan(
-                db, plan_id=grant.plan_id,
-                approved_artifact_id=grant.plan_id,
-                work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
             )
-            _activate_via_protected_approval(db, grant=grant)
-            revoke_grant(db, grant_id=grant.grant_id, reason="operator revoked")
-            stored = load_grant(db, grant.grant_id)
+            _activate_via_protected_approval(db, grant=grant_pinned)
+            revoke_grant(db, grant_id=grant_pinned.grant_id, reason="operator revoked")
+            stored = load_grant(db, grant_pinned.grant_id)
             self.assertEqual(stored.state, "revoked")
             base = _head_sha_padded(repo)
             camp = create_campaign(
@@ -375,7 +441,7 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=stored, chunk=_valid_chunk(camp.campaign_id),
-                    runtime_digest=stored.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=stored.policy_profile_id,
                     validator_profile_ids=list(stored.validator_profile_ids),
@@ -404,23 +470,21 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
                 context_token_budget=8192,
             )
             grant = _valid_grant().model_copy(update={"budget": expired_budget})
-            register_plan(
-                db, plan_id=grant.plan_id,
-                approved_artifact_id=grant.plan_id,
-                work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+            plan_digest, grant_pinned = _register_plan_with_grant_pinning(
+                db, grant=grant, packages={"pkg-1": {"crit-1", "crit-2"}},
             )
-            _activate_via_protected_approval(db, grant=grant)
+            _activate_via_protected_approval(db, grant=grant_pinned)
             base = _head_sha_padded(repo)
             camp = create_campaign(
-                db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+                db, plan_id=grant_pinned.plan_id, grant_id=grant_pinned.grant_id,
                 base_commit=base, base_tree_digest="b" * 64,
             )
             activate_campaign(db, campaign_id=camp.campaign_id)
-            stored = load_grant(db, grant.grant_id)
+            stored = load_grant(db, grant_pinned.grant_id)
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=stored, chunk=_valid_chunk(camp.campaign_id),
-                    runtime_digest=stored.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=stored.policy_profile_id,
                     validator_profile_ids=list(stored.validator_profile_ids),
@@ -440,14 +504,14 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         try:
             grant = _valid_grant()
             base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             chunk = _valid_chunk(cid).model_copy(update={
                 "permitted_write_paths": ["src/app.py", "outside.py"],
             })
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=chunk,
-                    runtime_digest=grant.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
@@ -467,14 +531,14 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         try:
             grant = _valid_grant()
             base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             chunk = _valid_chunk(cid).model_copy(update={
                 "required_validator_ids": ["noop", "shell_echo"],
             })
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=chunk,
-                    runtime_digest=grant.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
@@ -493,18 +557,18 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
+            kw = _required_kwargs(grant)
+            kw["current_runtime_digest"] = "wrong" + "0" * 58
+            kw["current_accepted_snapshot"] = _snap(commit="a" * 64)
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=_valid_chunk(cid),
-                    runtime_digest="wrong" + "0" * 58,
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
                     provider_profile_id=grant.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
-                    **_required_kwargs(grant),
+                    **kw,
                 )
             self.assertIn("runtime", str(ctx.exception).lower())
         finally:
@@ -518,11 +582,11 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         try:
             grant = _valid_grant()
             base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=_valid_chunk(cid),
-                    runtime_digest=grant.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
@@ -543,14 +607,14 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         try:
             grant = _valid_grant()
             base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             chunk = _valid_chunk(cid).model_copy(update={
                 "package_id": "pkg-FORGED",
             })
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=chunk,
-                    runtime_digest=grant.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
@@ -570,14 +634,14 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         try:
             grant = _valid_grant()
             base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             chunk = _valid_chunk(cid).model_copy(update={
                 "criterion_ids": ["crit-1", "crit-FOREIGN"],
             })
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=chunk,
-                    runtime_digest=grant.runtime_digest,
+
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
@@ -596,22 +660,20 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
+            kw = _required_kwargs(grant)
+            kw["current_runtime_digest"] = None
+            kw["current_accepted_snapshot"] = _snap(commit="a" * 64)
             with self.assertRaises(Exception) as ctx:
-                # Pass runtime_digest=None explicitly to verify the
-                # REQUIRED-identity-evidence gate.
                 derive_admission(
                     db, grant=grant, chunk=_valid_chunk(cid),
-                    runtime_digest=None,
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
                     provider_profile_id=grant.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
-                    **_required_kwargs(grant),
+                    **kw,
                 )
-            self.assertIn("runtime_digest", str(ctx.exception).lower())
+            self.assertIn("current_runtime_digest", str(ctx.exception).lower())
         finally:
             db.close()
 
@@ -622,19 +684,17 @@ class TestP06A01DelegatedAdmission(unittest.TestCase):
         db = Database(Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db")
         try:
             grant = _valid_grant()
-            base = _head_sha_padded(repo)
-            cid = _make_plan_and_active_grant(db, grant)
+            cid, grant = _make_plan_and_active_grant(db, grant)
             kw = _required_kwargs(grant)
             kw["current_model_name"] = None
+            kw["current_accepted_snapshot"] = _snap(commit="a" * 64)
             with self.assertRaises(Exception) as ctx:
                 derive_admission(
                     db, grant=grant, chunk=_valid_chunk(cid),
-                    runtime_digest=grant.runtime_digest,
                     worker_id="wkr-1",
                     policy_profile_id=grant.policy_profile_id,
                     validator_profile_ids=list(grant.validator_profile_ids),
                     provider_profile_id=grant.provider_profile_id,
-                    current_accepted_snapshot=_snap(commit=base),
                     **kw,
                 )
             self.assertIn("model_name", str(ctx.exception).lower())

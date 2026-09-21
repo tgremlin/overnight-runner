@@ -38,7 +38,13 @@ class ProtectedApproval:
     operator_id: str
     operator_receipt_digest: str
     issued_at: int
+    consumed_at: int
     payload: dict[str, Any]
+
+    @property
+    def is_consumed(self) -> bool:
+        """True iff this approval has already been consumed (one-shot)."""
+        return self.consumed_at > 0
 
 
 def register_protected_approval(
@@ -78,6 +84,7 @@ def register_protected_approval(
         operator_id=operator_id,
         operator_receipt_digest=digest,
         issued_at=ts,
+        consumed_at=0,
         payload=operator_receipt or {},
     )
 
@@ -99,6 +106,7 @@ def load_protected_approval(
         operator_id=row["operator_id"],
         operator_receipt_digest=row["operator_receipt_digest"],
         issued_at=row["issued_at"],
+        consumed_at=row["consumed_at"],
         payload=json.loads(row["payload"]) if row["payload"] else {},
     )
 
@@ -106,17 +114,30 @@ def load_protected_approval(
 def consume_protected_approval(
     db: Database, approval_id: str
 ) -> ProtectedApproval:
-    """Mark an approval as consumed. Idempotent: consuming twice
-    returns the existing record but flags ``consumed_at``.
+    """Mark an approval as consumed.
+
+    P06 follow-up #2 (A11): one-shot semantics. Re-consuming an
+    already-consumed approval raises ``SafetyError``. This prevents
+    an attacker who has captured a single approval envelope from
+    re-using it to mint multiple grants. The function returns the
+    updated approval record.
     """
     now = int(time.time())
     with db.transaction() as cur:
+        # Atomic compare-and-set: refuse if consumed_at > 0.
         cur.execute(
-            "UPDATE protected_approvals SET consumed_at=? WHERE approval_id=?",
+            "UPDATE protected_approvals SET consumed_at=? "
+            "WHERE approval_id=? AND consumed_at=0",
             (now, approval_id),
         )
         if cur.rowcount == 0:
-            raise SafetyError(f"approval {approval_id} not found")
+            existing = load_protected_approval(db, approval_id)
+            if existing is None:
+                raise SafetyError(f"approval {approval_id} not found")
+            raise SafetyError(
+                f"approval {approval_id} already consumed at "
+                f"{existing.consumed_at}; one-shot consumption enforced"
+            )
     ap = load_protected_approval(db, approval_id)
     if ap is None:
         raise SafetyError(f"approval {approval_id} disappeared")

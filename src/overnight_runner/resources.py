@@ -81,21 +81,38 @@ def acquire_lease(
     lease_id = f"lse-{uuid.uuid4().hex[:16]}"
 
     with db.transaction() as cur:
-        # Reject if a LIVE lease exists for the same resource.
+        # Reject if a LIVE lease exists for the same resource OR an
+        # expired-but-unreleased lease whose holder is still alive
+        # (P06 follow-up #2 A06).
         cur.execute(
             """
-            SELECT lease_id, expires_at, released_at FROM leases
-            WHERE campaign_id=? AND resource_id=?
-              AND released_at=0 AND expires_at > ?
+            SELECT lease_id, expires_at, released_at, owner_pid,
+                   owner_boot_id, fence_generation FROM leases
+            WHERE campaign_id=? AND resource_id=? AND released_at=0
             """,
-            (campaign_id, resource_id, now),
+            (campaign_id, resource_id),
         )
         live = cur.fetchone()
         if live is not None:
-            raise SafetyError(
-                f"resource busy: lease {live['lease_id']} still live "
-                f"(expires_at={live['expires_at']})"
-            )
+            if live["expires_at"] > now:
+                # Fresh live lease; reject immediately.
+                raise SafetyError(
+                    f"resource busy: lease {live['lease_id']} still live "
+                    f"(expires_at={live['expires_at']})"
+                )
+            # Lease is expired but UNRELEASED. The holder remains an
+            # authority object requiring explicit reconciliation. If
+            # the holder is still alive, direct acquire must fail.
+            if holder_process_alive(
+                owner_pid=int(live["owner_pid"]),
+                owner_boot_id=live["owner_boot_id"],
+                fence_generation=int(live["fence_generation"]),
+            ):
+                raise SafetyError(
+                    f"expired_but_live: lease {live['lease_id']} expired "
+                    f"but holder pid={live['owner_pid']} is still alive; "
+                    f"explicit takeover required"
+                )
         cur.execute(
             """
             INSERT INTO leases (
@@ -247,21 +264,37 @@ def load_lease(db: Database, lease_id: str) -> Lease | None:
 def expire_overdue_leases(db: Database, *, now: int | None = None) -> list[str]:
     """Mark leases whose ``expires_at`` has passed as released.
 
-    Returns the list of released lease ids. Note that this does NOT
-    increment the fence — the caller (e.g. ``revoke_for_takeover``) is
-    responsible for the fence bump if a new owner is taking over.
+    P06 follow-up #2 A06: an expired lease whose holder is still
+    alive MUST NOT be silently released into claimable state. Such a
+    lease remains an authority object requiring explicit takeover via
+    ``revoke_for_takeover``. This sweep releases only the leases
+    whose holders are dead (or whose leases do not have a real
+    process identity).
+
+    Returns the list of released lease ids. Does NOT increment the
+    fence; the caller (``revoke_for_takeover``) is responsible for
+    the fence bump when a new owner is taking over.
     """
     now = int(now if now is not None else time.time())
     released: list[str] = []
     with db.transaction() as cur:
         cur.execute(
             """
-            SELECT lease_id FROM leases WHERE released_at=0 AND expires_at > 0 AND expires_at <= ?
+            SELECT lease_id, owner_pid, owner_boot_id, fence_generation
+            FROM leases WHERE released_at=0 AND expires_at > 0 AND expires_at <= ?
             """,
             (now,),
         )
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
+            alive = holder_process_alive(
+                owner_pid=int(r["owner_pid"]),
+                owner_boot_id=r["owner_boot_id"],
+                fence_generation=int(r["fence_generation"]),
+            )
+            if alive:
+                # Holder still alive; refuse to silently release.
+                continue
             cur.execute(
                 "UPDATE leases SET released_at=? WHERE lease_id=? AND released_at=0",
                 (now, r["lease_id"]),

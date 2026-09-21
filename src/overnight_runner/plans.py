@@ -15,6 +15,12 @@ that:
 This module's ``lookup_plan_criteria`` is the single authority for
 chunk-to-plan mapping. A forged, missing, or unknown plan rejects;
 foreign/unapproved criteria reject.
+
+P06 follow-up #2 (A12): ``register_plan`` is a TRUSTED OPERATOR /
+PLANNER ingestion surface. It is NOT exposed to worker/model tool
+surfaces; a worker cannot register or modify plans. The function
+returns the deterministic ``plan_digest`` so callers can bind a
+grant to the exact plan content.
 """
 from __future__ import annotations
 
@@ -23,6 +29,10 @@ from typing import Any
 
 from .db import Database
 from .safety import SafetyError
+
+# Module-level marker: this is the only plan-registration surface.
+# Worker-facing surfaces MUST NOT call this.
+PLAN_TRUSTED_OPERATOR_SURFACE = True
 
 
 def register_plan(
@@ -37,6 +47,12 @@ def register_plan(
     ``work_package_criterion_ids`` maps ``package_id`` -> set of
     criterion ids. The plan's ``plan_digest`` is the SHA-256 of the
     canonical payload.
+
+    P06 follow-up #2: This is a TRUSTED operator-side surface. The
+    function returns the deterministic ``plan_digest`` so the grant
+    activation layer can bind a grant to the exact plan digest.
+    Re-registering an existing ``plan_id`` raises ``SafetyError`` to
+    preserve content-addressed immutability.
     """
     # Canonicalize to a sorted JSON-serializable form.
     canonical = {
@@ -52,6 +68,16 @@ def register_plan(
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     import hashlib
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # Refuse to re-register an existing plan_id (content-addressed immutability).
+    existing = load_plan_digest(db, plan_id)
+    if existing is not None:
+        if existing == digest:
+            # Idempotent re-register with identical content: return existing digest.
+            return digest
+        raise SafetyError(
+            f"plan {plan_id!r} already registered with a different digest "
+            f"(existing={existing[:8]}, attempted={digest[:8]}); refusing to widen"
+        )
     with db.transaction() as cur:
         cur.execute(
             """
@@ -62,6 +88,23 @@ def register_plan(
             (plan_id, approved_artifact_id, digest, payload),
         )
     return digest
+
+
+def load_plan_digest(db: Database, plan_id: str) -> str | None:
+    """Return the canonical ``plan_digest`` for ``plan_id`` or ``None``.
+
+    This is the authoritative content binding. Admission consults this
+    to refuse any plan whose digest has drifted away from the grant's
+    pinned ``approved_plan_digest``.
+    """
+    cur = db._conn.execute(
+        "SELECT plan_digest FROM approved_plans WHERE plan_id=?",
+        (plan_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return row["plan_digest"]
 
 
 def load_plan(db: Database, plan_id: str) -> dict[str, Any] | None:
@@ -124,8 +167,10 @@ def assert_chunk_criteria_approved(
 
 
 __all__ = [
+    "PLAN_TRUSTED_OPERATOR_SURFACE",
     "register_plan",
     "load_plan",
+    "load_plan_digest",
     "lookup_plan_criteria",
     "plan_criterion_ids_for_package",
     "assert_chunk_criteria_approved",

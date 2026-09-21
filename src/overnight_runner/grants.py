@@ -27,6 +27,7 @@ from .campaign_schemas import (
     content_sha256,
 )
 from .db import Database
+from .plans import load_plan_digest
 from .protected_approvals import consume_protected_approval
 from .safety import SafetyError
 
@@ -64,6 +65,13 @@ def activate_grant(
     ``operator_id`` and ``approval_id`` supplied here are identifier
     challenges only — the runner does NOT accept a freshly-supplied
     dict as the receipt itself.
+
+    P06 follow-up #2 (A01): the grant is pinned to the exact approved
+    plan digest. ``grant.approved_plan_digest`` MUST equal the digest
+    stored for ``grant.plan_id`` in ``approved_plans.plan_digest``.
+    Mismatch -> SafetyError. The protected approval is also consulted
+    AFTER this plan check so the trust order is: durable plan digest
+    -> protected approval -> grant activation.
     """
     if grant.state != "draft":
         raise SafetyError(f"grant must be draft (state={grant.state})")
@@ -73,9 +81,20 @@ def activate_grant(
         raise SafetyError("operator_id and approval_id required")
     if not approval_id:
         raise SafetyError("approval_id is required")
-    # Resolve the pre-registered protected approval. ``grant_id`` may
-    # not yet exist in the grants table; the approval is registered
-    # against the desired grant digest.
+    # (1) Plan digest pin: the grant MUST bind to an exact plan content.
+    stored_plan_digest = load_plan_digest(db, grant.plan_id)
+    if stored_plan_digest is None:
+        raise SafetyError(
+            f"plan {grant.plan_id!r} is not registered; refusing to activate a "
+            f"grant against an unknown plan"
+        )
+    if stored_plan_digest != grant.approved_plan_digest:
+        raise SafetyError(
+            f"approved_plan_digest mismatch: grant pinned "
+            f"{grant.approved_plan_digest[:8]} != registered plan "
+            f"{stored_plan_digest[:8]} for plan_id={grant.plan_id!r}"
+        )
+    # (2) Resolve the pre-registered protected approval.
     from .protected_approvals import (
         load_protected_approval,
         consume_protected_approval,
@@ -98,7 +117,7 @@ def activate_grant(
         raise SafetyError(
             "approval grant_digest_target does not match the supplied grant digest"
         )
-    # All three identity checks passed. Consume the approval.
+    # (3) All three identity checks passed. Consume the approval.
     consume_protected_approval(db, approval_id)
     ts = int(activated_at if activated_at is not None else time.time())
     active = grant.model_copy(

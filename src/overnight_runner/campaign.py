@@ -20,6 +20,7 @@ writes to a default branch.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -35,6 +36,7 @@ from .campaign_schemas import (
     ChunkSpec,
     ChunkState,
     RepoSnapshot,
+    content_sha256,
 )
 from .db import Database
 from .grants import load_grant
@@ -93,10 +95,33 @@ def create_campaign(
     need to find the grant in the durable store at campaign-create
     time. The campaign's lifecycle is governed by ``activate_campaign``
     (DRAFT -> ACTIVE) which is what binds to the store.
+
+    P06 follow-up #2 (A01): ``campaigns.grant_digest`` MUST contain the
+    actual grant digest (NOT a plan_id string), and
+    ``campaigns.plan_digest`` MUST contain the actual approved plan
+    digest (NOT a plan_id string). We resolve both by reading the
+    durable stores at insert time; unknown grant/plan refuses the
+    insert and raises ``SafetyError``.
     """
     from .feature_gate import require_campaign_v2
+    from .grants import load_grant_by_digest, load_grant
+    from .plans import load_plan
     require_not_paused_or_raise()
     require_campaign_v2("create_campaign")
+    # Resolve grant_digest and plan_digest from the durable stores.
+    # The campaign MUST NOT be created with placeholder plan_id strings
+    # in those columns.
+    stored_grant = load_grant(db, grant_id)
+    if stored_grant is None:
+        raise SafetyError(f"grant {grant_id!r} not registered in durable store")
+    stored_plan = load_plan(db, plan_id)
+    if stored_plan is None:
+        raise SafetyError(f"plan {plan_id!r} not registered in durable store")
+    grant_digest = content_sha256(stored_grant)
+    # Plan digest is content_sha256 of the canonical plan JSON
+    # (matches the value stored in approved_plans.plan_digest).
+    plan_payload = json.dumps(stored_plan, sort_keys=True, separators=(",", ":"))
+    plan_digest = hashlib.sha256(plan_payload.encode("utf-8")).hexdigest()
     now = int(time.time())
     campaign_id = f"cmp-{plan_id}-{uuid.uuid4().hex[:8]}"
     integration_branch = f"refs/heads/campaign/{campaign_id}"
@@ -120,8 +145,8 @@ def create_campaign(
                 campaign_id, grant_id, plan_id, CampaignState.DRAFT.value,
                 integration_branch, base_commit, base_tree_digest,
                 1, now, now,
-                plan_id,
-                plan_id,
+                grant_digest,
+                plan_digest,
             ),
         )
     return CampaignRecord(
@@ -213,23 +238,53 @@ def update_budget_after_chunk(
     ledger_id: str,
     delta_model_calls: int = 0,
     delta_tool_calls: int = 0,
+    delta_repairs: int = 0,
+    delta_rechunks: int = 0,
+    delta_escalations: int = 0,
     delta_active_seconds: int = 0,
-    delta_chunks: int = 1,
-) -> None:
-    """Increment cumulative budget counters without lowering them.
+    delta_wall_seconds: int = 0,
+    delta_cost_microusd: int = 0,
+    delta_chunks: int = 0,
+    delta_context_tokens: int = 0,
+    now: int | None = None,
+) -> dict[str, int]:
+    """ONE trusted cumulative consume/update operation (P06 follow-up #2 A07).
 
-    Sessions, restarts, rechunks, and provider changes NEVER reset
-    cumulative counters. The function only ever increments; it does NOT
-    decrement. Raises ``SafetyError`` if applying these increments
-    would exceed the budget bounds.
+    Covers every dimension defined in ``Budget`` and
+    ``BudgetLedgerEntry``:
+
+      * model calls
+      * tool calls
+      * repairs
+      * rechunks/revisions
+      * escalations
+      * active seconds
+      * cumulative wall/elapsed seconds
+      * cost_microusd
+      * chunks
+      * context tokens
+
+    The function only ever increments; sessions, restarts, rechunks,
+    and provider changes NEVER reset cumulative counters. Raises
+    ``SafetyError`` if applying these increments would exceed the
+    budget bounds. The caller MUST use this trusted budget API;
+    direct SQL UPDATE is reserved for migration/cleanup.
+
+    Returns the new cumulative totals so callers can persist them
+    into evidence.
     """
     require_not_paused_or_raise()
-    now = int(time.time())
+    now = int(now if now is not None else time.time())
     with db.transaction() as cur:
         cur.execute(
             """
-            SELECT bounds_json, cumulative_model_calls, cumulative_tool_calls,
-                   cumulative_active_seconds, cumulative_chunks
+            SELECT bounds_json,
+                   cumulative_model_calls, cumulative_tool_calls,
+                   cumulative_repairs, cumulative_rechunks,
+                   cumulative_escalations,
+                   cumulative_active_seconds, cumulative_wall_seconds,
+                   cumulative_cost_microusd,
+                   cumulative_chunks, cumulative_context_tokens
             FROM budget_ledgers WHERE ledger_id=?
             """,
             (ledger_id,),
@@ -238,27 +293,126 @@ def update_budget_after_chunk(
         if row is None:
             raise SafetyError(f"ledger {ledger_id} not found")
         bounds = json.loads(row["bounds_json"])
-        # Maximum comparisons (inline avoids requiring Pydantic here).
+        # Maximum comparisons.
         if row["cumulative_model_calls"] + delta_model_calls > bounds["max_model_calls"]:
-            raise SafetyError("budget exhausted: max_model_calls")
+            raise SafetyError(
+                f"budget exhausted: max_model_calls "
+                f"({row['cumulative_model_calls']+delta_model_calls}>{bounds['max_model_calls']})"
+            )
         if row["cumulative_tool_calls"] + delta_tool_calls > bounds["max_tool_calls"]:
-            raise SafetyError("budget exhausted: max_tool_calls")
+            raise SafetyError(
+                f"budget exhausted: max_tool_calls "
+                f"({row['cumulative_tool_calls']+delta_tool_calls}>{bounds['max_tool_calls']})"
+            )
+        if row["cumulative_repairs"] + delta_repairs > bounds["max_local_repairs"]:
+            raise SafetyError(
+                f"budget exhausted: max_local_repairs "
+                f"({row['cumulative_repairs']+delta_repairs}>{bounds['max_local_repairs']})"
+            )
+        if row["cumulative_rechunks"] + delta_rechunks > bounds["max_rechunks"]:
+            raise SafetyError(
+                f"budget exhausted: max_rechunks "
+                f"({row['cumulative_rechunks']+delta_rechunks}>{bounds['max_rechunks']})"
+            )
+        if row["cumulative_escalations"] + delta_escalations > bounds["max_frontier_escalations"]:
+            raise SafetyError(
+                f"budget exhausted: max_frontier_escalations "
+                f"({row['cumulative_escalations']+delta_escalations}>{bounds['max_frontier_escalations']})"
+            )
         if row["cumulative_active_seconds"] + delta_active_seconds > bounds["max_active_seconds"]:
-            raise SafetyError("budget exhausted: max_active_seconds")
+            raise SafetyError(
+                f"budget exhausted: max_active_seconds "
+                f"({row['cumulative_active_seconds']+delta_active_seconds}>{bounds['max_active_seconds']})"
+            )
+        # Wall seconds: cumulative (no upper delta increment; we
+        # always pass a delta and bound against max_wall_seconds).
+        if delta_wall_seconds < 0:
+            raise SafetyError("delta_wall_seconds must be >= 0")
+        cur_wall = int(row["cumulative_wall_seconds"]) if "cumulative_wall_seconds" in row.keys() else 0
+        if cur_wall + delta_wall_seconds > bounds["max_wall_seconds"]:
+            raise SafetyError(
+                f"budget exhausted: max_wall_seconds "
+                f"({cur_wall+delta_wall_seconds}>{bounds['max_wall_seconds']})"
+            )
+        if row["cumulative_cost_microusd"] + delta_cost_microusd > bounds["max_cost_microusd"]:
+            raise SafetyError(
+                f"budget exhausted: max_cost_microusd "
+                f"({row['cumulative_cost_microusd']+delta_cost_microusd}>{bounds['max_cost_microusd']})"
+            )
         if row["cumulative_chunks"] + delta_chunks > bounds["max_chunks"]:
-            raise SafetyError("budget exhausted: max_chunks")
+            raise SafetyError(
+                f"budget exhausted: max_chunks "
+                f"({row['cumulative_chunks']+delta_chunks}>{bounds['max_chunks']})"
+            )
+        if row["cumulative_context_tokens"] + delta_context_tokens > bounds["context_token_budget"]:
+            raise SafetyError(
+                f"budget exhausted: context_token_budget "
+                f"({row['cumulative_context_tokens']+delta_context_tokens}>{bounds['context_token_budget']})"
+            )
         cur.execute(
             """
             UPDATE budget_ledgers SET
                 cumulative_model_calls=cumulative_model_calls+?,
                 cumulative_tool_calls=cumulative_tool_calls+?,
+                cumulative_repairs=cumulative_repairs+?,
+                cumulative_rechunks=cumulative_rechunks+?,
+                cumulative_escalations=cumulative_escalations+?,
                 cumulative_active_seconds=cumulative_active_seconds+?,
+                cumulative_wall_seconds=cumulative_wall_seconds+?,
+                cumulative_cost_microusd=cumulative_cost_microusd+?,
                 cumulative_chunks=cumulative_chunks+?,
+                cumulative_context_tokens=cumulative_context_tokens+?,
                 revision=revision+1
             WHERE ledger_id=?
             """,
-            (delta_model_calls, delta_tool_calls, delta_active_seconds, delta_chunks, ledger_id),
+            (
+                delta_model_calls, delta_tool_calls,
+                delta_repairs, delta_rechunks, delta_escalations,
+                delta_active_seconds, delta_wall_seconds,
+                delta_cost_microusd,
+                delta_chunks, delta_context_tokens,
+                ledger_id,
+            ),
         )
+        # Read back the new totals.
+        cur.execute(
+            """
+            SELECT cumulative_model_calls, cumulative_tool_calls,
+                   cumulative_repairs, cumulative_rechunks,
+                   cumulative_escalations,
+                   cumulative_active_seconds, cumulative_wall_seconds,
+                   cumulative_cost_microusd,
+                   cumulative_chunks, cumulative_context_tokens
+            FROM budget_ledgers WHERE ledger_id=?
+            """,
+            (ledger_id,),
+        )
+        new = dict(cur.fetchone())
+    return new
+
+
+def read_budget_totals(db: Database, *, ledger_id: str) -> dict[str, int]:
+    """Read the current cumulative totals from the durable ledger.
+
+    Companion to ``update_budget_after_chunk``. The trusted budget
+    API is the only sanctioned read surface for cumulative budget.
+    """
+    cur = db._conn.execute(
+        """
+        SELECT cumulative_model_calls, cumulative_tool_calls,
+               cumulative_repairs, cumulative_rechunks,
+               cumulative_escalations,
+               cumulative_active_seconds, cumulative_wall_seconds,
+               cumulative_cost_microusd,
+               cumulative_chunks, cumulative_context_tokens
+        FROM budget_ledgers WHERE ledger_id=?
+        """,
+        (ledger_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise SafetyError(f"ledger {ledger_id} not found")
+    return dict(row)
 
 
 def pause_campaign(db: Database, *, campaign_id: str, reason: str) -> None:

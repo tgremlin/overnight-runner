@@ -176,6 +176,12 @@ class AutonomyGrant(StrictBase):
     state: Literal["draft", "active", "revoked", "expired"]
     plan_id: ID
     plan_revision: int = Field(ge=1, le=1_000_000)
+    # P06 follow-up #2 (A01): the grant is pinned to the EXACT plan
+    # digest registered at activation time. ``plan_id`` + ``plan_revision``
+    # are convenience references; ``approved_plan_digest`` is the
+    # authoritative content binding. Admission cannot substitute another
+    # plan even if its ``plan_id`` matches.
+    approved_plan_digest: SHA256
     repository_paths: list[str] = Field(default_factory=list)
     allowed_write_paths: list[str] = Field(default_factory=list)
     protected_paths: list[str] = Field(default_factory=list)
@@ -330,6 +336,7 @@ class BudgetLedgerEntry(StrictBase):
     cumulative_rechunks: int = Field(default=0, ge=0)
     cumulative_escalations: int = Field(default=0, ge=0)
     cumulative_active_seconds: int = Field(default=0, ge=0)
+    cumulative_wall_seconds: int = Field(default=0, ge=0)
     cumulative_cost_microusd: int = Field(default=0, ge=0)
     cumulative_chunks: int = Field(default=0, ge=0)
     cumulative_context_tokens: int = Field(default=0, ge=0)
@@ -357,6 +364,8 @@ class BudgetLedgerEntry(StrictBase):
             return f"max_frontier_escalations exceeded ({self.cumulative_escalations + delta_escalation}>{b.max_frontier_escalations})"
         if self.cumulative_active_seconds + delta_active_seconds > b.max_active_seconds:
             return f"max_active_seconds exceeded ({self.cumulative_active_seconds + delta_active_seconds}>{b.max_active_seconds})"
+        if self.cumulative_wall_seconds > b.max_wall_seconds:
+            return f"max_wall_seconds exceeded ({self.cumulative_wall_seconds}>{b.max_wall_seconds})"
         if self.cumulative_cost_microusd + delta_cost_microusd > b.max_cost_microusd:
             return f"max_cost_microusd exceeded ({self.cumulative_cost_microusd + delta_cost_microusd}>{b.max_cost_microusd})"
         if self.cumulative_chunks + delta_chunks > b.max_chunks:
