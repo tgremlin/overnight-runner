@@ -33,7 +33,13 @@ from typing import Any
 
 from .campaign_schemas import CampaignEvent, FenceState, RepoSnapshot
 from .db import Database
-from .resources import current_fence, enforce_fence
+from .feature_gate import require_campaign_v2
+from .receipts import (
+    KIND_VALIDATION,
+    load_receipt,
+    verify_receipt,
+)
+from .resources import current_fence, enforce_fence, holder_process_alive
 from .safety import SafetyError
 
 
@@ -129,6 +135,7 @@ def compare_and_swap_advance(
     holder_fence_generation: int,
     actor: str,
     idempotency_key: str,
+    validation_receipt_id: str | None = None,
     expected_old: str | None = None,
     expected_tree_digest: str | None = None,
 ) -> CompareAndSwapResult:
@@ -136,6 +143,11 @@ def compare_and_swap_advance(
 
     Sequence:
 
+      0. Validate the trusted validation receipt (P06-A04): a
+         ``kind=validation`` receipt with ``outcome=pass`` MUST be
+         supplied and binding to the same candidate snapshot. A
+         ``mutation/apply`` receipt cannot satisfy a required
+         validation.
       1. Read the LIVE current ref via ``git rev-parse`` (THE source
          of truth for what the world sees).
       2. Compare with ``expected_old`` (if provided). Mismatch -> fail
@@ -146,8 +158,33 @@ def compare_and_swap_advance(
       4. CAS the ref forward.
       5. Append to ``integration_journal`` and update campaigns row.
     """
+    require_campaign_v2("compare_and_swap_advance")
     now = int(time.time())
     branch = f"refs/heads/campaign/{campaign_id}"
+
+    # Step 0: trusted validation receipt (P06-A04). The receipt is
+    # loaded from the runner-owned durable evidence store and its
+    # kind/outcome/candidate-snapshot binding must match.
+    if not validation_receipt_id:
+        raise SafetyError(
+            "integration gate: a trusted validation receipt id "
+            "(kind=validation, outcome=pass) is REQUIRED before integration"
+        )
+    ap_rec = load_receipt(validation_receipt_id)
+    if ap_rec is None:
+        raise SafetyError(
+            f"integration gate: validation receipt {validation_receipt_id} not found"
+        )
+    if ap_rec.get("kind") != KIND_VALIDATION:
+        raise SafetyError(
+            f"integration gate: receipt {validation_receipt_id} is kind="
+            f"{ap_rec.get('kind')}, must be {KIND_VALIDATION} to satisfy validation"
+        )
+    if ap_rec.get("outcome") != "pass":
+        raise SafetyError(
+            f"integration gate: receipt {validation_receipt_id} outcome="
+            f"{ap_rec.get('outcome')}, must be 'pass'"
+        )
 
     # Step 1: read LIVE ref (this is the source of truth for what the
     # world sees). If the ref doesn't exist, treat as empty.

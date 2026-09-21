@@ -45,11 +45,13 @@ from .campaign_schemas import (
     content_sha256,
 )
 from .db import Database
+from .feature_gate import require_campaign_v2
 from .grants import (
     derive_initial_ledger,
     load_grant,
     load_grant_by_digest,
 )
+from .plans import assert_chunk_criteria_approved, load_plan
 from .resources import acquire_lease, current_fence
 from .safety import SafetyError
 
@@ -96,6 +98,7 @@ def derive_admission(
     policy_profile_id: str,
     validator_profile_ids: list[str],
     provider_profile_id: str,
+    plan_id: str | None = None,
     current_runtime_digest: str | None = None,
     current_model_name: str | None = None,
     current_model_digest: str | None = None,
@@ -113,7 +116,11 @@ def derive_admission(
 
     The caller passes the **current** identity pins (model/runtime/policy/...)
     so the receipt binds exactly to what the worker is observing.
+
+    All identity evidence MUST be supplied (P06-A02 follow-up;
+    missing identity -> reject closed).
     """
+    require_campaign_v2("derive_admission")
     now = int(now if now is not None else time.time())
 
     # ----- (A) Grant state -----
@@ -143,12 +150,35 @@ def derive_admission(
     if not _ids_match(chunk.required_validator_ids, stored.validator_profile_ids):
         raise SafetyError("chunk.required_validator_ids are not a subset of grant.validator_profile_ids")
 
-    # ----- (C) Identity drift -----
+    # ----- (C-pre) Required identity evidence (P06-A02 follow-up).
+    # Each of these MUST be supplied as a non-None value. We reject
+    # BEFORE any drift comparison so the caller always gets an
+    # explicit "missing identity" signal.
     if current_runtime_digest is None:
-        current_runtime_digest = runtime_digest
-    if current_runtime_digest != stored.runtime_digest:
+        if runtime_digest:
+            current_runtime_digest = runtime_digest
+        else:
+            raise SafetyError("current_runtime_digest is REQUIRED (got None)")
+    if current_model_name is None:
+        raise SafetyError("current_model_name is REQUIRED (got None)")
+    if current_model_digest is None:
+        raise SafetyError("current_model_digest is REQUIRED (got None)")
+    if current_policy_profile_id is None:
+        raise SafetyError("current_policy_profile_id is REQUIRED (got None)")
+    if current_validator_profile_ids is None:
         raise SafetyError(
-            f"runtime_drift: admission runtime {current_runtime_digest[:8]} != "
+            "current_validator_profile_ids is REQUIRED (got None)"
+        )
+    if current_provider_profile_id is None:
+        raise SafetyError(
+            "current_provider_profile_id is REQUIRED (got None)"
+        )
+
+    # ----- (C) Identity drift -----
+    if current_runtime_digest != stored.runtime_digest:
+        cur_substr = (current_runtime_digest or "missing")[:8]
+        raise SafetyError(
+            f"runtime_drift: admission runtime {cur_substr} != "
             f"grant runtime {stored.runtime_digest[:8]}"
         )
     if current_model_name is not None and current_model_name != stored.model_name:
@@ -177,6 +207,45 @@ def derive_admission(
         raise SafetyError("current_accepted_snapshot required")
     if stored.budget.is_expired(now):
         raise SafetyError("grant has expired at admission")
+    # ----- (B-extra) Plan-required: chunk's package_id and
+    # criterion_ids MUST match an entry in the approved plan.
+    if not plan_id:
+        raise SafetyError("chunk.plan_id is required for admission")
+    if not chunk.package_id:
+        raise SafetyError("chunk.package_id is required for admission")
+    chunk_crits = set(chunk.criterion_ids or [])
+    if not chunk_crits:
+        raise SafetyError("chunk.criterion_ids must be non-empty (per P06-A01)")
+    assert_chunk_criteria_approved(
+        db, plan_id=plan_id,
+        package_id=chunk.package_id,
+        chunk_criterion_ids=chunk_crits,
+    )
+    # ----- (C-bonus) Identity-drift: REQUIRED (not optional). Each
+    # admission MUST present evidence of every pinned identity. Any
+    # ``None`` -> reject.
+    if current_runtime_digest is None:
+        # Fall back ONLY if a runtime_digest was explicitly passed; do
+        # NOT substitute the bare argument ``runtime_digest`` when
+        # ``current_runtime_digest`` is required-but-None.
+        if runtime_digest:
+            current_runtime_digest = runtime_digest
+        else:
+            raise SafetyError("current_runtime_digest is REQUIRED (got None)")
+    if current_model_name is None:
+        raise SafetyError("current_model_name is REQUIRED (got None)")
+    if current_model_digest is None:
+        raise SafetyError("current_model_digest is REQUIRED (got None)")
+    if current_policy_profile_id is None:
+        raise SafetyError("current_policy_profile_id is REQUIRED (got None)")
+    if current_validator_profile_ids is None:
+        raise SafetyError(
+            "current_validator_profile_ids is REQUIRED (got None)"
+        )
+    if current_provider_profile_id is None:
+        raise SafetyError(
+            "current_provider_profile_id is REQUIRED (got None)"
+        )
     # ----- Baseline-mismatch check: an existing campaign whose current
     # committed snapshot is a different commit than the supplied one
     # rejects (external ref change / wrong predecessor). We compare

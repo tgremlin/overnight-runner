@@ -194,6 +194,37 @@ def enforce_fence(
         )
 
 
+def holder_process_alive(
+    *, owner_pid: int, owner_boot_id: str, fence_generation: int,
+) -> bool:
+    """Best-effort check whether the lease holder's process is alive.
+
+    In our test fixture the holder is the same process that opened
+    the lease; we use ``/proc/<pid>`` on Linux. ``status`` field in
+    ``/proc/<pid>/stat`` is 'Z' for zombie (defunct) and 'X' for
+    dead. Any other state is live.
+    """
+    try:
+        if owner_pid <= 0:
+            return False
+        import os
+        try:
+            os.kill(owner_pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        with open(f"/proc/{owner_pid}/stat", "r") as f:
+            stat_line = f.read().strip()
+        parts = stat_line.rsplit(")", 1)[-1].split()
+        if not parts:
+            return False
+        state = parts[0]
+        if state in ("Z", "X"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def load_lease(db: Database, lease_id: str) -> Lease | None:
     cur = db._conn.execute("SELECT * FROM leases WHERE lease_id=?", (lease_id,))
     row = cur.fetchone()
@@ -246,6 +277,7 @@ __all__ = [
     "revoke_for_takeover",
     "current_fence",
     "enforce_fence",
+    "holder_process_alive",
     "load_lease",
     "expire_overdue_leases",
 ]

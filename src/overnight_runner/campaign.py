@@ -94,7 +94,9 @@ def create_campaign(
     time. The campaign's lifecycle is governed by ``activate_campaign``
     (DRAFT -> ACTIVE) which is what binds to the store.
     """
+    from .feature_gate import require_campaign_v2
     require_not_paused_or_raise()
+    require_campaign_v2("create_campaign")
     now = int(time.time())
     campaign_id = f"cmp-{plan_id}-{uuid.uuid4().hex[:8]}"
     integration_branch = f"refs/heads/campaign/{campaign_id}"
@@ -138,7 +140,9 @@ def create_campaign(
 
 def activate_campaign(db: Database, *, campaign_id: str) -> CampaignRecord:
     """Transition a DRAFT campaign to ACTIVE."""
+    from .feature_gate import require_campaign_v2
     require_not_paused_or_raise()
+    require_campaign_v2("activate_campaign")
     now = int(time.time())
     with db.transaction() as cur:
         cur.execute(

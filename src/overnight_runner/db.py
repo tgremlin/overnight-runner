@@ -249,6 +249,40 @@ CREATE TABLE IF NOT EXISTS campaign_events (
     idempotency_key TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS campaign_events_campaign ON campaign_events(campaign_id);
+
+-- Protected operator approvals (P06-A01): the ONLY surface that can
+-- mint an active grant. The activation callback resolves the supplied
+-- approval_id to a record that ALREADY exists in this table. A
+-- caller-supplied dict alone confers NO authority.
+CREATE TABLE IF NOT EXISTS protected_approvals (
+    approval_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,                 -- 'activate_grant'
+    grant_digest_target TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    operator_receipt_digest TEXT NOT NULL,
+    issued_at INTEGER NOT NULL,
+    consumed_at INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS protected_approvals_operator ON protected_approvals(operator_id);
+
+-- Approved plans (P06-A01): bind work-packages and criterion coverage.
+-- Admission REQUIRES the chunk's package_id and criterion_ids to be
+-- present in the plan's approved structure.
+CREATE TABLE IF NOT EXISTS approved_plans (
+    plan_id TEXT PRIMARY KEY,
+    approved_artifact_id TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    payload TEXT NOT NULL,                     -- canonical JSON
+    created_at INTEGER NOT NULL
+);
+
+-- Migration bookkeeping (P09 review follow-up).
+CREATE TABLE IF NOT EXISTS migrations_applied (
+    name TEXT PRIMARY KEY,
+    applied_at INTEGER NOT NULL,
+    integrity_ok INTEGER NOT NULL DEFAULT 1
+);
 """
 
 # Migration log for forward-compatible schema versioning. Each versioned
@@ -284,8 +318,9 @@ class Database:
         self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.executescript(SCHEMA)
         self._conn.executescript(_MIGRATIONS_TABLE)
-        # Apply P06-0001: campaign-v2 tables (idempotent CREATE IF NOT EXISTS).
+        # Apply migrations in order (idempotent).
         self._record_migration("p06-0001-campaign-v2-tables")
+        self._record_migration("p06-followup-0001-protected-approvals-and-plans")
 
     def close(self) -> None:
         try:

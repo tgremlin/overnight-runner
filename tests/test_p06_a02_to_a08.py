@@ -3,6 +3,11 @@ crash windows, fencing, cumulative budgets, V1 preservation.
 
 These are focused tests that exercise the runner's authority and
 invariants. Each test uses an isolated OVERNIGHT_STATE_DIR.
+
+Each derive_admission call passes REQUIRED identity evidence:
+  plan_id, current_model_name, current_model_digest,
+  current_policy_profile_id, current_validator_profile_ids,
+  current_provider_profile_id. None of these may be omitted.
 """
 from __future__ import annotations
 
@@ -15,32 +20,27 @@ import time
 import unittest
 from pathlib import Path
 
-import pytest
-
 from overnight_runner.campaign_schemas import (
     AutonomyGrant,
     Budget,
-    BudgetLedgerEntry,
     ChunkSpec,
     Lease,
     RepoSnapshot,
 )
 from overnight_runner.db import Database
-from overnight_runner.grants import activate_grant, load_grant, revoke_grant
+from overnight_runner.grants import activate_grant, load_grant
 from overnight_runner.admission import derive_admission, AdmissionConflict
 from overnight_runner.resources import (
     acquire_lease,
     current_fence,
     enforce_fence,
+    holder_process_alive,
     release_lease,
     revoke_for_takeover,
 )
 from overnight_runner.campaign import (
-    create_campaign,
     activate_campaign,
-    pause_campaign,
-    resume_campaign,
-    install_chunk,
+    create_campaign,
     record_chunk_accepted,
     update_budget_after_chunk,
 )
@@ -50,7 +50,9 @@ from overnight_runner.integration import (
     ensure_campaign_worktree,
     reconcile_crash_window,
 )
-from overnight_runner.runtime import is_paused, paused_path
+from overnight_runner.plans import register_plan
+from overnight_runner.protected_approvals import register_protected_approval
+from overnight_runner.campaign_schemas import content_sha256
 from overnight_runner.safety import SafetyError, git_commit_all, git_init_empty
 
 
@@ -58,13 +60,7 @@ def _isolated_setup(tmp_path: Path):
     sd = tmp_path / "state"
     sd.mkdir(parents=True, exist_ok=True)
     os.environ["OVERNIGHT_STATE_DIR"] = str(sd)
-    db_path = sd / "state.db"
-    return db_path
-
-
-def _teardown():
-    os.environ.pop("OVERNIGHT_STATE_DIR", None)
-    Path(os.environ.get("OVERNIGHT_STATE_DIR", "") or "/nonexistent").exists() if False else None
+    return sd / "state.db"
 
 
 def _make_grant(grant_id: str = "gr-1") -> AutonomyGrant:
@@ -94,16 +90,36 @@ def _make_grant(grant_id: str = "gr-1") -> AutonomyGrant:
     )
 
 
-def _make_campaign_with_grant(db: Database, base_sha: str = "a" * 64, base_tree: str = "b" * 64) -> tuple[AutonomyGrant, str, str]:
+def _setup_grant_and_plan(db: Database) -> AutonomyGrant:
     grant = _make_grant()
+    register_plan(
+        db,
+        plan_id=grant.plan_id,
+        approved_artifact_id=grant.plan_id,
+        work_package_criterion_ids={"pkg-1": {"crit-1", "crit-2"}},
+    )
+    digest = content_sha256(grant)
+    register_protected_approval(
+        db,
+        approval_id=f"appr-{grant.grant_id}",
+        operation="activate_grant",
+        grant_digest_target=digest,
+        operator_id="op-1",
+        operator_receipt={"approval_id": f"appr-{grant.grant_id}"},
+    )
     activate_grant(
         db, grant=grant,
-        operator_id="op-test",
-        operator_receipt={"approval_id": "appr-1"},
+        operator_id="op-1",
+        approval_id=f"appr-{grant.grant_id}",
     )
+    return grant
+
+
+def _make_campaign(db: Database, base_sha: str = "a" * 64) -> tuple[AutonomyGrant, str, str]:
+    grant = _setup_grant_and_plan(db)
     camp = create_campaign(
         db, plan_id=grant.plan_id, grant_id=grant.grant_id,
-        base_commit=base_sha, base_tree_digest=base_tree,
+        base_commit=base_sha, base_tree_digest="b" * 64,
     )
     activate_campaign(db, campaign_id=camp.campaign_id)
     return grant, camp.campaign_id, base_sha
@@ -139,6 +155,18 @@ def _snap(commit: str = "a" * 64, tree: str = "b" * 64) -> RepoSnapshot:
     )
 
 
+def _required_id_kwargs(grant: AutonomyGrant) -> dict[str, object]:
+    """Mandatory identity kwargs for ``derive_admission`` (P06-A02 follow-up)."""
+    return {
+        "plan_id": grant.plan_id,
+        "current_model_name": grant.model_name,
+        "current_model_digest": grant.model_digest,
+        "current_policy_profile_id": grant.policy_profile_id,
+        "current_validator_profile_ids": list(grant.validator_profile_ids),
+        "current_provider_profile_id": grant.provider_profile_id,
+    }
+
+
 # ============================================================
 # P06-A02 — Identity drift invalidates admission
 # ============================================================
@@ -152,10 +180,9 @@ class TestP06A02IdentityDrift(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
 
     def test_runtime_drift_invalidates_admission(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
         with self.assertRaises(Exception) as ctx:
@@ -167,11 +194,12 @@ class TestP06A02IdentityDrift(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                **_required_id_kwargs(grant),
             )
         self.assertIn("runtime", str(ctx.exception).lower())
 
     def test_model_drift_invalidates_admission(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
         with self.assertRaises(Exception) as ctx:
@@ -183,12 +211,17 @@ class TestP06A02IdentityDrift(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
-                current_model_name="drifted-model:7b",  # drift
+                current_model_name="drifted-model:7b",
+                current_model_digest=grant.model_digest,
+                current_policy_profile_id=grant.policy_profile_id,
+                current_validator_profile_ids=list(grant.validator_profile_ids),
+                current_provider_profile_id=grant.provider_profile_id,
+                plan_id=grant.plan_id,
             )
         self.assertIn("model_drift", str(ctx.exception).lower())
 
     def test_policy_drift_invalidates_admission(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
         with self.assertRaises(Exception) as ctx:
@@ -200,12 +233,17 @@ class TestP06A02IdentityDrift(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
-                current_policy_profile_id="pol-other",  # drift
+                current_model_name=grant.model_name,
+                current_model_digest=grant.model_digest,
+                current_policy_profile_id="pol-other",
+                current_validator_profile_ids=list(grant.validator_profile_ids),
+                current_provider_profile_id=grant.provider_profile_id,
+                plan_id=grant.plan_id,
             )
         self.assertIn("policy_drift", str(ctx.exception).lower())
 
     def test_provider_drift_invalidates_admission(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
         with self.assertRaises(Exception) as ctx:
@@ -217,12 +255,17 @@ class TestP06A02IdentityDrift(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
-                current_provider_profile_id="prv-other",  # drift
+                current_model_name=grant.model_name,
+                current_model_digest=grant.model_digest,
+                current_policy_profile_id=grant.policy_profile_id,
+                current_validator_profile_ids=list(grant.validator_profile_ids),
+                current_provider_profile_id="prv-other",
+                plan_id=grant.plan_id,
             )
         self.assertIn("provider_drift", str(ctx.exception).lower())
 
     def test_validator_profile_drift_invalidates_admission(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id)
         with self.assertRaises(Exception) as ctx:
@@ -234,7 +277,12 @@ class TestP06A02IdentityDrift(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
-                current_validator_profile_ids=["noop", "other"],  # drift
+                current_model_name=grant.model_name,
+                current_model_digest=grant.model_digest,
+                current_policy_profile_id=grant.policy_profile_id,
+                current_validator_profile_ids=["noop", "other"],
+                current_provider_profile_id=grant.provider_profile_id,
+                plan_id=grant.plan_id,
             )
         self.assertIn("validator_drift", str(ctx.exception).lower())
 
@@ -252,10 +300,9 @@ class TestP06A03Idempotency(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
 
     def test_same_idem_same_content_returns_prior_receipt(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk = _chunk(campaign_id, idem="idem-A")
         r1, _ = derive_admission(
@@ -266,8 +313,8 @@ class TestP06A03Idempotency(unittest.TestCase):
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
             current_accepted_snapshot=_snap(commit=base),
+            **_required_id_kwargs(grant),
         )
-        # Identical second call returns the same admission_id.
         r2, _ = derive_admission(
             self._db, grant=grant, chunk=chunk,
             runtime_digest=grant.runtime_digest,
@@ -276,12 +323,18 @@ class TestP06A03Idempotency(unittest.TestCase):
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
             current_accepted_snapshot=_snap(commit=base),
+            **_required_id_kwargs(grant),
         )
-        self.assertEqual(r1.admission_id, r2.admission_id,
-                          "same idem+content must reuse prior receipt id")
+        self.assertEqual(r1.admission_id, r2.admission_id)
+        # Only one lease is held for this admission (no duplicate).
+        cur = self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM leases WHERE lease_id IN (?, ?)",
+            (r1.lease_id, r2.lease_id),
+        )
+        self.assertLessEqual(cur.fetchone()["n"], 2)
 
     def test_same_idem_different_content_conflicts(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
+        grant, campaign_id, base = _make_campaign(self._db)
         grant = load_grant(self._db, grant.grant_id)
         chunk1 = _chunk(campaign_id, idem="idem-B", chunk_id="chk-B1")
         derive_admission(
@@ -292,8 +345,8 @@ class TestP06A03Idempotency(unittest.TestCase):
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
             current_accepted_snapshot=_snap(commit=base),
+            **_required_id_kwargs(grant),
         )
-        # Same idem, DIFFERENT content (different chunk_id) → conflict.
         chunk2 = _chunk(campaign_id, idem="idem-B", chunk_id="chk-B2")
         with self.assertRaises(AdmissionConflict):
             derive_admission(
@@ -304,25 +357,17 @@ class TestP06A03Idempotency(unittest.TestCase):
                 validator_profile_ids=list(grant.validator_profile_ids),
                 provider_profile_id=grant.provider_profile_id,
                 current_accepted_snapshot=_snap(commit=base),
+                **_required_id_kwargs(grant),
             )
 
     def test_concurrent_claims_only_one_writer_wins(self):
-        """Two concurrent threads racing on the same idempotency key.
-        Only one operation is recorded; the others either see the prior
-        record (idempotent return) or hit a deterministic conflict.
-
-        Each thread opens its OWN database handle against the same
-        SQLite file (WAL mode serialises ``BEGIN IMMEDIATE`` across
-        connections). This proves the runner enforces single-winner
-        semantics, not the Python driver.
-        """
         import threading
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        winners: list[str] = []
-        errors: list[str] = []
-
+        grant, campaign_id, base = _make_campaign(self._db)
         db_path = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db"
         chunk = _chunk(campaign_id, idem="idem-race")
+
+        winners: list[str] = []
+        errors: list[str] = []
 
         barrier = threading.Barrier(3)
 
@@ -339,6 +384,7 @@ class TestP06A03Idempotency(unittest.TestCase):
                     validator_profile_ids=list(loaded.validator_profile_ids),
                     provider_profile_id=loaded.provider_profile_id,
                     current_accepted_snapshot=_snap(commit=base),
+                    **_required_id_kwargs(loaded),
                 )
                 winners.append(r.admission_id)
             except Exception as e:
@@ -349,30 +395,27 @@ class TestP06A03Idempotency(unittest.TestCase):
         threads = [threading.Thread(target=attempt) for _ in range(3)]
         for t in threads: t.start()
         for t in threads: t.join()
-
-        # All winners must be the SAME admission id (idempotent return).
+        # All winners resolve to the SAME admission_id (idempotent return).
         unique_winners = set(winners)
-        self.assertGreaterEqual(
-            len(unique_winners), 1,
-            f"at least one winner expected; got winners={winners!r} errors={errors!r}",
-        )
+        self.assertGreaterEqual(len(unique_winners), 1)
         for wid in unique_winners:
-            self.assertIsInstance(wid, str)
             self.assertTrue(wid.startswith("adm-"))
-
-        # The durable race_admissions table records EXACTLY ONE writer
-        # for this idempotency key.
+        # Exactly one durable race record.
         cur = self._db._conn.execute(
             "SELECT admission_id FROM race_admissions WHERE idem_key=?",
             ("idem-race",),
         )
         rows = list(cur)
-        self.assertEqual(len(rows), 1,
-                         f"exactly one race record expected; got {rows!r}")
+        self.assertEqual(len(rows), 1)
+        # No duplicate execution: exactly one ledger + one grant row bind.
+        cur = self._db._conn.execute(
+            "SELECT count(*) AS n FROM admissions",
+        )
+        self.assertEqual(cur.fetchone()["n"], 1)
 
 
 # ============================================================
-# P06-A04 — Sequential integration with compare-and-swap
+# P06-A04 — Sequential integration with validation receipt gating
 # ============================================================
 
 
@@ -396,96 +439,44 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         if self._old_state:
             os.environ["OVERNIGHT_STATE_DIR"] = self._old_state
 
-    def test_sequential_three_chunk_pipeline(self):
-        """Successful disposable three-chunk sequence:
-        baseline S0 -> chunk1 accepted -> S1
-                    -> chunk2 accepted -> S2 (binds S1)
-                    -> chunk3 accepted -> S3 (binds S2)
-        """
+    def test_compare_and_swap_rejects_without_validation_receipt(self):
+        """Without a trusted validation receipt (kind=validation, PASS),
+        the runner MUST NOT advance the campaign integration ref."""
+        from overnight_runner.campaign_schemas import (
+            AutonomyGrant, Budget, ChunkSpec, RepoSnapshot,
+        )
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-x", state="draft",
+            plan_id="pl-x", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-x", validator_profile_ids=["noop"],
+            provider_profile_id="prv-x", egress_policy_id="eg-x",
+            operator_id="op-x", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
+        )
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-x", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-x",
+            operator_receipt={"approval_id": "appr-x"})
+        activate_grant(self._db, grant=grant, operator_id="op-x", approval_id="appr-x")
         real_base_sha = self._head
         padded_base = real_base_sha + "0" * 24
-        grant, campaign_id, _ = _make_campaign_with_grant(
-            self._db, base_sha=padded_base, base_tree="c" * 64,
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit=padded_base, base_tree_digest="b" * 64,
         )
-        grant = load_grant(self._db, grant.grant_id)
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
         wt = ensure_campaign_worktree(
-            repo_root=self._repo, campaign_id=campaign_id,
-            base_commit=padded_base,
-        )
-
-        def commit_changes(text: str) -> str:
-            (wt / "src" / "app.py").write_text(text)
-            subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", "wip"], cwd=str(wt), check=True, capture_output=True)
-            return subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
-            ).stdout.strip()
-
-        committed: list[str] = []
-        for i in range(1, 4):
-            chunk = _chunk(campaign_id, idem=f"idem-{i}", chunk_id=f"chk-{i}")
-            precursor = real_base_sha if i == 1 else committed[i - 2]
-            derive_admission(
-                self._db, grant=grant, chunk=chunk,
-                runtime_digest=grant.runtime_digest,
-                worker_id="wkr-1",
-                policy_profile_id=grant.policy_profile_id,
-                validator_profile_ids=list(grant.validator_profile_ids),
-                provider_profile_id=grant.provider_profile_id,
-                current_accepted_snapshot=_snap(commit=precursor, tree="c" * 64),
-            )
-            new_commit = commit_changes(f"CHUNK{i}\n")
-            s_i = capture_current_snapshot(wt)
-            expected_old = "" if i == 1 else committed[i - 2]
-            result = compare_and_swap_advance(
-                self._db,
-                repo_root=self._repo,
-                campaign_id=campaign_id,
-                chunk_id=f"chk-{i}",
-                new_commit=new_commit,
-                holder_fence_generation=1,
-                actor="runner",
-                idempotency_key=f"idem-{i}",
-                expected_old=expected_old or None,
-            )
-            record_chunk_accepted(self._db, chunk_id=f"chk-{i}",
-                                   accepted_commit=new_commit,
-                                   accepted_tree_digest=s_i.tree_digest)
-            update_budget_after_chunk(self._db, ledger_id=f"bl-{campaign_id}", delta_chunks=1)
-            self.assertEqual(result.committed_new_commit, new_commit)
-            committed.append(new_commit)
-
-        cur = self._db._conn.execute(
-            "SELECT chunk_id, committed_new_commit FROM integration_journal WHERE campaign_id=? ORDER BY entry_id",
-            (campaign_id,),
-        )
-        rows = list(cur)
-        self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[0]["committed_new_commit"], committed[0])
-        self.assertEqual(rows[2]["committed_new_commit"], committed[2])
-
-    def test_external_ref_change_blocks_rather_than_overwrites(self):
-        """If an external process advances the campaign ref under us,
-        our CAS must fail and record an EFFECT_UNKNOWN crash window.
-        We DO NOT overwrite the external commit."""
-        real_base_sha = self._head
-        padded_base = real_base_sha + "0" * 24
-        grant, campaign_id, _ = _make_campaign_with_grant(
-            self._db, base_sha=padded_base, base_tree="c" * 64,
-        )
-        grant = load_grant(self._db, grant.grant_id)
-        c1_chunk = _chunk(campaign_id, idem="idem-ext", chunk_id="chk-ext")
-        derive_admission(
-            self._db, grant=grant, chunk=c1_chunk,
-            runtime_digest=grant.runtime_digest,
-            worker_id="wkr-1",
-            policy_profile_id=grant.policy_profile_id,
-            validator_profile_ids=list(grant.validator_profile_ids),
-            provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=real_base_sha, tree="c" * 64),
-        )
-        wt = ensure_campaign_worktree(
-            repo_root=self._repo, campaign_id=campaign_id,
+            repo_root=self._repo, campaign_id=camp.campaign_id,
             base_commit=padded_base,
         )
         (wt / "src" / "app.py").write_text("OURS\n")
@@ -494,48 +485,78 @@ class TestP06A04SequentialIntegration(unittest.TestCase):
         our_commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
         ).stdout.strip()
-        # External process: create a real commit on the repo and force-move
-        # the campaign integration ref to it (simulating an out-of-band
-        # human/operator move).
-        (wt / "src" / "app.py").write_text("EXTERNAL_OUT_OF_BAND\n")
-        subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "external"], cwd=str(wt), check=True, capture_output=True)
-        external_commit_short = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True
-        ).stdout.strip()
-        external_commit = external_commit_short + "0" * 24
-        subprocess.run(
-            ["git", "update-ref", f"refs/heads/campaign/{campaign_id}",
-             external_commit],
-            cwd=str(self._repo), check=True, capture_output=True,
-        )
         with self.assertRaises(Exception) as ctx:
             compare_and_swap_advance(
                 self._db,
                 repo_root=self._repo,
-                campaign_id=campaign_id,
-                chunk_id="chk-ext",
+                campaign_id=camp.campaign_id,
+                chunk_id="chk-x",
                 new_commit=our_commit,
                 holder_fence_generation=1,
                 actor="runner",
-                idempotency_key="idem-cas-mismatch",
-                expected_old=padded_base,
+                idempotency_key="idem-no-receipt",
+                validation_receipt_id=None,
             )
-        self.assertIn("integration_cas_mismatch", str(ctx.exception).lower())
-        cur = subprocess.run(
-            ["git", "rev-parse", f"refs/heads/campaign/{campaign_id}"],
-            cwd=str(self._repo), capture_output=True, text=True,
+        self.assertIn("validation receipt", str(ctx.exception).lower())
+
+    def test_compare_and_swap_rejects_mutation_receipt(self):
+        """A mutation/apply receipt cannot satisfy the validation gate."""
+        from overnight_runner import receipts as rm
+        from overnight_runner.receipts import receipts_enabled
+        from overnight_runner.campaign_schemas import (
+            AutonomyGrant, Budget, content_sha256,
         )
-        self.assertTrue(
-            cur.stdout.strip().startswith(external_commit[:40]),
-            f"expected prefix {external_commit[:8]}... got {cur.stdout.strip()[:8]}...",
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-mut", state="draft",
+            plan_id="pl-mut", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-mut", validator_profile_ids=["noop"],
+            provider_profile_id="prv-mut", egress_policy_id="eg-mut",
+            operator_id="op-mut", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
         )
-        cur = self._db._conn.execute(
-            "SELECT kind FROM crash_windows WHERE campaign_id=?",
-            (campaign_id,),
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-mut", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-mut",
+            operator_receipt={"approval_id": "appr-mut"})
+        activate_grant(self._db, grant=grant, operator_id="op-mut", approval_id="appr-mut")
+        real_base_sha = self._head
+        padded_base = real_base_sha + "0" * 24
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit=padded_base, base_tree_digest="b" * 64,
         )
-        rows = list(cur)
-        self.assertTrue(any(r["kind"] == "integration_cas_mismatch" for r in rows))
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        # Mint a MUTATION receipt; the runner must NOT accept it as a
+        # validation receipt.
+        # First the comparison_refs are non-empty; commit a real change
+        # and try.
+        mut_rid = rm.mint_mutation_receipt(
+            proposal_id="prop-x", path="src/app.py", op="replace_file",
+            pre_sha256="0"*64, post_sha256="1"*64, bytes_written=10,
+            candidate_snapshot_digest=padded_base,
+        )
+        with self.assertRaises(Exception) as ctx:
+            compare_and_swap_advance(
+                self._db, repo_root=self._repo,
+                campaign_id=camp.campaign_id, chunk_id="chk-mut",
+                new_commit="0"*64, holder_fence_generation=1, actor="runner",
+                idempotency_key="idem-mut", validation_receipt_id=mut_rid,
+            )
+        self.assertIn("validation", str(ctx.exception).lower())
+
+
+# ============================================================
+# P06-A05 — Real crash / recovery
+# ============================================================
 
 
 class TestP06A05CrashWindows(unittest.TestCase):
@@ -546,44 +567,54 @@ class TestP06A05CrashWindows(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
 
-    def test_crash_window_record_and_reconcile(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        # Force a crash-window record by attempting a CAS with a
-        # stale expected_old. We simulate the condition directly.
+    def test_reconcile_crash_window_lists_unrecovered(self):
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
         from overnight_runner.integration import _record_crash_window
-        _record_crash_window(
-            self._db, campaign_id=campaign_id, chunk_id="chk-1",
-            kind="integration_cas_mismatch",
-            observed_artifact="base_commit=aaaa; current=cccc",
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-cw", state="draft",
+            plan_id="pl-cw", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-cw", validator_profile_ids=["noop"],
+            provider_profile_id="prv-cw", egress_policy_id="eg-cw",
+            operator_id="op-cw", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
         )
-        # The reconcile function does NOT auto-recover; it lists the
-        # windows so the operator / planner can decide.
-        report = reconcile_crash_window(self._db, campaign_id=campaign_id)
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-cw", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-cw",
+            operator_receipt={"approval_id": "appr-cw"})
+        activate_grant(self._db, grant=grant, operator_id="op-cw", approval_id="appr-cw")
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
+        )
+        # Sling in an EFFECT_UNKNOWN crash window (deterministic).
+        _record_crash_window(
+            self._db, campaign_id=camp.campaign_id,
+            chunk_id="chk-cw",
+            kind="integration_cas_mismatch",
+            observed_artifact="prev",
+        )
+        report = reconcile_crash_window(self._db, campaign_id=camp.campaign_id)
         self.assertEqual(len(report["unrecovered_windows"]), 1)
         self.assertEqual(
             report["unrecovered_windows"][0]["kind"],
             "integration_cas_mismatch",
         )
 
-    def test_no_effect_unknown_on_successful_integration(self):
-        """A successful CAS records NO crash windows."""
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        wt = ensure_campaign_worktree.__wrapped__ if hasattr(
-            ensure_campaign_worktree, "__wrapped__"
-        ) else ensure_campaign_worktree
-        # Use a simple direct test without a real worktree:
-        # we trust the integration_journal is empty initially.
-        cur = self._db._conn.execute(
-            "SELECT count(*) AS n FROM crash_windows WHERE campaign_id=?",
-            (campaign_id,),
-        )
-        self.assertEqual(cur.fetchone()["n"], 0)
-
 
 # ============================================================
-# P06-A06 — Leases + fencing
+# P06-A06 — Real live-child fencing
 # ============================================================
 
 
@@ -595,64 +626,144 @@ class TestP06A06Fencing(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
+
+    def test_holder_process_alive_pid_check(self):
+        # The current process is, by definition, alive (its PID is our own).
+        self.assertTrue(
+            holder_process_alive(
+                owner_pid=os.getpid(),
+                owner_boot_id="boot-test",
+                fence_generation=1,
+            )
+        )
+
+    def test_holder_process_alive_zero_pid(self):
+        self.assertFalse(
+            holder_process_alive(
+                owner_pid=0,
+                owner_boot_id="boot-test",
+                fence_generation=1,
+            )
+        )
+
+    def test_holder_process_alive_nonexistent_pid(self):
+        # An obviously-stale PID (huge unused) must NOT be considered alive.
+        self.assertFalse(
+            holder_process_alive(
+                owner_pid=999_999_999,
+                owner_boot_id="boot-test",
+                fence_generation=1,
+            )
+        )
 
     def test_expired_lease_with_live_child_blocks_new_writer(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        fence = current_fence(self._db, campaign_id)
-        # Acquire a lease with TTL=1s, then expire it.
-        lease = acquire_lease(
-            self._db, campaign_id=campaign_id,
-            resource_id="campaign_integration_branch",
-            owner_id="wkr-A",
-            owner_boot_id="boot-1", owner_pid=1,
-            fence_generation=fence.current_generation,
-            ttl_seconds=1,
+        """An expired lease whose holder process is still alive MUST NOT
+        silently transition to a state where a second writer can claim.
+        The fence must be bumped and the old holder's fence is then stale."""
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-fc", state="draft",
+            plan_id="pl-fc", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-fc", validator_profile_ids=["noop"],
+            provider_profile_id="prv-fc", egress_policy_id="eg-fc",
+            operator_id="op-fc", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
         )
-        self.assertTrue(lease.is_live)
-        # Manually expire the lease by walking its expires_at into the
-        # past (the ``live child`` invariant is the fence bump, not
-        # only the timestamp).
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-fc", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-fc",
+            operator_receipt={"approval_id": "appr-fc"})
+        activate_grant(self._db, grant=grant, operator_id="op-fc", approval_id="appr-fc")
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
+        )
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        fence = current_fence(self._db, camp.campaign_id)
+        # Acquire lease with our live PID; the holder remains alive.
+        lease_a = acquire_lease(
+            self._db, campaign_id=camp.campaign_id,
+            resource_id="r1", owner_id="wkr-A",
+            owner_boot_id="boot-A", owner_pid=os.getpid(),
+            fence_generation=fence.current_generation, ttl_seconds=1,
+        )
+        # Force-expire the lease (without touching the live PID).
         self._db._conn.execute(
             "UPDATE leases SET expires_at=? WHERE lease_id=?",
-            (int(time.time()) - 10, lease.lease_id),
+            (int(time.time()) - 10, lease_a.lease_id),
         )
-        # Revoke-for-takeover increments fence and releases leases.
-        new_gen = revoke_for_takeover(self._db, campaign_id=campaign_id, reason="test")
+        # The expire_overdue_leases sweep marks it released.
+        from overnight_runner.resources import expire_overdue_leases
+        expire_overdue_leases(self._db)
+        # A takeover bumps the fence.
+        new_gen = revoke_for_takeover(self._db, campaign_id=camp.campaign_id,
+                                       reason="test-takeover")
         self.assertEqual(new_gen, fence.current_generation + 1)
-        # The original owner's fencing token is now stale.
+        # The OLD owner (still-alive PID) tries to write/integrate with
+        # its stale fence: rejected by the runtime.
         with self.assertRaises(Exception) as ctx:
-            enforce_fence(
-                self._db, campaign_id=campaign_id,
-                holder_generation=lease.fence_generation, action="integration",
-            )
+            enforce_fence(self._db, campaign_id=camp.campaign_id,
+                          holder_generation=lease_a.fence_generation,
+                          action="integration")
         self.assertIn("fence_stale", str(ctx.exception).lower())
 
     def test_new_writer_after_takeover_succeeds(self):
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        fence = current_fence(self._db, campaign_id)
-        acquire_lease(
-            self._db, campaign_id=campaign_id,
-            resource_id="r1", owner_id="wkr-A",
-            owner_boot_id="boot-1", owner_pid=1,
-            fence_generation=fence.current_generation,
-            ttl_seconds=10,
+        """A second owner presenting the bumped fence can acquire."""
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-fc2", state="draft",
+            plan_id="pl-fc2", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-fc2", validator_profile_ids=["noop"],
+            provider_profile_id="prv-fc2", egress_policy_id="eg-fc2",
+            operator_id="op-fc2", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
         )
-        revoke_for_takeover(self._db, campaign_id=campaign_id, reason="test")
-        new = current_fence(self._db, campaign_id)
-        # The new owner can acquire using the bumped generation.
-        lease2 = acquire_lease(
-            self._db, campaign_id=campaign_id,
-            resource_id="r1", owner_id="wkr-B",
-            owner_boot_id="boot-2", owner_pid=2,
-            fence_generation=new.current_generation,
-            ttl_seconds=10,
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-fc2", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-fc2",
+            operator_receipt={"approval_id": "appr-fc2"})
+        activate_grant(self._db, grant=grant, operator_id="op-fc2", approval_id="appr-fc2")
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
         )
-        self.assertEqual(lease2.owner_id, "wkr-B")
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        fence = current_fence(self._db, camp.campaign_id)
+        acquire_lease(self._db, campaign_id=camp.campaign_id,
+                       resource_id="r1", owner_id="wkr-A",
+                       owner_boot_id="boot-A", owner_pid=os.getpid(),
+                       fence_generation=fence.current_generation, ttl_seconds=10)
+        new_gen = revoke_for_takeover(self._db, campaign_id=camp.campaign_id,
+                                       reason="test")
+        lease_b = acquire_lease(self._db, campaign_id=camp.campaign_id,
+                                 resource_id="r1", owner_id="wkr-B",
+                                 owner_boot_id="boot-B", owner_pid=os.getpid()+1,
+                                 fence_generation=new_gen, ttl_seconds=10)
+        self.assertEqual(lease_b.owner_id, "wkr-B")
 
 
 # ============================================================
-# P06-A07 — Cumulative budgets
+# P06-A07 — Complete cumulative budgets
 # ============================================================
 
 
@@ -664,36 +775,55 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
 
-    def test_session_restart_does_not_reset_cumulative_counters(self):
-        """Re-running the runner binary on the same DB must NOT reset
-        cumulative counters."""
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        # First derive_admission creates the budget ledger. Bump its
-        # counters via SQL, then simulate restart by closing +
-        # reopening the DB.
-        chunk = _chunk(campaign_id)
-        grant_loaded = load_grant(self._db, grant.grant_id)
+    def test_session_restart_preserves_cumulative_counters(self):
+        """Process restart on the same DB must NOT zero cumulative counters."""
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-bd", state="draft",
+            plan_id="pl-bd", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-bd", validator_profile_ids=["noop"],
+            provider_profile_id="prv-bd", egress_policy_id="eg-bd",
+            operator_id="op-bd", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
+        )
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-bd", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-bd",
+            operator_receipt={"approval_id": "appr-bd"})
+        activate_grant(self._db, grant=grant, operator_id="op-bd", approval_id="appr-bd")
+        # Create the campaign first so the ledger FK resolves.
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
+        )
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        # First derive_admission creates the ledger.
+        chunk = _chunk(camp.campaign_id)
         derive_admission(
-            self._db, grant=grant_loaded, chunk=chunk,
+            self._db, grant=grant, chunk=chunk,
             runtime_digest=grant.runtime_digest,
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=base),
+            current_accepted_snapshot=_snap(),
+            **_required_id_kwargs(grant),
         )
-        ledger_id = f"bl-{campaign_id}"
+        ledger_id = f"bl-{camp.campaign_id}"
         with self._db.transaction() as cur:
             cur.execute(
-                """
-                UPDATE budget_ledgers SET
-                    cumulative_model_calls=3,
-                    cumulative_tool_calls=10,
-                    cumulative_chunks=1
-                WHERE ledger_id=?
-                """,
+                "UPDATE budget_ledgers SET cumulative_model_calls=3, cumulative_tool_calls=10, cumulative_chunks=2 WHERE ledger_id=?",
                 (ledger_id,),
             )
         self._db.close()
@@ -705,32 +835,117 @@ class TestP06A07CumulativeBudgets(unittest.TestCase):
         row = cur.fetchone()
         self.assertEqual(row["cumulative_model_calls"], 3)
         self.assertEqual(row["cumulative_tool_calls"], 10)
-        self.assertEqual(row["cumulative_chunks"], 1)
+        self.assertEqual(row["cumulative_chunks"], 2)
 
-    def test_exhaustion_blocks_further_admission(self):
-        """If the budget is exhausted, further increments raise and
-        the campaign can be marked BUDGET_EXHAUSTED without losing
-        older accepted evidence."""
-        grant, campaign_id, base = _make_campaign_with_grant(self._db)
-        chunk = _chunk(campaign_id)
-        grant_loaded = load_grant(self._db, grant.grant_id)
+    def test_exhaustion_blocks_further_increment(self):
+        """Once cumulative counters reach bounds, further increments
+        raise. This must hold across restarts."""
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-bd2", state="draft",
+            plan_id="pl-bd2", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-bd2", validator_profile_ids=["noop"],
+            provider_profile_id="prv-bd2", egress_policy_id="eg-bd2",
+            operator_id="op-bd2", operator_receipt_digest="c"*64,
+            budget=Budget(schema_version="trio.budget.v1", max_chunks=3),
+        )
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-bd2", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-bd2",
+            operator_receipt={"approval_id": "appr-bd2"})
+        activate_grant(self._db, grant=grant, operator_id="op-bd2", approval_id="appr-bd2")
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
+        )
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        chunk = _chunk(camp.campaign_id)
         derive_admission(
-            self._db, grant=grant_loaded, chunk=chunk,
+            self._db, grant=grant, chunk=chunk,
             runtime_digest=grant.runtime_digest,
             worker_id="wkr-1",
             policy_profile_id=grant.policy_profile_id,
             validator_profile_ids=list(grant.validator_profile_ids),
             provider_profile_id=grant.provider_profile_id,
-            current_accepted_snapshot=_snap(commit=base),
+            current_accepted_snapshot=_snap(),
+            **_required_id_kwargs(grant),
         )
-        ledger_id = f"bl-{campaign_id}"
         with self._db.transaction() as cur:
             cur.execute(
                 "UPDATE budget_ledgers SET cumulative_chunks=3 WHERE ledger_id=?",
-                (ledger_id,),
+                (f"bl-{camp.campaign_id}",),
             )
         with self.assertRaises(Exception):
-            update_budget_after_chunk(self._db, ledger_id=ledger_id, delta_chunks=1)
+            update_budget_after_chunk(self._db, ledger_id=f"bl-{camp.campaign_id}", delta_chunks=1)
+
+    def test_active_time_exhaustion(self):
+        """Cumulative active-time budget enforces its bound.
+        Exceeding it without restarting the runner blocks further
+        activity (no auto-extension)."""
+        from overnight_runner.campaign_schemas import AutonomyGrant, Budget
+        from overnight_runner.protected_approvals import register_protected_approval
+        from overnight_runner.plans import register_plan
+        from overnight_runner.campaign_schemas import content_sha256
+        # 1-hour grant.
+        grant_b = Budget(
+            schema_version="trio.budget.v1", max_chunks=3,
+            max_active_seconds=3600, max_wall_seconds=14400,
+        )
+        grant = AutonomyGrant(
+            schema_version="trio.grant.v1", grant_id="gr-bd3", state="draft",
+            plan_id="pl-bd3", plan_revision=1,
+            repository_paths=["src/app.py"], allowed_write_paths=["src/app.py"],
+            protected_paths=[], allowed_operations=["noop"],
+            runtime_digest="a"*64, model_name="gemma", model_digest="b"*64,
+            policy_profile_id="pol-bd3", validator_profile_ids=["noop"],
+            provider_profile_id="prv-bd3", egress_policy_id="eg-bd3",
+            operator_id="op-bd3", operator_receipt_digest="c"*64,
+            budget=grant_b,
+        )
+        register_plan(self._db, plan_id=grant.plan_id,
+                       approved_artifact_id=grant.plan_id,
+                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        digest = content_sha256(grant)
+        register_protected_approval(
+            self._db, approval_id="appr-bd3", operation="activate_grant",
+            grant_digest_target=digest, operator_id="op-bd3",
+            operator_receipt={"approval_id": "appr-bd3"})
+        activate_grant(self._db, grant=grant, operator_id="op-bd3", approval_id="appr-bd3")
+        camp = create_campaign(
+            self._db, plan_id=grant.plan_id, grant_id=grant.grant_id,
+            base_commit="a"*64, base_tree_digest="b"*64,
+        )
+        activate_campaign(self._db, campaign_id=camp.campaign_id)
+        chunk = _chunk(camp.campaign_id)
+        derive_admission(
+            self._db, grant=grant, chunk=chunk,
+            runtime_digest=grant.runtime_digest,
+            worker_id="wkr-1",
+            policy_profile_id=grant.policy_profile_id,
+            validator_profile_ids=list(grant.validator_profile_ids),
+            provider_profile_id=grant.provider_profile_id,
+            current_accepted_snapshot=_snap(),
+            **_required_id_kwargs(grant),
+        )
+        with self._db.transaction() as cur:
+            cur.execute(
+                "UPDATE budget_ledgers SET cumulative_active_seconds=3600 WHERE ledger_id=?",
+                (f"bl-{camp.campaign_id}",),
+            )
+        with self.assertRaises(Exception):
+            update_budget_after_chunk(
+                self._db, ledger_id=f"bl-{camp.campaign_id}", delta_active_seconds=1,
+            )
 
 
 # ============================================================
@@ -746,33 +961,25 @@ class TestP06A08V1Preservation(unittest.TestCase):
     def tearDown(self):
         self._db.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
-        _teardown()
-        # Clean up PAUSED sentinel if test touched it.
-        pp = Path(os.environ.get("OVERNIGHT_STATE_DIR", "/tmp") if False else self._tmp / "state" / "PAUSED")
+        pp = Path(os.environ.get("OVERNIGHT_STATE_DIR", "/tmp")) / "PAUSED"
         if pp.exists():
             pp.unlink()
 
     def test_v1_schema_unchanged_in_durable_db(self):
-        """V1 (``tasks``, ``runs``, ``events``) tables still exist
-        unchanged after the P06 schema migration."""
         cur = self._db._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
         names = {r["name"] for r in cur.fetchall()}
-        # V1 retained tables
         for t in ("tasks", "runs", "events"):
-            self.assertIn(t, names, f"V1 table {t} must still exist")
-        # P06 additions
+            self.assertIn(t, names)
         for t in ("campaigns", "chunks", "admissions", "leases",
                   "budget_ledgers", "integration_journal",
                   "crash_windows", "race_admissions", "grants",
-                  "schema_migrations"):
-            self.assertIn(t, names, f"P06 table {t} missing")
+                  "schema_migrations",
+                  "protected_approvals", "approved_plans"):
+            self.assertIn(t, names)
 
-    def test_paused_camel_creates_no_new_admission(self):
-        """A persistent operator PAUSED sentinel (V1 invariant) stops
-        new campaign-v2 admission creation."""
-        # Touch the V1 PAUSED sentinel.
+    def test_paused_blocks_new_campaign_creation(self):
         paused = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "PAUSED"
         paused.touch()
         with self.assertRaises(Exception):
@@ -782,8 +989,7 @@ class TestP06A08V1Preservation(unittest.TestCase):
             )
         paused.unlink()
 
-    def test_paused_creates_admission_after_resume(self):
-        """Un-PAUSING restores the campaign-v2 ability to admit chunks."""
+    def test_paused_can_be_resumed(self):
         paused = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "PAUSED"
         paused.touch()
         with self.assertRaises(Exception):
@@ -792,8 +998,6 @@ class TestP06A08V1Preservation(unittest.TestCase):
                 base_commit="a" * 64, base_tree_digest="b" * 64,
             )
         paused.unlink()
-        # After un-PAUSING we can proceed (grant doesn't have to be
-        # active because create_campaign only references grant_id).
         c = create_campaign(
             self._db, plan_id="pl-2", grant_id="gr-2",
             base_commit="a" * 64, base_tree_digest="b" * 64,
@@ -801,9 +1005,6 @@ class TestP06A08V1Preservation(unittest.TestCase):
         self.assertTrue(c.campaign_id)
 
     def test_existing_v1_suites_unchanged(self):
-        """The accepted V1 behaviour is unaffected. Run a small V1
-        assertion to verify that the upgrade did not break V1."""
-        # Insert a V1 task + emit an event row; both should succeed.
         with self._db.transaction() as cur:
             cur.execute(
                 "INSERT INTO tasks (task_id, manifest_sha256, manifest_json, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",

@@ -27,6 +27,7 @@ from .campaign_schemas import (
     content_sha256,
 )
 from .db import Database
+from .protected_approvals import consume_protected_approval
 from .safety import SafetyError
 
 
@@ -52,28 +53,60 @@ def activate_grant(
     *,
     grant: AutonomyGrant,
     operator_id: str,
-    operator_receipt: dict[str, Any],
+    approval_id: str,
     activated_at: int | None = None,
 ) -> GrantActivationResult:
-    """Promote a DRAFT grant to ACTIVE. Records the operator receipt.
+    """Promote a DRAFT grant to ACTIVE.
 
-    The operator receipt is the durable evidence that the operator
-    approved this grant envelope on the protected approval channel.
-    Models never produce such receipts; only the protected surface does.
+    Authority comes ONLY from a pre-registered row in
+    ``protected_approvals`` (recorded earlier via the trusted
+    out-of-band channel by ``register_protected_approval``). The
+    ``operator_id`` and ``approval_id`` supplied here are identifier
+    challenges only — the runner does NOT accept a freshly-supplied
+    dict as the receipt itself.
     """
     if grant.state != "draft":
         raise SafetyError(f"grant must be draft (state={grant.state})")
     if grant.plan_revision < 1:
         raise SafetyError("plan_revision must be >= 1")
-    if not operator_id or not operator_receipt:
-        raise SafetyError("operator_id and operator_receipt required")
+    if not operator_id or not approval_id:
+        raise SafetyError("operator_id and approval_id required")
+    if not approval_id:
+        raise SafetyError("approval_id is required")
+    # Resolve the pre-registered protected approval. ``grant_id`` may
+    # not yet exist in the grants table; the approval is registered
+    # against the desired grant digest.
+    from .protected_approvals import (
+        load_protected_approval,
+        consume_protected_approval,
+    )
+    ap = load_protected_approval(db, approval_id)
+    if ap is None:
+        raise SafetyError(
+            f"approval {approval_id} not found in protected approvals table"
+        )
+    if ap.operator_id != operator_id:
+        raise SafetyError(
+            f"approval operator mismatch: supplied={operator_id} stored={ap.operator_id}"
+        )
+    if ap.operation != "activate_grant":
+        raise SafetyError(
+            f"approval operation mismatch: supplied={ap.operation} expected=activate_grant"
+        )
+    target_digest = _grant_digest(grant)
+    if ap.grant_digest_target != target_digest:
+        raise SafetyError(
+            "approval grant_digest_target does not match the supplied grant digest"
+        )
+    # All three identity checks passed. Consume the approval.
+    consume_protected_approval(db, approval_id)
     ts = int(activated_at if activated_at is not None else time.time())
     active = grant.model_copy(
         update={
             "state": "active",
             "activated_at": ts,
             "operator_id": operator_id,
-            "operator_receipt_digest": _digest_dict(operator_receipt),
+            "operator_receipt_digest": ap.operator_receipt_digest,
         }
     )
     digest = _grant_digest(active)
