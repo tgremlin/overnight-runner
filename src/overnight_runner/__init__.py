@@ -1,2 +1,46 @@
-"""overnight-runner: bounded local-model work pipeline."""
-__version__ = "0.1.0"
+"""overnight_runner public surface (V1 + campaign-v2 additively)."""
+from .campaign_schemas import (
+    AdmissionReceipt,
+    AutonomyGrant,
+    Budget,
+    BudgetLedgerEntry,
+    CampaignEvent,
+    CampaignRecord,
+    CampaignState,
+    ChunkSpec,
+    ChunkState,
+    FenceState,
+    Lease,
+    RepoSnapshot,
+    WorkPackage,
+    WorkPackageState,
+)
+from . import (
+    admission,
+    grants,
+    integration,
+    receipts,
+    resources,
+)
+
+__all__ = [
+    "admission",
+    "grants",
+    "integration",
+    "receipts",
+    "resources",
+    "AdmissionReceipt",
+    "AutonomyGrant",
+    "Budget",
+    "BudgetLedgerEntry",
+    "CampaignEvent",
+    "CampaignRecord",
+    "CampaignState",
+    "ChunkSpec",
+    "ChunkState",
+    "FenceState",
+    "Lease",
+    "RepoSnapshot",
+    "WorkPackage",
+    "WorkPackageState",
+]

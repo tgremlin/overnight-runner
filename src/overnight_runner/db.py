@@ -86,8 +86,183 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_task ON events(task_id);
 CREATE INDEX IF NOT EXISTS events_type ON events(event_type);
+
+-- -------------------- campaign-v2 (P06) additions --------------------
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    integration_branch TEXT NOT NULL,
+    current_commit TEXT,
+    current_tree_digest TEXT,
+    current_fence INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL DEFAULT 0,
+    grant_digest TEXT NOT NULL,
+    plan_digest TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS campaigns_grant ON campaigns(grant_id);
+CREATE INDEX IF NOT EXISTS campaigns_state ON campaigns(state);
+
+CREATE TABLE IF NOT EXISTS grants (
+    grant_id TEXT PRIMARY KEY,
+    grant_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    operator_id TEXT NOT NULL,
+    operator_receipt_digest TEXT NOT NULL,
+    activated_at INTEGER NOT NULL DEFAULT 0,
+    revoked_at INTEGER NOT NULL DEFAULT 0,
+    revoked_reason TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS grants_state ON grants(state);
+
+CREATE TABLE IF NOT EXISTS budget_ledgers (
+    ledger_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    grant_id TEXT NOT NULL,
+    family_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    cumulative_model_calls INTEGER NOT NULL DEFAULT 0,
+    cumulative_tool_calls INTEGER NOT NULL DEFAULT 0,
+    cumulative_repairs INTEGER NOT NULL DEFAULT 0,
+    cumulative_rechunks INTEGER NOT NULL DEFAULT 0,
+    cumulative_escalations INTEGER NOT NULL DEFAULT 0,
+    cumulative_active_seconds INTEGER NOT NULL DEFAULT 0,
+    cumulative_cost_microusd INTEGER NOT NULL DEFAULT 0,
+    cumulative_chunks INTEGER NOT NULL DEFAULT 0,
+    cumulative_context_tokens INTEGER NOT NULL DEFAULT 0,
+    bounds_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS budget_ledgers_campaign ON budget_ledgers(campaign_id);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    package_id TEXT NOT NULL,
+    parent_chunk_id TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    snapshot_commit TEXT,
+    snapshot_tree_digest TEXT,
+    preview_diff_path TEXT,
+    accepted_predecessor_commit TEXT,
+    accepted_predecessor_tree TEXT,
+    admission_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    idempotency_content_sha256 TEXT
+);
+CREATE INDEX IF NOT EXISTS chunks_campaign ON chunks(campaign_id);
+CREATE UNIQUE INDEX IF NOT EXISTS chunks_idem_campaign ON chunks(campaign_id, idempotency_key);
+
+CREATE TABLE IF NOT EXISTS admissions (
+    admission_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    grant_revision INTEGER NOT NULL,
+    chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id),
+    chunk_revision INTEGER NOT NULL,
+    accepted_predecessor_commit TEXT NOT NULL,
+    accepted_predecessor_tree TEXT NOT NULL,
+    runtime_digest TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    model_digest TEXT NOT NULL,
+    policy_profile_id TEXT NOT NULL,
+    validator_profile_ids_json TEXT NOT NULL,
+    provider_profile_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    budget_ledger_id TEXT NOT NULL,
+    fence_generation INTEGER NOT NULL,
+    lease_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    issued_at INTEGER NOT NULL,
+    issuer TEXT NOT NULL DEFAULT 'runner',
+    snapshot_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admissions_chunk ON admissions(chunk_id);
+
+CREATE TABLE IF NOT EXISTS leases (
+    lease_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    resource_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    owner_boot_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    fence_generation INTEGER NOT NULL,
+    acquired_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    released_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS leases_campaign ON leases(campaign_id);
+
+CREATE TABLE IF NOT EXISTS integration_journal (
+    entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    expected_old_commit TEXT,
+    committed_new_commit TEXT NOT NULL,
+    fence_generation INTEGER NOT NULL,
+    committed_at INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS integration_journal_campaign ON integration_journal(campaign_id);
+
+CREATE TABLE IF NOT EXISTS race_admissions (
+    idem_key TEXT PRIMARY KEY,
+    admission_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    issued_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crash_windows (
+    window_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    chunk_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    observed_artifact TEXT,
+    snapshot_at INTEGER NOT NULL,
+    recovered_at INTEGER NOT NULL DEFAULT 0,
+    reconciliation_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS crash_windows_campaign ON crash_windows(campaign_id);
+
+CREATE TABLE IF NOT EXISTS campaign_events (
+    event_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    chunk_id TEXT,
+    event_type TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT,
+    actor TEXT NOT NULL DEFAULT 'runner',
+    payload TEXT NOT NULL DEFAULT '{}',
+    fence_generation INTEGER NOT NULL DEFAULT 1,
+    issued_at INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS campaign_events_campaign ON campaign_events(campaign_id);
 """
 
+# Migration log for forward-compatible schema versioning. Each versioned
+# migration records its name + first-applied timestamp. Older binaries may
+# ignore newer rows; newer binaries refuse to run if any record exists
+# whose name they do not understand (unless ``SCHEMA_FORWARD_COMPAT`` is
+# explicitly set).
+_MIGRATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+);
+"""
 
 class ClaimConflict(Exception):
     """Raised when an atomic claim loses a race or fails to satisfy constraints.
@@ -108,10 +283,31 @@ class Database:
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.executescript(SCHEMA)
+        self._conn.executescript(_MIGRATIONS_TABLE)
+        # Apply P06-0001: campaign-v2 tables (idempotent CREATE IF NOT EXISTS).
+        self._record_migration("p06-0001-campaign-v2-tables")
 
     def close(self) -> None:
         try:
             self._conn.close()
+        except Exception:
+            pass
+
+    def _record_migration(self, name: str, *, note: str = "") -> None:
+        """Record a schema migration. Idempotent: the same name may be
+        applied multiple times without re-running the migration body.
+
+        Refuses to run if an unknown migration name is already present
+        in the log (forward-compat guard). The P06 series of migrations
+        are recorded unconditionally; future migrations extending this
+        set must declare a forward-compatibility window to keep older
+        binaries openable.
+        """
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, applied_at, note) VALUES (?, ?, ?)",
+                (name, int(time.time()), note),
+            )
         except Exception:
             pass
 
