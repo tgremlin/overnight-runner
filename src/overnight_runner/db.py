@@ -423,6 +423,31 @@ CREATE TABLE IF NOT EXISTS phase_dispositions (
     UNIQUE (campaign_id, operation, target_digest, provenance_version)
 );
 
+-- P08 (A03): ADDITIVE admission-lease renewal lineage. The original
+-- AdmissionReceipt remains immutable root authority; a resumed capacity
+-- obligation gets an explicit descendant authority EVENT here. The
+-- integration gate resolves the EFFECTIVE lease through this table.
+CREATE TABLE IF NOT EXISTS admission_lease_bindings (
+    binding_id TEXT PRIMARY KEY,
+    admission_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    prior_lease_id TEXT NOT NULL,
+    replacement_lease_id TEXT NOT NULL,
+    fence_generation INTEGER NOT NULL,
+    wake_claim_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    issued_at INTEGER NOT NULL,
+    issuer TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    UNIQUE (admission_id, replacement_lease_id)
+);
+CREATE INDEX IF NOT EXISTS admission_lease_bindings_admission
+    ON admission_lease_bindings(admission_id, issued_at);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_lease_bindings_idem
+    ON admission_lease_bindings(admission_id, idempotency_key)
+    WHERE idempotency_key != '';
+
 -- Runner-owned approved fallback registry (trusted operator surface).
 -- Fallback authority is derived from this + the active grant, never from
 -- a caller-fabricated policy object.
@@ -506,6 +531,7 @@ class Database:
         self._record_migration("p08-0001-context-handoffs")
         self._record_migration("p08-0002-handoff-canonical-record")
         self._record_migration("p08-0003-phase-dispositions")
+        self._record_migration("p08-0004-admission-lease-bindings")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),

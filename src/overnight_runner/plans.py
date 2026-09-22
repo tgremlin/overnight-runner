@@ -107,6 +107,25 @@ def load_plan_digest(db: Database, plan_id: str) -> str | None:
     return row["plan_digest"]
 
 
+def load_plan_artifact_id(db: Database, plan_id: str) -> str | None:
+    """Return the APPROVED SOURCE ARTIFACT identity for ``plan_id``.
+
+    P08 (A01): ``approved_artifact_id`` is how the runner records WHICH
+    external plan artifact (e.g. the canonical P04 master-plan artifact)
+    the reduced package/criterion projection was derived from. It is
+    deliberately separate from ``plan_digest``, which is the runner's own
+    projection digest and is NOT the full source-plan digest.
+    """
+    cur = db._conn.execute(
+        "SELECT approved_artifact_id FROM approved_plans WHERE plan_id=?",
+        (plan_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return row["approved_artifact_id"]
+
+
 def load_plan(db: Database, plan_id: str) -> dict[str, Any] | None:
     cur = db._conn.execute(
         "SELECT payload FROM approved_plans WHERE plan_id=?",
@@ -171,6 +190,7 @@ __all__ = [
     "register_plan",
     "load_plan",
     "load_plan_digest",
+    "load_plan_artifact_id",
     "lookup_plan_criteria",
     "plan_criterion_ids_for_package",
     "assert_chunk_criteria_approved",

@@ -381,6 +381,38 @@ def _validate_admission_lease_lineage(
             f"integration gate: admission {admission_id!r} has no lease; "
             f"refusing integration"
         )
+    # P08 (A03): resolve the EFFECTIVE lease through runner authority. The
+    # immutable admission lease is the root authority; a resumed capacity
+    # obligation may instead be authorized by the latest runner-issued
+    # renewal binding. A caller-supplied lease id can never substitute
+    # (this function accepts no lease argument).
+    from .admission_lease import effective_admission_lease_id
+    lease_id, lease_source = effective_admission_lease_id(db, admission_id)
+    if not lease_id:
+        raise SafetyError(
+            f"integration gate: admission {admission_id!r} has no effective "
+            f"lease; refusing integration"
+        )
+    if lease_source == "renewal":
+        brow = db._conn.execute(
+            "SELECT campaign_id, chunk_id, admission_id, issuer "
+            "FROM admission_lease_bindings WHERE admission_id=? "
+            "AND replacement_lease_id=? ORDER BY issued_at DESC LIMIT 1",
+            (admission_id, lease_id),
+        ).fetchone()
+        if brow is None or (brow["issuer"] or "") != "runner":
+            raise SafetyError(
+                f"integration gate: admission {admission_id!r} renewal lease "
+                f"{lease_id!r} is not a runner-issued binding; refusing"
+            )
+        if (brow["campaign_id"] or "") != campaign_id or (
+            brow["chunk_id"] or ""
+        ) != chunk_id:
+            raise SafetyError(
+                f"integration gate: renewal binding for {lease_id!r} does not "
+                f"bind admission {admission_id!r} to campaign/chunk "
+                f"{campaign_id!r}/{chunk_id!r}"
+            )
     lrow = db._conn.execute(
         "SELECT campaign_id, released_at, expires_at, fence_generation "
         "FROM leases WHERE lease_id=?",
