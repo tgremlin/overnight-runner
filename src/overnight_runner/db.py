@@ -401,7 +401,9 @@ CREATE TABLE IF NOT EXISTS context_handoffs (
     snapshot_commit TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
-    state TEXT NOT NULL DEFAULT 'OPEN'
+    state TEXT NOT NULL DEFAULT 'OPEN',
+    canonical_json TEXT NOT NULL DEFAULT '',   -- canonical P05 HandoffRecord
+    canonical_digest TEXT NOT NULL DEFAULT ''  -- digest of the canonical record
 );
 CREATE INDEX IF NOT EXISTS context_handoffs_campaign ON context_handoffs(campaign_id);
 
@@ -486,6 +488,7 @@ class Database:
         self._record_migration("p07-0003-claim-execution-and-wait-model")
         self._record_migration("p07-0004-bootstrap-handshake")
         self._record_migration("p08-0001-context-handoffs")
+        self._record_migration("p08-0002-handoff-canonical-record")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),
@@ -501,6 +504,8 @@ class Database:
             ("wake_claims", "result_path", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "bootstrap_path", "TEXT NOT NULL DEFAULT ''"),
             ("wake_jobs", "linked_job_id", "TEXT NOT NULL DEFAULT ''"),
+            ("context_handoffs", "canonical_json", "TEXT NOT NULL DEFAULT ''"),
+            ("context_handoffs", "canonical_digest", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
             ("chunks", "required_validator_ids_json", "TEXT NOT NULL DEFAULT '[]'"),

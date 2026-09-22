@@ -56,6 +56,7 @@ from overnight_runner.p08 import (
     evaluate_phase_completion,
     load_handoff,
     record_handoff,
+    record_phase_gate,
 )
 from overnight_runner.plans import load_plan_digest, register_plan
 from overnight_runner.protected_approvals import register_protected_approval
@@ -551,26 +552,41 @@ class TestP08A04Adversarial(_Harness):
 # ============================================================
 
 class TestP08A05Completion(_Harness):
-    def test_completion_requires_integration_and_gate(self):
+    def test_completion_requires_integration_and_protected_gate(self):
         self._one_chunk(1)
-        # A. queue empty (no pending work) but required chunk 2 missing.
+        # A. required integration criterion missing (queue empty is not enough).
         r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
                                       required_chunks=["chk-1", "chk-2"])
         self.assertFalse(r["complete"])
         self.assertEqual(r["state"], "INCOMPLETE")
         self.assertIn("chk-2", r["missing_criteria"])
-        # B. technical criteria met but human gate outstanding.
+        # B. all technical criteria met but NO protected human disposition.
         r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
-                                      required_chunks=["chk-1"],
-                                      human_gate_required=True, human_gate_satisfied=False)
+                                      required_chunks=["chk-1"], human_gate_required=True)
         self.assertFalse(r["complete"])
         self.assertEqual(r["state"], "AWAITING_HUMAN")
-        # C. all technical + gate satisfied.
+        self.assertEqual(r["reason"], "no_protected_human_disposition")
+        # C. a FORGED/untrusted disposition (wrong operation/target) is ignored.
+        register_protected_approval(
+            self._db, approval_id="forged-gate", operation="activate_grant",
+            grant_digest_target="f" * 64, operator_id="attacker",
+            operator_receipt={"approval_id": "forged-gate"})
         r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
-                                      required_chunks=["chk-1"],
-                                      human_gate_required=True, human_gate_satisfied=True)
+                                      required_chunks=["chk-1"], human_gate_required=True)
+        self.assertFalse(r["complete"])
+        self.assertEqual(r["state"], "AWAITING_HUMAN")
+        # D. a VALID protected operator disposition through the trusted channel.
+        record_phase_gate(self._db, campaign_id=self._camp.campaign_id,
+                          operator_id="op-1", approval_id="pg-1")
+        r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
+                                      required_chunks=["chk-1"], human_gate_required=True)
         self.assertTrue(r["complete"])
         self.assertEqual(r["state"], "ELIGIBLE_FOR_PHASE_COMPLETION")
+        # One-shot: the disposition is consumed; a repeat is AWAITING_HUMAN again.
+        r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
+                                      required_chunks=["chk-1"], human_gate_required=True)
+        self.assertFalse(r["complete"])
+        self.assertEqual(r["reason"], "human_disposition_already_consumed")
 
 
 # ============================================================
