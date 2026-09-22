@@ -40,9 +40,50 @@ for p in (RUNNER_SRC, FORGE_WORKERS):
 
 
 def _blocked(reason: str, detail: str = "") -> int:
+    """Emit a BLOCKED record AND return a NON-ZERO exit code.
+
+    A blocked/failed canary MUST NOT look like shell success; consumers must
+    inspect both the process status and the ``gate`` field.
+    """
     print(json.dumps({"schema_version": "trio.p08-real-canary.v1",
                       "gate": "BLOCKED", "reason": reason, "detail": detail}, indent=2))
-    return 0
+    return 3
+
+
+def _git_identity(root: str) -> dict:
+    """Real provenance for a source root: sha, branch, clean/dirty state."""
+    try:
+        sha = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        branch = subprocess.run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        # Tracked-file drift only; untracked build/local artifacts do not mark
+        # the source tree dirty.
+        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain",
+                                "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        return {"root": root, "sha": "", "branch": "", "clean": False, "error": str(e)}
+    return {"root": root, "sha": sha, "branch": branch,
+            "clean": dirty == "", "dirty_entries": dirty.splitlines()[:20]}
+
+
+def _provenance() -> dict:
+    """Exact source revisions actually exercised, with verification.
+
+    Runner source = the tree CONTAINING this script (the P08 candidate).
+    Forge worker source = an explicitly supplied P08_FORGE_ROOT (pinned).
+    """
+    runner_root = str(Path(__file__).resolve().parent.parent)
+    forge_root = os.environ.get("P08_FORGE_ROOT", "/home/tgremlin/work/trio-game-forge-p5")
+    return {
+        "runner": {**_git_identity(runner_root),
+                   "package_path": str(Path(runner_root) / "src" / "overnight_runner")},
+        "forge_worker": {**_git_identity(forge_root),
+                         "package_path": str(Path(forge_root) / "python" / "trio-workers" / "trio_workers")},
+        "python": sys.version.split()[0],
+        "executable": sys.executable,
+    }
 
 
 def main() -> int:
@@ -57,6 +98,19 @@ def main() -> int:
         return _blocked("worker_runtime_unavailable", f"{type(e).__name__}: {e}")
 
     ev: dict = {"schema_version": "trio.p08-real-canary.v1"}
+
+    # 0) SOURCE PROVENANCE — prove which revisions were actually exercised.
+    prov = _provenance()
+    ev["source_provenance"] = prov
+    if not prov["runner"]["sha"] or not prov["forge_worker"]["sha"]:
+        return _blocked("source_provenance_unverifiable",
+                        f"runner={prov['runner']} forge={prov['forge_worker']}")
+    if not prov["runner"]["clean"]:
+        ev["gate"] = "BLOCKED"
+        return _blocked("runner_source_dirty", str(prov["runner"]["dirty_entries"]))
+    if not prov["forge_worker"]["clean"]:
+        return _blocked("forge_worker_source_dirty",
+                        str(prov["forge_worker"]["dirty_entries"]))
 
     # 1) REAL qualification of the accepted local model.
     profile = qualify_ollama(model_name="qwen3.8:27b")
@@ -113,25 +167,47 @@ def main() -> int:
         (repo / "src").mkdir()
         (repo / "tests").mkdir()
         (repo / "src" / "app.py").write_text("def value():\n    return 1\n")
-        (repo / "tests" / "test_app.py").write_text(
-            "from src.app import value\n\n\ndef test_value():\n    assert value() == 1\n")
+        # PROTECTED immutable acceptance test: expresses the DESIRED behavior
+        # (double() == 2), so it FAILS at baseline before implementation. It is
+        # outside the worker's write authority (see policy below).
+        protected_test = (
+            "from src.app import value, double\n\n\n"
+            "def test_value():\n    assert value() == 1\n\n\n"
+            "def test_double():\n    assert double() == 2\n")
+        (repo / "tests" / "test_app.py").write_text(protected_test)
         (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n.pytest_cache/\n")
         (repo / "tests" / "__init__.py").write_text("")
         git_commit_all(repo, "init")
         ev["pilot_repo"] = str(repo)
         ev["pilot_base_commit"] = git_head(repo)
+        protected_test_sha = sha256_file(repo / "tests" / "test_app.py")
+        ev["protected_test_sha256"] = protected_test_sha
+        ev["protected_test_path"] = "tests/test_app.py"
 
         # 3) Plan + grant bound to the REAL qualified model identity.
         register_plan(db, plan_id="pl-canary", approved_artifact_id="pl-canary",
                       work_package_criterion_ids={"pkg-1": {"crit-1"}})
+        # Canonical runtime_digest derivation FROM the qualification record
+        # (no opaque synthetic digest). The exact derivation is persisted.
+        canonical_runtime = json.dumps({
+            "runtime": profile.runtime_version, "python": profile.python_version,
+            "model_name": profile.model_name, "model_digest": profile.model_digest,
+            "tokenizer_id": profile.tokenizer_id, "tokenizer_digest": profile.tokenizer_digest,
+            "chat_template_digest": profile.chat_template_digest,
+        }, sort_keys=True, separators=(",", ":"))
+        runtime_digest = hashlib.sha256(canonical_runtime.encode()).hexdigest()
+        ev["runtime_digest"] = runtime_digest
+        ev["runtime_digest_derivation"] = (
+            "sha256(canonical_json({runtime,python,model_name,model_digest,"
+            "tokenizer_id,tokenizer_digest,chat_template_digest}))")
         grant = AutonomyGrant(
             schema_version="trio.grant.v1", grant_id="gr-canary", state="draft",
             plan_id="pl-canary", plan_revision=1,
             approved_plan_digest=load_plan_digest(db, "pl-canary"),
             repository_paths=["src/app.py", "tests/test_app.py"],
-            allowed_write_paths=["src/app.py", "tests/test_app.py"],
-            protected_paths=[], allowed_operations=["noop"],
-            runtime_digest=hashlib.sha256(profile.runtime_version.encode()).hexdigest(),
+            allowed_write_paths=["src/app.py"],
+            protected_paths=["tests/test_app.py"], allowed_operations=["noop"],
+            runtime_digest=runtime_digest,
             model_name=profile.model_name or "qwen3.8:27b",
             model_digest=profile.model_digest or "0" * 64,
             policy_profile_id="pol-1", validator_profile_ids=["python_compile", "pytest"],
@@ -224,9 +300,12 @@ def main() -> int:
                             snapshot_digest=git_worktree_sha(wt), contract_tokens=0,
                             context_tokens=0, max_attempts=1)
         new_text = (original.rstrip("\n") + "\n\n\ndef double():\n    return value() * 2\n")
+        ev["worker_policy"] = {"allowed_write_paths": sorted(policy.allowed_write_paths),
+                               "protected_test_paths": sorted(policy.protected_test_paths)}
         prompt = (
-            "You are a bounded worker. Your ONLY task: add a new function `double()` "
-            "to src/app.py that returns value() * 2, leaving existing code unchanged.\n"
+            "You are a bounded worker. TASK INTENT: implement `double()` in src/app.py "
+            "so the PROTECTED test suite passes (it requires double() == 2). "
+            "You may modify src/app.py ONLY; you MUST NOT modify any test file.\n"
             "You MUST do exactly this sequence:\n"
             "1. call propose_patch with path='src/app.py', "
             f"expected_sha256='{expected_sha}', and new_text set to EXACTLY the following "
@@ -249,6 +328,23 @@ def main() -> int:
         new_content = (wt / "src" / "app.py").read_text()
         if "def double()" not in new_content:
             return _blocked("candidate_missing_expected_change", new_content[:200])
+        # Broker-only + scope integrity: the source changed, the PROTECTED test
+        # did NOT (the worker had no write authority over it).
+        if sha256_file(wt / "src" / "app.py") == sha256_file(repo / "src" / "app.py"):
+            return _blocked("candidate_unchanged", "broker apply did not change the source")
+        if sha256_file(wt / "tests" / "test_app.py") != protected_test_sha:
+            return _blocked("protected_test_mutated",
+                            "the protected acceptance test changed — refusing")
+        # Semantic check on the ACTUAL candidate source (not name presence).
+        sem = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0,'.'); from src.app import value, double; "
+             "assert value()==1 and double()==2, (value(), double()); print('semantics OK')"],
+            cwd=str(wt), capture_output=True, text=True)
+        ev["semantic_check"] = {"ok": sem.returncode == 0, "stdout": sem.stdout.strip(),
+                                "stderr": sem.stderr.strip()[-400:]}
+        if sem.returncode != 0:
+            return _blocked("candidate_semantics_failed", sem.stderr.strip()[-400:])
 
         # 6) Commit the candidate, run REAL validators, integrate.
         subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)

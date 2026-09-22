@@ -57,6 +57,7 @@ from overnight_runner.p08 import (
     load_handoff,
     record_handoff,
     record_phase_gate,
+    phase_disposition,
 )
 from overnight_runner.plans import load_plan_digest, register_plan
 from overnight_runner.protected_approvals import register_protected_approval
@@ -582,11 +583,37 @@ class TestP08A05Completion(_Harness):
                                       required_chunks=["chk-1"], human_gate_required=True)
         self.assertTrue(r["complete"])
         self.assertEqual(r["state"], "ELIGIBLE_FOR_PHASE_COMPLETION")
-        # One-shot: the disposition is consumed; a repeat is AWAITING_HUMAN again.
-        r = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
-                                      required_chunks=["chk-1"], human_gate_required=True)
-        self.assertFalse(r["complete"])
-        self.assertEqual(r["reason"], "human_disposition_already_consumed")
+        # ... persisted durably.
+        disp = phase_disposition(self._db, self._camp.campaign_id)
+        self.assertIsNotNone(disp)
+        self.assertEqual(disp["approval_id"], "pg-1")
+        # D2. repeated evaluation stays satisfied (idempotent; NO re-consumption).
+        r2 = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
+                                       required_chunks=["chk-1"], human_gate_required=True)
+        self.assertTrue(r2["complete"])
+        self.assertEqual(r2["state"], "ELIGIBLE_FOR_PHASE_COMPLETION")
+        self.assertEqual(phase_disposition(self._db, self._camp.campaign_id)["disposition_id"],
+                         disp["disposition_id"])
+        # E. a disposition for campaign A cannot satisfy campaign B.
+        grant_b = _grant(self._db, plan_id="pl-b", grant_id="gr-b")
+        camp_b = create_campaign(self._db, plan_id=grant_b.plan_id,
+                                 grant_id=grant_b.grant_id, base_commit=self._base,
+                                 base_tree_digest="b" * 64)
+        activate_campaign(self._db, campaign_id=camp_b.campaign_id)
+        rB = evaluate_phase_completion(self._db, campaign_id=camp_b.campaign_id,
+                                       required_chunks=[], human_gate_required=True)
+        self.assertFalse(rB["complete"])
+        self.assertEqual(rB["state"], "AWAITING_HUMAN")
+        # F. changed target/version cannot reuse the old disposition: drop the
+        # durable disposition (simulating a version bump) -> the consumed
+        # one-shot approval must NOT re-satisfy.
+        with self._db.transaction() as cur:
+            cur.execute("DELETE FROM phase_dispositions WHERE campaign_id=?",
+                        (self._camp.campaign_id,))
+        rF = evaluate_phase_completion(self._db, campaign_id=self._camp.campaign_id,
+                                       required_chunks=["chk-1"], human_gate_required=True)
+        self.assertFalse(rF["complete"])
+        self.assertEqual(rF["state"], "AWAITING_HUMAN")
 
 
 # ============================================================

@@ -407,6 +407,22 @@ CREATE TABLE IF NOT EXISTS context_handoffs (
 );
 CREATE INDEX IF NOT EXISTS context_handoffs_campaign ON context_handoffs(campaign_id);
 
+-- P08: durable phase-completion DISPOSITION. A valid protected operator
+-- approval is consumed ONCE and recorded here so repeated phase-completion
+-- evaluation stays satisfied (idempotent) without re-consuming a one-shot.
+CREATE TABLE IF NOT EXISTS phase_dispositions (
+    disposition_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_digest TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    operator_id TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    accepted_at INTEGER NOT NULL,
+    provenance_version TEXT NOT NULL,
+    UNIQUE (campaign_id, operation, target_digest, provenance_version)
+);
+
 -- Runner-owned approved fallback registry (trusted operator surface).
 -- Fallback authority is derived from this + the active grant, never from
 -- a caller-fabricated policy object.
@@ -489,6 +505,7 @@ class Database:
         self._record_migration("p07-0004-bootstrap-handshake")
         self._record_migration("p08-0001-context-handoffs")
         self._record_migration("p08-0002-handoff-canonical-record")
+        self._record_migration("p08-0003-phase-dispositions")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),

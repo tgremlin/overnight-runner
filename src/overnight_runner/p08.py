@@ -111,6 +111,16 @@ def record_phase_gate(db: Database, *, campaign_id: str, operator_id: str,
         operator_id=operator_id, operator_receipt={"approval_id": approval_id})
 
 
+def phase_disposition(db: Database, campaign_id: str) -> dict[str, Any] | None:
+    """Return the durable accepted phase disposition for a campaign, if any."""
+    row = db._conn.execute(
+        "SELECT * FROM phase_dispositions WHERE campaign_id=? AND operation=? "
+        "AND disposition='accepted' ORDER BY accepted_at DESC LIMIT 1",
+        (campaign_id, PHASE_GATE_OPERATION),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def evaluate_phase_completion(
     db: Database, *, campaign_id: str, required_chunks: Iterable[str],
     human_gate_required: bool = False,
@@ -146,33 +156,73 @@ def evaluate_phase_completion(
             "missing_criteria": missing,
         }
     if human_gate_required:
-        # Resolve the gate from the TRUSTED protected-operator channel only.
-        row = db._conn.execute(
-            "SELECT approval_id, operator_id, consumed_at FROM protected_approvals "
-            "WHERE operation=? AND grant_digest_target=? ORDER BY issued_at DESC LIMIT 1",
-            (PHASE_GATE_OPERATION, phase_gate_target(campaign_id)),
+        target = phase_gate_target(campaign_id)
+        # (1) A durable disposition already recorded for this EXACT
+        # campaign+operation+target+version keeps the gate satisfied
+        # IDEMPOTENTLY (no re-consumption of the one-shot approval).
+        existing = db._conn.execute(
+            "SELECT * FROM phase_dispositions WHERE campaign_id=? AND operation=? "
+            "AND target_digest=? AND provenance_version=? AND disposition='accepted'",
+            (campaign_id, PHASE_GATE_OPERATION, target, PHASE_COMPLETION_VERSION),
         ).fetchone()
-        if row is None:
-            return {
-                "schema_version": PHASE_COMPLETION_VERSION,
-                "campaign_id": campaign_id,
-                "complete": False,
-                "state": "AWAITING_HUMAN",
-                "reason": "no_protected_human_disposition",
-                "missing_criteria": [],
-            }
-        if int(row["consumed_at"]) != 0:
-            return {
-                "schema_version": PHASE_COMPLETION_VERSION,
-                "campaign_id": campaign_id,
-                "complete": False,
-                "state": "AWAITING_HUMAN",
-                "reason": "human_disposition_already_consumed",
-                "missing_criteria": [],
-            }
-        # Consume the one-shot disposition (auditable) and proceed.
-        from .protected_approvals import consume_protected_approval
-        consume_protected_approval(db, row["approval_id"])
+        if existing is None:
+            # (2) Otherwise resolve a valid protected operator approval and
+            # atomically consume + persist the durable disposition.
+            ap = db._conn.execute(
+                "SELECT approval_id, operator_id, consumed_at FROM protected_approvals "
+                "WHERE operation=? AND grant_digest_target=? ORDER BY issued_at DESC LIMIT 1",
+                (PHASE_GATE_OPERATION, target),
+            ).fetchone()
+            if ap is None:
+                return {
+                    "schema_version": PHASE_COMPLETION_VERSION,
+                    "campaign_id": campaign_id,
+                    "complete": False,
+                    "state": "AWAITING_HUMAN",
+                    "reason": "no_protected_human_disposition",
+                    "missing_criteria": [],
+                }
+            if int(ap["consumed_at"]) != 0:
+                # Already consumed but NO disposition for this target/version
+                # (e.g. changed target) -> cannot reuse.
+                return {
+                    "schema_version": PHASE_COMPLETION_VERSION,
+                    "campaign_id": campaign_id,
+                    "complete": False,
+                    "state": "AWAITING_HUMAN",
+                    "reason": "protected_disposition_already_consumed_or_target_changed",
+                    "missing_criteria": [],
+                }
+            from .protected_approvals import consume_protected_approval
+            now = int(time.time())
+            with db.transaction() as cur:
+                # One-shot consume (atomic compare-and-set inside the txn).
+                cur.execute(
+                    "UPDATE protected_approvals SET consumed_at=? "
+                    "WHERE approval_id=? AND consumed_at=0",
+                    (now, ap["approval_id"]),
+                )
+                if cur.rowcount != 1:
+                    return {
+                        "schema_version": PHASE_COMPLETION_VERSION,
+                        "campaign_id": campaign_id,
+                        "complete": False,
+                        "state": "AWAITING_HUMAN",
+                        "reason": "protected_disposition_race_lost",
+                        "missing_criteria": [],
+                    }
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO phase_dispositions (
+                        disposition_id, campaign_id, operation, target_digest,
+                        approval_id, operator_id, disposition, accepted_at,
+                        provenance_version
+                    ) VALUES (?,?,?,?,?,?, 'accepted', ?, ?)
+                    """,
+                    (f"pd-{uuid.uuid4().hex[:16]}", campaign_id, PHASE_GATE_OPERATION,
+                     target, ap["approval_id"], ap["operator_id"], now,
+                     PHASE_COMPLETION_VERSION),
+                )
     return {
         "schema_version": PHASE_COMPLETION_VERSION,
         "campaign_id": campaign_id,
@@ -187,5 +237,5 @@ __all__ = [
     "PHASE_COMPLETION_VERSION", "HANDOFF_VERSION", "BOUNDED_CONTEXT_FIELDS",
     "record_handoff", "load_handoff", "bound_context", "close_handoff",
     "evaluate_phase_completion", "PHASE_GATE_OPERATION", "phase_gate_target",
-    "record_phase_gate",
+    "record_phase_gate", "phase_disposition",
 ]
