@@ -193,13 +193,13 @@ class HeartbeatBase(unittest.TestCase):
     def test_c_different_process_start_time_rejected(self):
         with self.assertRaises(SafetyError) as ctx:
             self._hb(owner_start_time="999999")
-        self.assertIn("start-time mismatch", str(ctx.exception))
+        self.assertIn("start time does not match the stored lease identity", str(ctx.exception))
 
     # ------------------------------------------------------------------ D
     def test_d_different_boot_id_rejected(self):
         with self.assertRaises(SafetyError) as ctx:
             self._hb(owner_boot_id="boot-other")
-        self.assertIn("boot id mismatch", str(ctx.exception))
+        self.assertIn("boot id does not match the stored lease identity", str(ctx.exception))
 
     # ------------------------------------------------------------------ E
     def test_e_stale_fence_rejected(self):
@@ -363,6 +363,87 @@ class HeartbeatBase(unittest.TestCase):
         with self.assertRaises(SafetyError) as ctx:
             self._hb(extend_seconds=100000)
         self.assertIn("bounded maximum", str(ctx.exception))
+
+    # --------------------------------------------------- independent identity
+    def test_n_stored_identity_matches_caller_but_not_live_proc(self):
+        """Stored == caller text, but the LIVE /proc identity differs -> reject."""
+        with self.db.transaction() as cur:
+            cur.execute("UPDATE leases SET owner_start_time='424242' WHERE lease_id=?",
+                        (self.lease_id,))
+        with self.assertRaises(SafetyError) as ctx:
+            self._hb(owner_start_time="424242")  # caller repeats the stored value
+        self.assertIn("not alive or no longer carries", str(ctx.exception))
+        self.assertEqual(len(list_heartbeats(self.db, self.admission.admission_id)), 0)
+
+    def test_o_dead_holder_pid_rejected(self):
+        dead = 999999
+        with self.db.transaction() as cur:
+            cur.execute("UPDATE leases SET owner_pid=?, owner_start_time='1' "
+                        "WHERE lease_id=?", (dead, self.lease_id))
+        with self.assertRaises(SafetyError) as ctx:
+            self._hb(owner_pid=dead, owner_start_time="1")
+        self.assertIn("not alive", str(ctx.exception))
+        self.assertEqual(len(list_heartbeats(self.db, self.admission.admission_id)), 0)
+
+    def test_p_omitting_identity_does_not_disable_verification(self):
+        # Omission still succeeds ONLY because the live identity matches...
+        res = self._hb(owner_start_time=None, owner_boot_id="")
+        self.assertEqual(res["issuer"], "runner")
+        # ...and omission cannot rescue a lease whose stored identity is stale.
+        with self.db.transaction() as cur:
+            cur.execute("UPDATE leases SET owner_start_time='31337' WHERE lease_id=?",
+                        (self.lease_id,))
+        with self.assertRaises(SafetyError):
+            self._hb(owner_start_time=None, owner_boot_id="")
+
+    def test_q_fence_change_during_extension_rejected(self):
+        """A fence move AFTER the pre-checks but INSIDE the write transaction."""
+        import unittest.mock as mock
+        import overnight_runner.runtime as rt
+        calls = {"n": 0}
+
+        def paused_twice():
+            calls["n"] += 1
+            if calls["n"] == 2:  # the in-transaction re-check
+                self.db._conn.execute(
+                    "UPDATE campaigns SET current_fence=current_fence+1 "
+                    "WHERE campaign_id=?", (self.camp.campaign_id,))
+            return False
+
+        with mock.patch.object(rt, "is_paused", paused_twice):
+            with self.assertRaises(SafetyError) as ctx:
+                self._hb()
+        self.assertIn("fence moved", str(ctx.exception))
+        self.assertEqual(len(list_heartbeats(self.db, self.admission.admission_id)), 0)
+
+    def test_r_grant_revoked_before_transactional_extension(self):
+        revoke_grant(self.db, grant_id="gr-hb", reason="revoke")
+        with self.assertRaises(SafetyError):
+            self._hb()
+        self.assertEqual(len(list_heartbeats(self.db, self.admission.admission_id)), 0)
+
+    def test_s_release_race_rejected(self):
+        import unittest.mock as mock
+        import overnight_runner.admission as adm
+        real = adm.check_campaign_continuation
+
+        def release_then_check(db, *, campaign_id, grant_id, now=None):
+            db._conn.execute("UPDATE leases SET released_at=1 WHERE lease_id=?",
+                             (self.lease_id,))
+            return real(db, campaign_id=campaign_id, grant_id=grant_id, now=now)
+
+        with mock.patch.object(adm, "check_campaign_continuation", release_then_check):
+            with self.assertRaises(SafetyError) as ctx:
+                self._hb()
+        self.assertTrue(
+            "released concurrently" in str(ctx.exception)
+            or "changed concurrently" in str(ctx.exception), str(ctx.exception))
+        self.assertEqual(len(list_heartbeats(self.db, self.admission.admission_id)), 0)
+        # No duplicate authority was created.
+        n = self.db._conn.execute(
+            "SELECT COUNT(*) AS n FROM leases WHERE campaign_id=?",
+            (self.camp.campaign_id,)).fetchone()["n"]
+        self.assertEqual(n, 1)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,10 @@ import uuid
 from typing import Any
 
 from .db import Database
-from .resources import acquire_lease, current_fence, load_lease_row
+from .resources import (
+    acquire_lease, current_fence, holder_process_alive, load_lease_row,
+    process_identity,
+)
 from .safety import SafetyError
 
 ISSUER = "runner"
@@ -338,7 +341,7 @@ def heartbeat_admission_lease(
     admission_grant_id = arow["grant_id"] or ""
     admission_fence = int(arow["fence_generation"])
 
-    lease_id, source = effective_admission_lease_id(db, admission_id)
+    lease_id, _source = effective_admission_lease_id(db, admission_id)
     if not lease_id:
         raise SafetyError(
             f"heartbeat refused: admission {admission_id!r} has no effective lease"
@@ -352,11 +355,80 @@ def heartbeat_admission_lease(
         if ex is not None:
             return _heartbeat_result(db, _binding_row_to_dict(ex), replay=True)
 
-    lease = load_lease_row(db, lease_id)
+    lease = load_lease_row(db, lease_id) if lease_id else None
     if lease is None:
         raise SafetyError(
             f"heartbeat refused: effective lease {lease_id!r} not found"
         )
+
+    # ----- INDEPENDENT PROCESS-IDENTITY VERIFICATION -------------------------
+    # The caller's word is never sufficient: the runner proves the CURRENT host
+    # process still carries the identity the lease was minted with. Process
+    # identity logic lives in resources.py and is reused, not duplicated.
+    stored_pid = int(lease["owner_pid"] or 0)
+    stored_boot = lease["owner_boot_id"] or ""
+    stored_start = lease.get("owner_start_time") or ""
+    if stored_pid <= 0:
+        raise SafetyError(
+            f"heartbeat refused: lease {lease_id!r} has no stored owner pid; "
+            f"cannot verify holder identity"
+        )
+    if (lease["owner_id"] or "") != owner_id:
+        raise SafetyError(
+            f"heartbeat refused: owner_id mismatch (lease={lease['owner_id']!r} "
+            f"caller={owner_id!r})"
+        )
+    if stored_pid != int(owner_pid):
+        raise SafetyError(
+            f"heartbeat refused: owner_pid mismatch "
+            f"(lease={stored_pid} caller={owner_pid})"
+        )
+    # Caller-supplied legacy values may only CONFIRM the durable identity;
+    # an empty/omitted value must not disable verification on Linux.
+    if owner_start_time is not None and owner_start_time != stored_start:
+        raise SafetyError(
+            "heartbeat refused: supplied start time does not match the stored "
+            "lease identity"
+        )
+    if owner_boot_id and stored_boot and owner_boot_id != stored_boot:
+        raise SafetyError(
+            "heartbeat refused: supplied boot id does not match the stored "
+            "lease identity"
+        )
+    # Live identity, resolved from the host (never from the caller).
+    live = process_identity(stored_pid)
+    live_boot = live.get("boot_id") or ""
+    live_start = live.get("start_time") or ""
+    if not holder_process_alive(
+        owner_pid=stored_pid, owner_boot_id=stored_boot,
+        fence_generation=int(lease["fence_generation"]),
+        owner_start_time=stored_start or None,
+    ):
+        raise SafetyError(
+            f"heartbeat refused: holder process {stored_pid} is not alive or no "
+            f"longer carries the lease identity"
+        )
+    if stored_start:
+        if not live_start or live_start != stored_start:
+            raise SafetyError(
+                "heartbeat refused: live /proc start time does not match the "
+                "stored lease identity"
+            )
+    elif live_start:
+        # The lease predates process-identity minting; the host can prove
+        # identity now, so a missing stored start time is not verifiable.
+        raise SafetyError(
+            "heartbeat refused: lease has no stored process start time while "
+            "the host can report one; refusing unverifiable extension"
+        )
+    if stored_boot:
+        if not live_boot or live_boot != stored_boot:
+            raise SafetyError(
+                "heartbeat refused: live host boot id does not match the stored "
+                "lease identity"
+            )
+
+    # ----- LEASE STATE -------------------------------------------------------
     if int(lease["released_at"]) != 0:
         raise SafetyError(
             f"heartbeat refused: lease {lease_id!r} was released; a released lease "
@@ -368,39 +440,16 @@ def heartbeat_admission_lease(
             f"heartbeat refused: lease {lease_id!r} already expired at {expires_at} "
             f"(now={now})"
         )
-    # Exact holder identity — never PID alone.
-    if (lease["owner_id"] or "") != owner_id:
-        raise SafetyError(
-            f"heartbeat refused: owner_id mismatch (lease={lease['owner_id']!r} "
-            f"caller={owner_id!r})"
-        )
-    if int(lease["owner_pid"]) != int(owner_pid):
-        raise SafetyError(
-            f"heartbeat refused: owner_pid mismatch "
-            f"(lease={lease['owner_pid']} caller={owner_pid})"
-        )
-    if owner_start_time is not None and (
-        (lease.get("owner_start_time") or "") != owner_start_time
-    ):
-        raise SafetyError(
-            "heartbeat refused: process start-time mismatch (pid reuse?)"
-        )
-    if owner_boot_id and (lease["owner_boot_id"] or "") not in ("", owner_boot_id):
-        raise SafetyError("heartbeat refused: boot id mismatch")
     if int(lease["fence_generation"]) != admission_fence:
         raise SafetyError(
             f"heartbeat refused: lease fence={lease['fence_generation']} != "
             f"admission fence={admission_fence}"
         )
-    # Current campaign fence must still equal the admission fence.
-    cur_fence = current_fence(db, campaign_id)
-    if cur_fence.current_generation != admission_fence:
+    if current_fence(db, campaign_id).current_generation != admission_fence:
         raise SafetyError(
-            f"heartbeat refused: campaign fence={cur_fence.current_generation} != "
-            f"admission fence={admission_fence}"
+            f"heartbeat refused: campaign fence != admission fence "
+            f"{admission_fence}"
         )
-    # Campaign continuation authority: blocking state, ACTIVE/non-revoked/
-    # non-expired grant, trusted budget headroom, PAUSED sentinel.
     crow = db._conn.execute(
         "SELECT grant_id FROM campaigns WHERE campaign_id=?", (campaign_id,)
     ).fetchone()
@@ -412,13 +461,12 @@ def heartbeat_admission_lease(
             f"heartbeat refused: campaign grant {current_grant_id!r} != admission "
             f"grant {admission_grant_id!r}"
         )
-    from .admission import check_campaign_continuation
-    check_campaign_continuation(
-        db, campaign_id=campaign_id, grant_id=current_grant_id, now=now
-    )
+    # PAUSED is filesystem state: check immediately before the write lock...
+    from .runtime import is_paused
+    if is_paused():
+        raise SafetyError("heartbeat refused: PAUSED sentinel present")
 
-    # Bounded extension: never beyond the acquisition-anchored maximum, and
-    # never a shrink.
+    # Bounded extension: anchored on acquisition, never a shrink.
     acquired_at = int(lease["acquired_at"])
     cap = acquired_at + int(max_effective_seconds)
     new_expires = min(expires_at + int(extend_seconds), cap)
@@ -427,7 +475,53 @@ def heartbeat_admission_lease(
             f"heartbeat refused: lease {lease_id!r} is already at the bounded "
             f"maximum (expires_at={expires_at}, cap={cap})"
         )
+
+    # ----- ATOMIC EXTENSION --------------------------------------------------
+    # All DB-owned consequential state is re-read and re-validated INSIDE the
+    # write transaction, using the SAME authoritative continuation predicates
+    # (no divergent second policy).
+    from .admission import check_campaign_continuation
     with db.transaction() as cur:
+        # ...and again after acquiring the write lock.
+        if is_paused():
+            raise SafetyError("heartbeat refused: PAUSED sentinel present")
+        lrow = cur.execute(
+            "SELECT released_at, expires_at, fence_generation, owner_pid, "
+            "owner_id, owner_boot_id, owner_start_time FROM leases WHERE lease_id=?",
+            (lease_id,),
+        ).fetchone()
+        if lrow is None:
+            raise SafetyError(f"heartbeat refused: lease {lease_id!r} vanished")
+        if int(lrow["released_at"]) != 0:
+            raise SafetyError(
+                "heartbeat refused: lease was released concurrently"
+            )
+        if int(lrow["expires_at"]) != expires_at:
+            raise SafetyError(
+                "heartbeat refused: lease expiry changed concurrently"
+            )
+        if (lrow["owner_id"] or "") != owner_id or int(lrow["owner_pid"]) != stored_pid:
+            raise SafetyError("heartbeat refused: lease holder changed concurrently")
+        if int(lrow["fence_generation"]) != admission_fence:
+            raise SafetyError("heartbeat refused: lease fence changed concurrently")
+        crow2 = cur.execute(
+            "SELECT grant_id, current_fence FROM campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        if crow2 is None:
+            raise SafetyError("heartbeat refused: campaign vanished")
+        if int(crow2["current_fence"]) != admission_fence:
+            raise SafetyError(
+                "heartbeat refused: campaign fence moved before the extension "
+                "committed"
+            )
+        if (crow2["grant_id"] or "") != admission_grant_id:
+            raise SafetyError("heartbeat refused: campaign grant changed concurrently")
+        # Authoritative continuation predicate (state/grant/budget) re-run under
+        # the write lock on the same connection.
+        check_campaign_continuation(
+            db, campaign_id=campaign_id, grant_id=current_grant_id, now=now
+        )
         cur.execute(
             "UPDATE leases SET expires_at=? WHERE lease_id=? AND released_at=0 "
             "AND expires_at=?",
@@ -449,9 +543,8 @@ def heartbeat_admission_lease(
             """,
             (
                 heartbeat_id, admission_id, campaign_id, chunk_id, lease_id,
-                expires_at, new_expires, admission_fence, owner_id, int(owner_pid),
-                lease["owner_boot_id"] or "", lease.get("owner_start_time") or "",
-                reason, now, ISSUER, idempotency_key,
+                expires_at, new_expires, admission_fence, owner_id, stored_pid,
+                stored_boot, stored_start, reason, now, ISSUER, idempotency_key,
             ),
         )
     row = db._conn.execute(
