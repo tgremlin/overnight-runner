@@ -389,6 +389,22 @@ CREATE TABLE IF NOT EXISTS wake_claims (
 );
 CREATE INDEX IF NOT EXISTS wake_claims_campaign ON wake_claims(campaign_id);
 
+-- P08: durable context handoff (session/context boundary) bound to the
+-- same campaign/chunk/job/grant/budget identities.
+CREATE TABLE IF NOT EXISTS context_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    job_id TEXT NOT NULL DEFAULT '',
+    grant_id TEXT NOT NULL DEFAULT '',
+    budget_ledger_id TEXT NOT NULL DEFAULT '',
+    snapshot_commit TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'OPEN'
+);
+CREATE INDEX IF NOT EXISTS context_handoffs_campaign ON context_handoffs(campaign_id);
+
 -- Runner-owned approved fallback registry (trusted operator surface).
 -- Fallback authority is derived from this + the active grant, never from
 -- a caller-fabricated policy object.
@@ -469,6 +485,7 @@ class Database:
         self._record_migration("p07-0002-capacity-outcomes-wake-claims-fallbacks")
         self._record_migration("p07-0003-claim-execution-and-wait-model")
         self._record_migration("p07-0004-bootstrap-handshake")
+        self._record_migration("p08-0001-context-handoffs")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),
