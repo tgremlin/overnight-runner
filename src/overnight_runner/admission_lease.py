@@ -31,6 +31,11 @@ from .safety import SafetyError
 
 ISSUER = "runner"
 REASON_CAPACITY_RESUME = "capacity_resume"
+REASON_LONG_OPERATION = "long_operation"
+
+# OV-01L: bounded maximum effective admission lifetime for normal execution.
+# A heartbeat may never create permanent authority.
+MAX_EFFECTIVE_SECONDS = 900
 
 
 def _binding_row_to_dict(row: Any) -> dict[str, Any]:
@@ -276,11 +281,215 @@ def _result(db: Database, binding: dict[str, Any], *, replay: bool) -> dict[str,
     }
 
 
+def list_heartbeats(db: Database, admission_id: str) -> list[dict[str, Any]]:
+    """Return the durable heartbeat (extension) events, oldest first."""
+    rows = db._conn.execute(
+        "SELECT * FROM admission_lease_heartbeats WHERE admission_id=? "
+        "ORDER BY issued_at ASC, rowid ASC",
+        (admission_id,),
+    ).fetchall()
+    return [_binding_row_to_dict(r) for r in rows]
+
+
+def heartbeat_admission_lease(
+    db: Database,
+    *,
+    admission_id: str,
+    owner_id: str,
+    owner_pid: int,
+    owner_start_time: str | None = None,
+    owner_boot_id: str = "",
+    extend_seconds: int,
+    max_effective_seconds: int = MAX_EFFECTIVE_SECONDS,
+    reason: str = REASON_LONG_OPERATION,
+    idempotency_key: str = "",
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Extend the CURRENT effective admission lease for the SAME holder.
+
+    This is NOT capacity-resume authority and it is NOT a new admission:
+
+      * no caller-supplied replacement lease is accepted;
+      * it does NOT mint an admission, change the grant, change the fence,
+        reset budget, or revive a released/expired lease;
+      * it only extends the lease the admission currently resolves to, and
+        only while that lease is still valid;
+      * the original admission lineage (row + receipt) is left untouched.
+
+    Fails closed on: released lease, expired lease, changed owner identity
+    (id / boot id / pid / process start time), stale fence, changed grant,
+    paused campaign, or exhausted budget.
+    """
+    now = int(now if now is not None else time.time())
+    if extend_seconds <= 0:
+        raise SafetyError("heartbeat refused: extend_seconds must be > 0")
+
+    arow = db._conn.execute(
+        "SELECT c.campaign_id AS campaign_id, a.chunk_id AS chunk_id, "
+        "a.grant_id AS grant_id, a.fence_generation AS fence_generation "
+        "FROM admissions a JOIN chunks c ON c.chunk_id = a.chunk_id "
+        "WHERE a.admission_id=?",
+        (admission_id,),
+    ).fetchone()
+    if arow is None:
+        raise SafetyError(f"heartbeat refused: admission {admission_id!r} not found")
+    campaign_id = arow["campaign_id"] or ""
+    chunk_id = arow["chunk_id"] or ""
+    admission_grant_id = arow["grant_id"] or ""
+    admission_fence = int(arow["fence_generation"])
+
+    lease_id, source = effective_admission_lease_id(db, admission_id)
+    if not lease_id:
+        raise SafetyError(
+            f"heartbeat refused: admission {admission_id!r} has no effective lease"
+        )
+    if idempotency_key:
+        ex = db._conn.execute(
+            "SELECT * FROM admission_lease_heartbeats WHERE admission_id=? "
+            "AND idempotency_key=?",
+            (admission_id, idempotency_key),
+        ).fetchone()
+        if ex is not None:
+            return _heartbeat_result(db, _binding_row_to_dict(ex), replay=True)
+
+    lease = load_lease_row(db, lease_id)
+    if lease is None:
+        raise SafetyError(
+            f"heartbeat refused: effective lease {lease_id!r} not found"
+        )
+    if int(lease["released_at"]) != 0:
+        raise SafetyError(
+            f"heartbeat refused: lease {lease_id!r} was released; a released lease "
+            f"can not be revived"
+        )
+    expires_at = int(lease["expires_at"])
+    if expires_at > 0 and expires_at <= now:
+        raise SafetyError(
+            f"heartbeat refused: lease {lease_id!r} already expired at {expires_at} "
+            f"(now={now})"
+        )
+    # Exact holder identity — never PID alone.
+    if (lease["owner_id"] or "") != owner_id:
+        raise SafetyError(
+            f"heartbeat refused: owner_id mismatch (lease={lease['owner_id']!r} "
+            f"caller={owner_id!r})"
+        )
+    if int(lease["owner_pid"]) != int(owner_pid):
+        raise SafetyError(
+            f"heartbeat refused: owner_pid mismatch "
+            f"(lease={lease['owner_pid']} caller={owner_pid})"
+        )
+    if owner_start_time is not None and (
+        (lease.get("owner_start_time") or "") != owner_start_time
+    ):
+        raise SafetyError(
+            "heartbeat refused: process start-time mismatch (pid reuse?)"
+        )
+    if owner_boot_id and (lease["owner_boot_id"] or "") not in ("", owner_boot_id):
+        raise SafetyError("heartbeat refused: boot id mismatch")
+    if int(lease["fence_generation"]) != admission_fence:
+        raise SafetyError(
+            f"heartbeat refused: lease fence={lease['fence_generation']} != "
+            f"admission fence={admission_fence}"
+        )
+    # Current campaign fence must still equal the admission fence.
+    cur_fence = current_fence(db, campaign_id)
+    if cur_fence.current_generation != admission_fence:
+        raise SafetyError(
+            f"heartbeat refused: campaign fence={cur_fence.current_generation} != "
+            f"admission fence={admission_fence}"
+        )
+    # Campaign continuation authority: blocking state, ACTIVE/non-revoked/
+    # non-expired grant, trusted budget headroom, PAUSED sentinel.
+    crow = db._conn.execute(
+        "SELECT grant_id FROM campaigns WHERE campaign_id=?", (campaign_id,)
+    ).fetchone()
+    if crow is None:
+        raise SafetyError(f"heartbeat refused: campaign {campaign_id!r} not registered")
+    current_grant_id = crow["grant_id"] or ""
+    if current_grant_id != admission_grant_id:
+        raise SafetyError(
+            f"heartbeat refused: campaign grant {current_grant_id!r} != admission "
+            f"grant {admission_grant_id!r}"
+        )
+    from .admission import check_campaign_continuation
+    check_campaign_continuation(
+        db, campaign_id=campaign_id, grant_id=current_grant_id, now=now
+    )
+
+    # Bounded extension: never beyond the acquisition-anchored maximum, and
+    # never a shrink.
+    acquired_at = int(lease["acquired_at"])
+    cap = acquired_at + int(max_effective_seconds)
+    new_expires = min(expires_at + int(extend_seconds), cap)
+    if new_expires <= expires_at:
+        raise SafetyError(
+            f"heartbeat refused: lease {lease_id!r} is already at the bounded "
+            f"maximum (expires_at={expires_at}, cap={cap})"
+        )
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE leases SET expires_at=? WHERE lease_id=? AND released_at=0 "
+            "AND expires_at=?",
+            (new_expires, lease_id, expires_at),
+        )
+        if cur.rowcount != 1:
+            raise SafetyError(
+                f"heartbeat refused: lease {lease_id!r} changed concurrently"
+            )
+        heartbeat_id = f"albh-{uuid.uuid4().hex[:16]}"
+        cur.execute(
+            """
+            INSERT INTO admission_lease_heartbeats (
+                heartbeat_id, admission_id, campaign_id, chunk_id, lease_id,
+                prior_expires_at, new_expires_at, fence_generation, owner_id,
+                owner_pid, owner_boot_id, owner_start_time, reason, issued_at,
+                issuer, idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                heartbeat_id, admission_id, campaign_id, chunk_id, lease_id,
+                expires_at, new_expires, admission_fence, owner_id, int(owner_pid),
+                lease["owner_boot_id"] or "", lease.get("owner_start_time") or "",
+                reason, now, ISSUER, idempotency_key,
+            ),
+        )
+    row = db._conn.execute(
+        "SELECT * FROM admission_lease_heartbeats WHERE heartbeat_id=?",
+        (heartbeat_id,),
+    ).fetchone()
+    return _heartbeat_result(db, _binding_row_to_dict(row), replay=False)
+
+
+def _heartbeat_result(db: Database, hb: dict[str, Any], *, replay: bool) -> dict[str, Any]:
+    lease = load_lease_row(db, hb["lease_id"]) or {}
+    return {
+        "heartbeat_id": hb["heartbeat_id"],
+        "admission_id": hb["admission_id"],
+        "campaign_id": hb["campaign_id"],
+        "chunk_id": hb["chunk_id"],
+        "lease_id": hb["lease_id"],
+        "lease_source": "renewal" if list_bindings(db, hb["admission_id"]) else "original",
+        "prior_expires_at": int(hb["prior_expires_at"]),
+        "new_expires_at": int(hb["new_expires_at"]),
+        "fence_generation": int(hb["fence_generation"]),
+        "issued_at": int(hb["issued_at"]),
+        "issuer": hb["issuer"],
+        "reason": hb["reason"],
+        "idempotent_replay": replay,
+        "lease_acquired_at": int(lease.get("acquired_at", 0)),
+    }
+
+
 __all__ = [
     "ISSUER",
     "REASON_CAPACITY_RESUME",
+    "REASON_LONG_OPERATION",
+    "MAX_EFFECTIVE_SECONDS",
     "refresh_admission_lease_for_resume",
+    "heartbeat_admission_lease",
     "effective_admission_lease_id",
     "load_binding",
     "list_bindings",
+    "list_heartbeats",
 ]

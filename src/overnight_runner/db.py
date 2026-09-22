@@ -448,6 +448,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS admission_lease_bindings_idem
     ON admission_lease_bindings(admission_id, idempotency_key)
     WHERE idempotency_key != '';
 
+-- OV-01L: durable audit of bounded admission-lease HEARTBEATS. A heartbeat
+-- extends the CURRENT effective lease for the SAME owner without minting a
+-- new admission, changing the grant/fence, or resetting budget. The original
+-- admission lineage stays visible on the (unmodified) admission row.
+CREATE TABLE IF NOT EXISTS admission_lease_heartbeats (
+    heartbeat_id TEXT PRIMARY KEY,
+    admission_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    prior_expires_at INTEGER NOT NULL,
+    new_expires_at INTEGER NOT NULL,
+    fence_generation INTEGER NOT NULL,
+    owner_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_boot_id TEXT NOT NULL DEFAULT '',
+    owner_start_time TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    issued_at INTEGER NOT NULL,
+    issuer TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS admission_lease_heartbeats_admission
+    ON admission_lease_heartbeats(admission_id, issued_at);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_lease_heartbeats_idem
+    ON admission_lease_heartbeats(admission_id, idempotency_key)
+    WHERE idempotency_key != '';
+
 -- Runner-owned approved fallback registry (trusted operator surface).
 -- Fallback authority is derived from this + the active grant, never from
 -- a caller-fabricated policy object.
@@ -532,6 +560,7 @@ class Database:
         self._record_migration("p08-0002-handoff-canonical-record")
         self._record_migration("p08-0003-phase-dispositions")
         self._record_migration("p08-0004-admission-lease-bindings")
+        self._record_migration("ov01l-0001-admission-lease-heartbeats")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),
