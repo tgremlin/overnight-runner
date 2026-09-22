@@ -380,7 +380,11 @@ CREATE TABLE IF NOT EXISTS wake_claims (
     heartbeat_at INTEGER NOT NULL DEFAULT 0,
     finished_at INTEGER NOT NULL DEFAULT 0,
     result TEXT NOT NULL DEFAULT '',
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    exec_token TEXT NOT NULL DEFAULT '',   -- ownership token for the start reservation
+    boot_id TEXT NOT NULL DEFAULT '',      -- host boot id of the owned process
+    start_time TEXT NOT NULL DEFAULT '',   -- /proc start-time identity
+    result_path TEXT NOT NULL DEFAULT ''   -- durable worker result record
 );
 CREATE INDEX IF NOT EXISTS wake_claims_campaign ON wake_claims(campaign_id);
 
@@ -472,6 +476,10 @@ class Database:
             ("wake_claims", "finished_at", "INTEGER NOT NULL DEFAULT 0"),
             ("wake_claims", "result", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_claims", "exec_token", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "boot_id", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "start_time", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "result_path", "TEXT NOT NULL DEFAULT ''"),
             ("wake_jobs", "linked_job_id", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),

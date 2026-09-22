@@ -31,6 +31,7 @@ from overnight_runner.p07 import (
     ADAPTER_SCHEMA,
     ALLOWED_CONTROL_OPERATIONS,
     CapacityKind,
+    ExecutionStartConflict,
     FallbackPolicy,
     FallbackProfile,
     _resolve_with_policy,
@@ -501,11 +502,16 @@ class TestProjection(_Base):
 
 class TestWakeExecution(_Base):
     def _alive(self, pid: int) -> bool:
+        # Zombie-aware: a defunct (unreaped) child is DEAD.
+        if pid <= 0:
+            return False
         try:
-            os.kill(pid, 0)
-            return True
+            with open(f"/proc/{pid}/stat", "r") as f:
+                line = f.read()
         except OSError:
             return False
+        rest = line.rsplit(")", 1)[-1].split()
+        return bool(rest) and rest[0] not in ("Z", "X")
 
     def _budget_snapshot(self):
         rows = self._db._conn.execute(
@@ -602,11 +608,16 @@ class TestWakeExecution(_Base):
 
 class TestProcessSupervision(_Base):
     def _alive(self, pid: int) -> bool:
+        # Zombie-aware: a defunct (unreaped) child is DEAD.
+        if pid <= 0:
+            return False
         try:
-            os.kill(pid, 0)
-            return True
+            with open(f"/proc/{pid}/stat", "r") as f:
+                line = f.read()
         except OSError:
             return False
+        rest = line.rsplit(")", 1)[-1].split()
+        return bool(rest) and rest[0] not in ("Z", "X")
 
     def test_short_control_owns_long_worker_and_survives_caller(self):
         grant, camp = self._campaign(plan_id="pl-sup", grant_id="gr-sup")
@@ -796,6 +807,245 @@ class TestPaidFallbackContract(_Base):
         self.assertNotIn("register_fallback", json.dumps(ADAPTER_SCHEMA))
         for surface in ADAPTER_SCHEMA["surfaces"].values():
             self.assertNotIn("fallback", json.dumps(surface).lower())
+
+
+# ============================================================
+# A06/A07 — execution-start atomicity + restart supervision
+# ============================================================
+
+def _marker_worker(marker_dir: Path) -> list[str]:
+    """Fixture worker that writes a UNIQUE per-process marker file."""
+    return [sys.executable, "-c",
+            "import os,sys;open(os.path.join(sys.argv[1],str(os.getpid())),'w').write('x')",
+            str(marker_dir)]
+
+
+class TestExecutionAuthority(_Base):
+    def _alive(self, pid: int) -> bool:
+        # Zombie-aware: a defunct (unreaped) child is DEAD.
+        if pid <= 0:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                line = f.read()
+        except OSError:
+            return False
+        rest = line.rsplit(")", 1)[-1].split()
+        return bool(rest) and rest[0] not in ("Z", "X")
+
+    def _wait_terminal(self, run_id, timeout=10.0):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = poll_wake_claim_execution(self._db, run_id=run_id, now=int(time.time()))
+            if last["state"] in ("COMPLETED", "FAILED"):
+                return last
+            time.sleep(0.03)
+        return last
+
+    def test_concurrent_start_one_winner(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-cstart", grant_id="gr-cstart")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        claim_id = d["claim_id"]
+        marker = self._tmp / "markers"
+        marker.mkdir()
+        dbfile = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db"
+        results: list[dict] = []
+        errors: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def _start():
+            db2 = Database(dbfile)
+            try:
+                barrier.wait(timeout=10)
+                results.append(start_wake_claim_execution(
+                    db2, claim_id=claim_id, argv=_marker_worker(marker),
+                    cwd=str(self._tmp), now=2, result_dir=str(self._tmp / "res")))
+            except Exception as e:  # noqa: BLE001
+                errors.append(type(e).__name__)
+            finally:
+                db2.close()
+
+        ts = [threading.Thread(target=_start) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=20)
+        # Exactly one winner, one conflict.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(errors, ["ExecutionStartConflict"])
+        run_id = results[0]["run_id"]
+        self.assertEqual(wake_claim(self._db, claim_id)["run_id"], run_id)
+        self.assertEqual(int(wake_claim(self._db, claim_id)["attempts"]), 1)
+        last = self._wait_terminal(run_id)
+        self.assertEqual(last["state"], "COMPLETED")
+        # Exactly one OS worker process wrote a marker (no second spawn).
+        self.assertEqual(len(list(marker.iterdir())), 1)
+        p07mod._CHILDREN.clear()
+
+    def test_concurrent_consume_one_winner(self):
+        grant, camp = self._campaign(plan_id="pl-cc", grant_id="gr-cc")
+        job_id = request_control(self._db, operation="wake",
+                                 campaign_id=camp.campaign_id, window_key="w")
+        marker = self._tmp / "m2"
+        marker.mkdir()
+        dbfile = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db"
+        outs: list[list] = []
+        barrier = threading.Barrier(2)
+
+        def _consume():
+            db2 = Database(dbfile)
+            try:
+                barrier.wait(timeout=10)
+                outs.append(consume_control_requests(
+                    db2, worker_argv=_marker_worker(marker), cwd=str(self._tmp), now=3))
+            finally:
+                db2.close()
+
+        ts = [threading.Thread(target=_consume) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=20)
+        consumed = [o for o in outs if any(x.get("consumed") for x in o)]
+        self.assertEqual(len(consumed), 1)
+        # exactly one claim / one run / one marker
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims").fetchone()["n"], 1)
+        claim = self._db._conn.execute("SELECT * FROM wake_claims").fetchone()
+        self.assertTrue(claim["run_id"])
+        self.assertEqual(int(claim["attempts"]), 1)
+        last = self._wait_terminal(claim["run_id"])
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(len(list(marker.iterdir())), 1)
+
+    def test_starting_crash_before_spawn_recovery(self):
+        grant, camp = self._campaign(plan_id="pl-st", grant_id="gr-st")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        claim_id = d["claim_id"]
+        # Simulate a crash at STARTING with NO process spawned.
+        with self._db.transaction() as cur:
+            cur.execute("UPDATE wake_claims SET state='STARTING', run_id=?, "
+                        "exec_token='tok', pid=0, result_path=? WHERE claim_id=?",
+                        (f"run-{claim_id}", str(self._tmp / "none.json"), claim_id))
+        self._reopen()
+        recon = reconcile_wake_claims(self._db, now=2)
+        self.assertEqual(recon[0]["to"], "RETRY_ELIGIBLE")
+        # Exactly one eventual execution.
+        run = start_wake_claim_execution(
+            self._db, claim_id=claim_id, argv=[sys.executable, "-c", "pass"],
+            cwd=str(self._tmp), now=3)
+        self.assertEqual(self._wait_terminal(run["run_id"])["state"], "COMPLETED")
+
+    def test_spawn_failure_no_starting_deadlock(self):
+        grant, camp = self._campaign(plan_id="pl-sf", grant_id="gr-sf")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        # Invalid cwd forces the OUTER spawn to fail (bounded policy).
+        with self.assertRaises(SafetyError):
+            start_wake_claim_execution(
+                self._db, claim_id=d["claim_id"],
+                argv=[sys.executable, "-c", "pass"],
+                cwd="/nonexistent-dir-xyz-123", now=2)
+        # Never a permanent STARTING deadlock.
+        self.assertEqual(wake_claim(self._db, d["claim_id"])["state"], "RETRY_ELIGIBLE")
+
+    def test_restart_preserves_running_and_recovers_durable_result(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-rr", grant_id="gr-rr")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "import time;time.sleep(0.6)"],
+            cwd=str(self._tmp), now=2, result_dir=str(self._tmp / "res2"))
+        claim = wake_claim(self._db, d["claim_id"])
+        self.assertGreater(int(claim["pid"]), 0)
+        self.assertTrue(claim["boot_id"] and claim["start_time"])
+        # Simulate a parent restart: durable DB identity survives; handles lost.
+        self._reopen()
+        p07mod._CHILDREN.clear()
+        recon = reconcile_wake_claims(self._db, now=3)
+        self.assertEqual(recon[0]["to"], "RUNNING")  # exact owned process alive
+        # Post-restart polling uses identity + durable result.
+        last = self._wait_terminal(run["run_id"])
+        self.assertEqual(last["state"], "COMPLETED")
+        # Lineage preserved on the public job surface.
+        job = job_state(self._db, f"wake-{d['obligation_id']}")
+        self.assertEqual(job["state"], "COMPLETED")
+
+    def test_post_restart_owned_termination_and_bystander(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-rt", grant_id="gr-rt")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "import time;time.sleep(30)"],
+            cwd=str(self._tmp), now=2)
+        child_pid = int(wake_claim(self._db, d["claim_id"])["pid"])
+        bystander = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])
+        try:
+            self._reopen()
+            p07mod._CHILDREN.clear()  # restart: no in-process handle
+            res = stop_wake_claim_execution(self._db, run_id=run["run_id"], now=3)
+            self.assertEqual(res["state"], "FAILED")
+            time.sleep(0.3)
+            self.assertFalse(self._alive(child_pid))
+            self.assertTrue(self._alive(bystander.pid))  # never broad-kill
+        finally:
+            bystander.terminate()
+            bystander.wait(timeout=5)
+
+    def test_pid_identity_mismatch_never_signalled(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-pid", grant_id="gr-pid")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "import time;time.sleep(30)"],
+            cwd=str(self._tmp), now=2)
+        claim = wake_claim(self._db, d["claim_id"])
+        child_pid, pgid = int(claim["pid"]), int(claim["pgid"])
+        # Tamper the recorded start-time (simulated PID reuse).
+        with self._db.transaction() as cur:
+            cur.execute("UPDATE wake_claims SET start_time='0' WHERE claim_id=?",
+                        (d["claim_id"],))
+        p07mod._CHILDREN.clear()
+        try:
+            stop_wake_claim_execution(self._db, run_id=run["run_id"], now=3)
+            # Identity mismatch => the process must NOT be signalled.
+            self.assertTrue(self._alive(child_pid))
+        finally:
+            try:
+                os.killpg(pgid, 9)
+            except OSError:
+                pass
+
+    def test_double_trigger_end_to_end_rehearsal(self):
+        grant, camp = self._campaign(plan_id="pl-e2e", grant_id="gr-e2e")
+        # Two INDEPENDENT short-control invocations (different trigger ids).
+        j1 = request_control(self._db, operation="wake",
+                             campaign_id=camp.campaign_id, window_key="trig-A")
+        j2 = request_control(self._db, operation="wake",
+                             campaign_id=camp.campaign_id, window_key="trig-B")
+        marker = self._tmp / "m3"
+        marker.mkdir()
+        for jid in (j1, j2):
+            # Each consumed by an independent runner consumer.
+            tmp_claim = self._db._conn.execute(
+                "SELECT COUNT(*) AS n FROM wake_claims").fetchone()["n"]
+            consume_control_requests(self._db, worker_argv=_marker_worker(marker),
+                                     cwd=str(self._tmp), now=5)
+            del tmp_claim
+        # One control/wake winner, one claim, one run, one owned child.
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims").fetchone()["n"], 1)
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks").fetchone()["n"], 0)
+        claim = self._db._conn.execute("SELECT * FROM wake_claims").fetchone()
+        self.assertEqual(int(claim["attempts"]), 1)
+        last = self._wait_terminal(claim["run_id"])
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(len(list(marker.iterdir())), 1)
 
 
 if __name__ == "__main__":

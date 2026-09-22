@@ -27,10 +27,12 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from .db import Database
@@ -1060,8 +1062,83 @@ def handle_provider_result(
 # ===========================================================================
 
 # Owned child processes keyed by run_id. Supervision is per-pgid only:
-# NEVER a broad kill by name.
+# NEVER a broad kill by name. In-process handles are a CACHE only: durable
+# identity (pid/boot/start-time/pgid) is authoritative across restarts.
 _CHILDREN: dict[str, subprocess.Popen] = {}
+
+
+class ExecutionStartConflict(SafetyError):
+    """Raised when a consumer loses the atomic STARTING reservation."""
+
+
+# Owned wrapper: runs the fixture/worker and writes an ATOMIC durable
+# result record for run_id before exiting, so a restarted parent can
+# determine the terminal outcome without the old Popen handle.
+_WRAPPER_SRC = (
+    "import json,os,sys,subprocess\n"
+    "run_id=sys.argv[1]; result_path=sys.argv[2]; argv=json.loads(sys.argv[3]); cwd=sys.argv[4]\n"
+    "rc=subprocess.run(argv,cwd=cwd).returncode\n"
+    "rec={'run_id':run_id,'exit_code':rc,'finished_at':int(__import__('time').time())}\n"
+    "tmp=result_path+'.tmp'\n"
+    "open(tmp,'w').write(json.dumps(rec,separators=(',',':')))\n"
+    "os.replace(tmp,result_path)\n"
+    "sys.exit(rc)\n"
+)
+
+
+def _p07_results_dir() -> Path:
+    from .runtime import state_dir
+    return state_dir() / "p07-results"
+
+
+def _read_result(result_path: str) -> dict[str, Any] | None:
+    if not result_path:
+        return None
+    try:
+        with open(result_path, "r") as f:
+            return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _pid_running(pid: int) -> bool:
+    """True iff pid exists AND is not a zombie/dead process."""
+    if pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            line = f.read()
+    except OSError:
+        return False
+    rest = line.rsplit(")", 1)[-1].split()
+    if not rest:
+        return False
+    return rest[0] not in ("Z", "X")
+
+
+def _identity_matches(pid: int, boot_id: str, start_time: str) -> bool:
+    """Exact owned-process identity check (never trust PID alone)."""
+    from .resources import host_boot_id, proc_start_time
+    if not pid or not _pid_running(pid):
+        return False
+    live_boot = host_boot_id()
+    if boot_id and live_boot and boot_id != live_boot:
+        return False
+    if start_time:
+        live_start = proc_start_time(pid)
+        if live_start and live_start != start_time:
+            return False  # PID was reused by a different process
+    return True
 
 
 def wake_claim(db: Database, claim_id: str) -> dict[str, Any] | None:
@@ -1070,144 +1147,272 @@ def wake_claim(db: Database, claim_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _finalize_claim(db: Database, claim: dict[str, Any], exit_code: int,
+                    now: int, *, source: str) -> dict[str, Any]:
+    state = "COMPLETED" if exit_code == 0 else "FAILED"
+    result = json.dumps({"exit_code": exit_code, "terminal": state, "source": source})
+    wake_job_id = f"wake-{claim['obligation_id']}"
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE wake_claims SET state=?, finished_at=?, result=? WHERE claim_id=?",
+            (state, now, result, claim["claim_id"]),
+        )
+        cur.execute("UPDATE wake_jobs SET state=?, detail=? WHERE job_id=?",
+                    (state, result, wake_job_id))
+        cur.execute("UPDATE wake_jobs SET state=?, detail=? WHERE linked_job_id=?",
+                    (state, result, wake_job_id))
+    return {"run_id": claim["run_id"], "state": state, "exit_code": exit_code,
+            "claim_id": claim["claim_id"], "result": result}
+
+
 def start_wake_claim_execution(
     db: Database, *, claim_id: str, argv: list[str], cwd: str,
-    now: int | None = None,
+    now: int | None = None, result_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Start the OWNED bounded worker execution for a claim.
+    """Atomically OWN the execution start, THEN spawn the owned worker.
 
-    Stores the durable run identity on the claim (no second execution
-    state machine for the work itself). Only the runner calls this.
+    The STARTING reservation is a compare-and-set inside BEGIN IMMEDIATE:
+
+        UPDATE ... SET state='STARTING', run_id=?, exec_token=?
+        WHERE claim_id=? AND run_id='' AND state IN ('CLAIMED','RETRY_ELIGIBLE')
+
+    Exactly one consumer wins; ONLY the winner spawns. A losing consumer
+    raises ``ExecutionStartConflict`` carrying the existing run lineage and
+    spawns NOTHING.
     """
     now = int(now if now is not None else time.time())
     row = wake_claim(db, claim_id)
     if row is None:
         raise SafetyError(f"wake claim {claim_id!r} not found")
-    if row["state"] not in ("CLAIMED", "RETRY_ELIGIBLE"):
-        raise SafetyError(f"claim {claim_id!r} not startable (state={row['state']})")
-    if row["run_id"]:
-        raise SafetyError(f"claim {claim_id!r} already has run {row['run_id']!r}")
-    proc = subprocess.Popen(
-        argv, cwd=str(cwd), start_new_session=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
+    run_id = f"run-{claim_id}"
+    token = uuid.uuid4().hex
+    rdir = Path(result_dir) if result_dir else _p07_results_dir()
+    rdir.mkdir(parents=True, exist_ok=True)
+    result_path = str(rdir / f"{run_id}.json")
+
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE wake_claims SET state='STARTING', run_id=?, exec_token=?, "
+            "result_path=?, heartbeat_at=? WHERE claim_id=? AND run_id='' "
+            "AND state IN ('CLAIMED','RETRY_ELIGIBLE')",
+            (run_id, token, result_path, now, claim_id),
+        )
+        won = cur.rowcount == 1
+    if not won:
+        raise ExecutionStartConflict(
+            f"start_conflict: claim {claim_id!r} already owned "
+            f"(state={wake_claim(db, claim_id)})"
+        )
+
+    wrapper = [sys.executable, "-c", _WRAPPER_SRC, run_id, result_path,
+               json.dumps(argv), str(cwd)]
+    try:
+        proc = subprocess.Popen(wrapper, cwd=str(cwd), start_new_session=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+    except Exception as e:  # noqa: BLE001
+        with db.transaction() as cur:
+            cur.execute(
+                "UPDATE wake_claims SET state='RETRY_ELIGIBLE', "
+                "attempts=attempts+1, heartbeat_at=? WHERE claim_id=? AND exec_token=?",
+                (now, claim_id, token),
+            )
+        raise SafetyError(f"spawn_failed: {type(e).__name__}: {e}") from e
+
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = 0
-    run_id = f"run-{claim_id}"
+    from .resources import host_boot_id, proc_start_time
+    boot = host_boot_id()
+    start_time = proc_start_time(proc.pid)
     _CHILDREN[run_id] = proc
     wake_job_id = f"wake-{row['obligation_id']}"
     with db.transaction() as cur:
         cur.execute(
-            "UPDATE wake_claims SET state='RUNNING', run_id=?, pid=?, pgid=?, "
-            "heartbeat_at=?, attempts=attempts+1 WHERE claim_id=?",
-            (run_id, proc.pid, pgid, now, claim_id),
+            "UPDATE wake_claims SET state='RUNNING', pid=?, pgid=?, boot_id=?, "
+            "start_time=?, heartbeat_at=?, attempts=attempts+1 "
+            "WHERE claim_id=? AND exec_token=?",
+            (proc.pid, pgid, boot, start_time, now, claim_id, token),
         )
-        cur.execute(
-            "UPDATE wake_jobs SET state='RUNNING', detail=? WHERE job_id=?",
-            (run_id, wake_job_id),
-        )
-        # Mirror the lineage onto any control job that requested this wake.
-        cur.execute(
-            "UPDATE wake_jobs SET state='RUNNING' WHERE linked_job_id=?",
-            (wake_job_id,),
-        )
+        cur.execute("UPDATE wake_jobs SET state='RUNNING', detail=? WHERE job_id=?",
+                    (run_id, wake_job_id))
+        cur.execute("UPDATE wake_jobs SET state='RUNNING' WHERE linked_job_id=?",
+                    (wake_job_id,))
     return {"claim_id": claim_id, "run_id": run_id, "pid": proc.pid, "pgid": pgid,
-            "state": "RUNNING"}
+            "boot_id": boot, "start_time": start_time, "state": "RUNNING"}
 
 
 def poll_wake_claim_execution(
     db: Database, *, run_id: str, now: int | None = None,
 ) -> dict[str, Any]:
-    """Observe the owned worker; transition the claim on terminal exit."""
+    """Observe the owned worker (in-process OR post-restart by identity).
+
+    Terminal outcome comes from the DURABLE result record first, then the
+    in-process handle, then exact process identity. A vanished PID with no
+    durable result is UNKNOWN (fail closed) — never inferred COMPLETED.
+    """
     now = int(now if now is not None else time.time())
     row = db._conn.execute("SELECT * FROM wake_claims WHERE run_id=?",
                            (run_id,)).fetchone()
     if row is None:
         raise SafetyError(f"no wake claim for run {run_id!r}")
     claim = dict(row)
+    if claim["state"] in ("COMPLETED", "FAILED"):
+        res = _read_result(claim.get("result_path") or "")
+        return {"run_id": run_id, "state": claim["state"],
+                "claim_id": claim["claim_id"],
+                "exit_code": (res or {}).get("exit_code")}
+    res = _read_result(claim.get("result_path") or "")
+    if res is not None:
+        return _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
+                               source="result_file")
     proc = _CHILDREN.get(run_id)
-    if proc is None:
-        return {"run_id": run_id, "state": claim["state"], "exit_code": None,
-                "claim_id": claim["claim_id"]}
-    rc = proc.poll()
-    if rc is None:
+    if proc is not None:
+        rc = proc.poll()
+        if rc is None:
+            return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
+                    "claim_id": claim["claim_id"], "exit_code": None}
+        return _finalize_claim(db, claim, rc, now, source="popen")
+    if _identity_matches(int(claim["pid"]), claim["boot_id"], claim["start_time"]):
         return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
                 "claim_id": claim["claim_id"], "exit_code": None}
-    state = "COMPLETED" if rc == 0 else "FAILED"
-    result = json.dumps({"exit_code": rc, "terminal": state})
-    wake_job_id = f"wake-{claim['obligation_id']}"
-    with db.transaction() as cur:
-        cur.execute(
-            "UPDATE wake_claims SET state=?, finished_at=?, result=? WHERE run_id=?",
-            (state, now, result, run_id),
-        )
-        cur.execute(
-            "UPDATE wake_jobs SET state=?, detail=? WHERE job_id=?",
-            (state, result, wake_job_id),
-        )
-        cur.execute(
-            "UPDATE wake_jobs SET state=?, detail=? WHERE linked_job_id=?",
-            (state, result, wake_job_id),
-        )
-    return {"run_id": run_id, "state": state, "exit_code": rc,
-            "claim_id": claim["claim_id"], "result": result}
+    if claim["state"] == "STARTING":
+        return {"run_id": run_id, "state": "STARTING",
+                "claim_id": claim["claim_id"], "exit_code": None}
+    return {"run_id": run_id, "state": "UNKNOWN", "claim_id": claim["claim_id"],
+            "exit_code": None}
 
 
 def reconcile_wake_claims(db: Database, *, now: int | None = None) -> list[dict[str, Any]]:
-    """Reconcile claims at restart.
+    """Reconcile claim state at restart (CLAIMED / STARTING / RUNNING).
 
-    A claim stuck in CLAIMED with NO run identity (crash after the claim
-    was durable but before execution started) is NOT a permanent
-    dead-end: it is transitioned to RETRY_ELIGIBLE so the runner can
-    start exactly one eventual execution.
+    Crash windows handled explicitly:
+
+      A. CLAIMED or STARTING with NO spawned process -> deterministic
+         RETRY_ELIGIBLE (never a permanent dead-end).
+      B. owner process durably recorded and still exactly alive ->
+         preserve RUNNING and restore supervision capability.
+      C. process definitely gone -> terminal from the DURABLE result record;
+         if the outcome cannot be known -> EFFECT_UNKNOWN (fail closed).
     """
     now = int(now if now is not None else time.time())
     rows = db._conn.execute(
-        "SELECT * FROM wake_claims WHERE state='CLAIMED' AND run_id=''"
+        "SELECT * FROM wake_claims WHERE state IN ('CLAIMED','STARTING','RUNNING')"
     ).fetchall()
     out = []
-    with db.transaction() as cur:
-        for r in rows:
-            cur.execute(
-                "UPDATE wake_claims SET state='RETRY_ELIGIBLE', heartbeat_at=? "
-                "WHERE claim_id=? AND state='CLAIMED' AND run_id=''",
-                (now, r["claim_id"]),
-            )
-            # Un-suppress the corresponding wake job so status reflects it.
-            cur.execute(
-                "UPDATE wake_jobs SET state='RETRY_ELIGIBLE' WHERE job_id=?",
-                (f"wake-{r['obligation_id']}",),
-            )
-            out.append({"claim_id": r["claim_id"], "state": "RETRY_ELIGIBLE"})
+    for r in rows:
+        claim = dict(r)
+        cid = claim["claim_id"]
+        frm = claim["state"]
+        to = frm
+        clear_run = False
+        if frm == "CLAIMED" and not claim["run_id"]:
+            to = "RETRY_ELIGIBLE"
+        elif frm == "STARTING" and not claim["pid"]:
+            # STARTING durable but the process was never spawned: release
+            # the reservation so exactly one eventual execution can start.
+            if _read_result(claim.get("result_path") or "") is None:
+                to = "RETRY_ELIGIBLE"
+                clear_run = True
+        else:
+            res = _read_result(claim.get("result_path") or "")
+            if res is not None:
+                _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
+                                source="reconcile")
+                to = "COMPLETED" if int(res.get("exit_code", -1)) == 0 else "FAILED"
+            elif _identity_matches(int(claim["pid"]), claim["boot_id"],
+                                   claim["start_time"]):
+                to = "RUNNING"  # exact owned process still alive; keep supervision
+            else:
+                to = "EFFECT_UNKNOWN"  # outcome cannot be proven -> fail closed
+        if to != frm or clear_run:
+            with db.transaction() as cur:
+                if clear_run:
+                    cur.execute(
+                        "UPDATE wake_claims SET state=?, run_id='', exec_token='', "
+                        "result_path='', heartbeat_at=? WHERE claim_id=?",
+                        (to, now, cid))
+                else:
+                    cur.execute("UPDATE wake_claims SET state=?, heartbeat_at=? "
+                                "WHERE claim_id=?", (to, now, cid))
+                cur.execute("UPDATE wake_jobs SET state=? WHERE job_id=?",
+                            (to, f"wake-{claim['obligation_id']}"))
+                cur.execute("UPDATE wake_jobs SET state=? WHERE linked_job_id=?",
+                            (to, f"wake-{claim['obligation_id']}"))
+        out.append({"claim_id": cid, "from": frm, "to": to})
     return out
+
+
+def _kill_owned_pgid(pgid: int, proc: subprocess.Popen | None, pid: int = 0,
+                     wait_seconds: float = 3.0) -> bool:
+    """Terminate ONLY the owned process group. Never by name / reused PID."""
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return False
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if proc is not None:
+            if proc.poll() is not None:
+                return True
+        elif pid and not _pid_running(pid):
+            return True
+        time.sleep(0.02)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    if proc is not None:
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+    return True
 
 
 def stop_wake_claim_execution(
     db: Database, *, run_id: str, now: int | None = None,
 ) -> dict[str, Any]:
-    """Runner-owned termination of its OWN owned worker (per-pgid only)."""
+    """Runner-owned termination of its OWN owned worker (per-pgid only).
+
+    Works after a restart using the PERSISTED identity: termination requires
+    an exact pid/boot/start-time identity match (or the in-process handle).
+    A reused PID or unrelated process is never signalled.
+    """
     now = int(now if now is not None else time.time())
     row = db._conn.execute("SELECT * FROM wake_claims WHERE run_id=?",
                            (run_id,)).fetchone()
     if row is None:
         raise SafetyError(f"no wake claim for run {run_id!r}")
     claim = dict(row)
+    terminated = False
     proc = _CHILDREN.get(run_id)
     if proc is not None and proc.poll() is None:
-        try:
-            pgid = claim["pgid"] or os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(claim["pgid"], signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+        terminated = _kill_owned_pgid(int(claim["pgid"]) or 0, proc,
+                                      pid=int(claim["pid"]))
+    elif _identity_matches(int(claim["pid"]), claim["boot_id"], claim["start_time"]):
+        terminated = _kill_owned_pgid(int(claim["pgid"]) or 0, None,
+                                      pid=int(claim["pid"]))
+    # If neither, we do NOT signal anything (never a reused PID / stranger).
+    res = _read_result(claim.get("result_path") or "")
+    if res is not None:
+        return _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
+                               source="stop")
+    if terminated:
+        wake_job_id = f"wake-{claim['obligation_id']}"
+        result = json.dumps({"terminal": "FAILED", "source": "runner_terminated"})
+        with db.transaction() as cur:
+            cur.execute("UPDATE wake_claims SET state='FAILED', finished_at=?, "
+                        "result=? WHERE claim_id=?", (now, result, claim["claim_id"]))
+            cur.execute("UPDATE wake_jobs SET state='FAILED', detail=? WHERE job_id=?",
+                        (result, wake_job_id))
+            cur.execute("UPDATE wake_jobs SET state='FAILED', detail=? "
+                        "WHERE linked_job_id=?", (result, wake_job_id))
+        return {"run_id": run_id, "state": "FAILED", "claim_id": claim["claim_id"],
+                "exit_code": None, "result": result}
     return poll_wake_claim_execution(db, run_id=run_id, now=now)
 
 
@@ -1222,46 +1427,64 @@ def consume_control_requests(
     a short no-long-work operation. The CLI never executes work itself.
     """
     now = int(now if now is not None else time.time())
-    rows = db._conn.execute(
-        "SELECT * FROM wake_jobs WHERE state='ACCEPTED' "
+    ids = [r["job_id"] for r in db._conn.execute(
+        "SELECT job_id FROM wake_jobs WHERE state='ACCEPTED' "
         "AND operation IN ('wake','tick','status-refresh') ORDER BY requested_at ASC"
-    ).fetchall()
+    ).fetchall()]
     out = []
-    for r in rows:
-        job = dict(r)
+    for job_id in ids:
+        # Atomic control consumption: exactly one consumer wins.
+        with db.transaction() as cur:
+            cur.execute("UPDATE wake_jobs SET state='CONSUMING' "
+                        "WHERE job_id=? AND state='ACCEPTED'", (job_id,))
+            won = cur.rowcount == 1
+        if not won:
+            existing = job_state(db, job_id) or {"state": "?"}
+            out.append({"job_id": job_id, "state": existing.get("state"),
+                        "consumed": False, "claim_id": "", "run_id": ""})
+            continue
+        job = job_state(db, job_id)
         op = job["operation"]
         if op == "status-refresh":
             with db.transaction() as cur:
                 cur.execute("UPDATE wake_jobs SET state='COMPLETED', detail=? "
-                            "WHERE job_id=?", ("short_status_refresh", job["job_id"]))
-            out.append({"job_id": job["job_id"], "state": "COMPLETED"})
+                            "WHERE job_id=?", ("short_status_refresh", job_id))
+            out.append({"job_id": job_id, "state": "COMPLETED", "consumed": True})
             continue
         cid = job["campaign_id"]
         if not cid:
             with db.transaction() as cur:
                 cur.execute("UPDATE wake_jobs SET state='REFUSED', detail=? WHERE job_id=?",
-                            ("no_campaign", job["job_id"]))
-            out.append({"job_id": job["job_id"], "state": "REFUSED"})
+                            ("no_campaign", job_id))
+            out.append({"job_id": job_id, "state": "REFUSED", "consumed": True})
             continue
-        res = wake_tick(db, campaign_id=cid, trigger_id=job["job_id"], now=now)
+        res = wake_tick(db, campaign_id=cid, trigger_id=job_id, now=now)
         claim_id = res.get("claim_id", "")
         run = None
-        if worker_argv and claim_id:
-            claim = wake_claim(db, claim_id)
-            if claim is not None and claim["state"] in ("CLAIMED", "RETRY_ELIGIBLE"):
+        conflict = False
+        claim = wake_claim(db, claim_id) if claim_id else None
+        if worker_argv and claim is not None and claim["state"] in ("CLAIMED", "RETRY_ELIGIBLE"):
+            try:
                 run = start_wake_claim_execution(db, claim_id=claim_id,
                                                  argv=worker_argv, cwd=cwd, now=now)
+            except ExecutionStartConflict:
+                conflict = True
+                claim = wake_claim(db, claim_id)
+                if claim is not None and claim["run_id"]:
+                    run = {"run_id": claim["run_id"]}
         with db.transaction() as cur:
             cur.execute(
                 "UPDATE wake_jobs SET state=?, detail=?, linked_job_id=? WHERE job_id=?",
                 ("RUNNING" if run else res.get("decision", "REFUSED"),
                  json.dumps({"claim_id": claim_id,
                              "run_id": (run or {}).get("run_id", ""),
-                             "decision": res.get("decision", "")}),
-                 res.get("job_id", ""), job["job_id"]),
+                             "decision": res.get("decision", ""),
+                             "conflict": conflict}),
+                 res.get("job_id", ""), job_id),
             )
-        out.append({"job_id": job["job_id"], "state": "RUNNING" if run else res.get("decision"),
-                    "claim_id": claim_id, "run_id": (run or {}).get("run_id", "")})
+        out.append({"job_id": job_id, "state": "RUNNING" if run else res.get("decision"),
+                    "claim_id": claim_id, "run_id": (run or {}).get("run_id", ""),
+                    "consumed": True, "conflict": conflict})
     return out
 
 
@@ -1304,6 +1527,7 @@ __all__ = [
     "WAKE_OPERATION", "ALLOWED_CONTROL_OPERATIONS", "obligation_identity",
     "handle_provider_result",
     "wake_tick", "hermes_tick",
+    "ExecutionStartConflict",
     "wake_claim", "start_wake_claim_execution", "poll_wake_claim_execution",
     "reconcile_wake_claims", "stop_wake_claim_execution", "consume_control_requests",
     "request_control", "job_state", "complete_job",
