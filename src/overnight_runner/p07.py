@@ -1071,17 +1071,35 @@ class ExecutionStartConflict(SafetyError):
     """Raised when a consumer loses the atomic STARTING reservation."""
 
 
-# Owned wrapper: runs the fixture/worker and writes an ATOMIC durable
-# result record for run_id before exiting, so a restarted parent can
-# determine the terminal outcome without the old Popen handle.
+# Two-phase OWNED bootstrap wrapper. It MUST NOT run the worker before
+# activation. It writes an atomic bootstrap identity record FIRST, then
+# waits for an activation token bound to exec_token; only then does it
+# launch the worker and write the durable terminal result record.
 _WRAPPER_SRC = (
-    "import json,os,sys,subprocess\n"
-    "run_id=sys.argv[1]; result_path=sys.argv[2]; argv=json.loads(sys.argv[3]); cwd=sys.argv[4]\n"
-    "rc=subprocess.run(argv,cwd=cwd).returncode\n"
-    "rec={'run_id':run_id,'exit_code':rc,'finished_at':int(__import__('time').time())}\n"
-    "tmp=result_path+'.tmp'\n"
-    "open(tmp,'w').write(json.dumps(rec,separators=(',',':')))\n"
-    "os.replace(tmp,result_path)\n"
+    "import json,os,sys,subprocess,time\n"
+    "run_id=sys.argv[1]; claim_id=sys.argv[2]; token=sys.argv[3]\n"
+    "boot_path=sys.argv[4]; act_path=sys.argv[5]; result_path=sys.argv[6]\n"
+    "worker_argv=json.loads(sys.argv[7]); cwd=sys.argv[8]; act_timeout=float(sys.argv[9])\n"
+    "def aw(p,o):\n"
+    "    t=p+'.tmp'; f=open(t,'w'); f.write(json.dumps(o)); f.close(); os.replace(t,p)\n"
+    "def st():\n"
+    "    try:\n"
+    "        l=open('/proc/%d/stat'%os.getpid()).read(); return l.rsplit(')',1)[-1].split()[19]\n"
+    "    except Exception: return ''\n"
+    "try: boot=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
+    "except Exception: boot=''\n"
+    "aw(boot_path,{'claim_id':claim_id,'run_id':run_id,'exec_token':token,"
+    "'pid':os.getpid(),'pgid':os.getpgid(0),'boot_id':boot,'start_time':st()})\n"
+    "deadline=time.time()+act_timeout; ok=False\n"
+    "while time.time()<deadline:\n"
+    "    try: t=open(act_path).read().strip()\n"
+    "    except Exception: t=''\n"
+    "    if t==token: ok=True; break\n"
+    "    time.sleep(0.05)\n"
+    "if not ok: sys.exit(0)\n"
+    "rc=subprocess.run(worker_argv,cwd=cwd).returncode\n"
+    "aw(result_path,{'claim_id':claim_id,'run_id':run_id,'exec_token':token,"
+    "'exit_code':rc,'finished_at':int(time.time())})\n"
     "sys.exit(rc)\n"
 )
 
@@ -1091,14 +1109,78 @@ def _p07_results_dir() -> Path:
     return state_dir() / "p07-results"
 
 
-def _read_result(result_path: str) -> dict[str, Any] | None:
-    if not result_path:
+def _p07_bootstrap_dir() -> Path:
+    from .runtime import state_dir
+    return state_dir() / "p07-bootstrap"
+
+
+def _p07_activate_dir() -> Path:
+    from .runtime import state_dir
+    return state_dir() / "p07-activate"
+
+
+def _read_record(path: str, *, claim_id: str, run_id: str,
+                 exec_token: str) -> dict[str, Any] | None:
+    """Read AND validate a bootstrap/result record.
+
+    A record is accepted only when its claim_id / run_id / exec_token all
+    match; a stray file at the expected path is NOT accepted.
+    """
+    if not path:
         return None
     try:
-        with open(result_path, "r") as f:
-            return json.loads(f.read())
+        with open(path, "r") as f:
+            rec = json.loads(f.read())
     except (OSError, ValueError):
         return None
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("claim_id") != claim_id or rec.get("run_id") != run_id:
+        return None
+    if rec.get("exec_token") != exec_token:
+        return None
+    return rec
+
+
+def _wait_bootstrap(boot_path: str, *, claim_id: str, run_id: str,
+                    exec_token: str, timeout: float = 5.0) -> dict[str, Any] | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = _read_record(boot_path, claim_id=claim_id, run_id=run_id,
+                           exec_token=exec_token)
+        if rec is not None:
+            return rec
+        time.sleep(0.02)
+    return None
+
+
+def _activate(bootstrap_path: str, run_id: str, exec_token: str) -> None:
+    """Write the activation token next to the bootstrap record.
+
+    The activation file must live beside the run's bootstrap dir so it is
+    honoured even when the runner used a non-default base directory.
+    """
+    if bootstrap_path:
+        p = Path(bootstrap_path).parent.parent / "activate" / f"{run_id}.tok"
+    else:
+        p = _p07_activate_dir() / f"{run_id}.tok"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(p) + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(exec_token)
+    os.replace(tmp, str(p))
+
+
+def _clear_reservation(db: Database, claim_id: str, exec_token: str,
+                       now: int) -> None:
+    """Atomically clear ALL start-reservation fields (proven pre-spawn failure)."""
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE wake_claims SET state='RETRY_ELIGIBLE', run_id='', exec_token='', "
+            "pid=0, pgid=0, boot_id='', start_time='', bootstrap_path='', "
+            "result_path='', heartbeat_at=? WHERE claim_id=? AND exec_token=?",
+            (now, claim_id, exec_token),
+        )
 
 
 def _pid_exists(pid: int) -> bool:
@@ -1168,34 +1250,45 @@ def _finalize_claim(db: Database, claim: dict[str, Any], exit_code: int,
 def start_wake_claim_execution(
     db: Database, *, claim_id: str, argv: list[str], cwd: str,
     now: int | None = None, result_dir: str | None = None,
+    activation_timeout: float = 5.0, activate: bool = True,
 ) -> dict[str, Any]:
-    """Atomically OWN the execution start, THEN spawn the owned worker.
+    """Two-phase OWNED launch: reserve -> spawn bootstrap -> durable
+    identity -> activate.
 
-    The STARTING reservation is a compare-and-set inside BEGIN IMMEDIATE:
+    Invariant: NO worker side effect can occur unless the exact owned
+    process identity is already durable on the claim.
 
-        UPDATE ... SET state='STARTING', run_id=?, exec_token=?
-        WHERE claim_id=? AND run_id='' AND state IN ('CLAIMED','RETRY_ELIGIBLE')
-
-    Exactly one consumer wins; ONLY the winner spawns. A losing consumer
-    raises ``ExecutionStartConflict`` carrying the existing run lineage and
-    spawns NOTHING.
+    Phase A  CAS reservation CLAIMED/RETRY_ELIGIBLE -> STARTING (run_id,
+             exec_token, bootstrap_path, result_path). One winner only.
+    Phase B  spawn ONLY the owned bootstrap wrapper (writes an atomic
+             bootstrap identity record, then WAITS for activation).
+    Phase C  read + validate the bootstrap identity.
+    Phase D  durably record identity; transition to RUNNING.
+    Phase E  write the activation token; only then does the wrapper launch
+             the worker.
     """
+    from .failpoints import trigger_crash_failpoint
     now = int(now if now is not None else time.time())
     row = wake_claim(db, claim_id)
     if row is None:
         raise SafetyError(f"wake claim {claim_id!r} not found")
     run_id = f"run-{claim_id}"
     token = uuid.uuid4().hex
-    rdir = Path(result_dir) if result_dir else _p07_results_dir()
-    rdir.mkdir(parents=True, exist_ok=True)
-    result_path = str(rdir / f"{run_id}.json")
+    base = Path(result_dir) if result_dir else _p07_results_dir()
+    boot_dir, act_dir, res_dir = base / "bootstrap", base / "activate", base / "results"
+    for d in (boot_dir, act_dir, res_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    boot_path = str(boot_dir / f"{run_id}.json")
+    act_path = str(act_dir / f"{run_id}.tok")
+    result_path = str(res_dir / f"{run_id}.json")
 
+    # Phase A: atomic STARTING reservation (exactly one winner).
     with db.transaction() as cur:
         cur.execute(
             "UPDATE wake_claims SET state='STARTING', run_id=?, exec_token=?, "
-            "result_path=?, heartbeat_at=? WHERE claim_id=? AND run_id='' "
-            "AND state IN ('CLAIMED','RETRY_ELIGIBLE')",
-            (run_id, token, result_path, now, claim_id),
+            "bootstrap_path=?, result_path=?, heartbeat_at=? WHERE claim_id=? "
+            "AND run_id='' AND state IN ('CLAIMED','RETRY_ELIGIBLE')",
+            (run_id, token, boot_path, result_path, now, claim_id),
         )
         won = cur.rowcount == 1
     if not won:
@@ -1203,44 +1296,62 @@ def start_wake_claim_execution(
             f"start_conflict: claim {claim_id!r} already owned "
             f"(state={wake_claim(db, claim_id)})"
         )
+    for stale in (act_path, result_path):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
 
-    wrapper = [sys.executable, "-c", _WRAPPER_SRC, run_id, result_path,
-               json.dumps(argv), str(cwd)]
+    # Phase B: spawn the owned bootstrap (failpoint/spawn failure is a
+    # PROVEN pre-spawn failure -> clear the whole reservation).
+    wrapper = [sys.executable, "-c", _WRAPPER_SRC, run_id, claim_id, token,
+               boot_path, act_path, result_path, json.dumps(argv), str(cwd),
+               str(activation_timeout)]
     try:
+        trigger_crash_failpoint("p07_after_starting_before_bootstrap_spawn")
         proc = subprocess.Popen(wrapper, cwd=str(cwd), start_new_session=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
     except Exception as e:  # noqa: BLE001
-        with db.transaction() as cur:
-            cur.execute(
-                "UPDATE wake_claims SET state='RETRY_ELIGIBLE', "
-                "attempts=attempts+1, heartbeat_at=? WHERE claim_id=? AND exec_token=?",
-                (now, claim_id, token),
-            )
+        _clear_reservation(db, claim_id, token, now)
         raise SafetyError(f"spawn_failed: {type(e).__name__}: {e}") from e
-
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = 0
-    from .resources import host_boot_id, proc_start_time
-    boot = host_boot_id()
-    start_time = proc_start_time(proc.pid)
     _CHILDREN[run_id] = proc
+
+    trigger_crash_failpoint("p07_after_bootstrap_spawn_before_identity_read")
+
+    # Phase C: read + validate bootstrap identity.
+    boot = _wait_bootstrap(boot_path, claim_id=claim_id, run_id=run_id,
+                           exec_token=token, timeout=5.0)
+    if boot is None:
+        raise SafetyError("bootstrap_identity_missing: fail closed (no blind retry)")
+
+    # Phase D: durable identity -> launch-authorized RUNNING.
+    pid = int(boot.get("pid") or 0)
+    pgid = int(boot.get("pgid") or 0)
+    boot_id = boot.get("boot_id", "")
+    start_time = boot.get("start_time", "")
     wake_job_id = f"wake-{row['obligation_id']}"
     with db.transaction() as cur:
         cur.execute(
             "UPDATE wake_claims SET state='RUNNING', pid=?, pgid=?, boot_id=?, "
             "start_time=?, heartbeat_at=?, attempts=attempts+1 "
             "WHERE claim_id=? AND exec_token=?",
-            (proc.pid, pgid, boot, start_time, now, claim_id, token),
+            (pid, pgid, boot_id, start_time, now, claim_id, token),
         )
         cur.execute("UPDATE wake_jobs SET state='RUNNING', detail=? WHERE job_id=?",
                     (run_id, wake_job_id))
         cur.execute("UPDATE wake_jobs SET state='RUNNING' WHERE linked_job_id=?",
                     (wake_job_id,))
-    return {"claim_id": claim_id, "run_id": run_id, "pid": proc.pid, "pgid": pgid,
-            "boot_id": boot, "start_time": start_time, "state": "RUNNING"}
+
+    trigger_crash_failpoint("p07_after_identity_durable_before_activation")
+
+    # Phase E: activate (only now may the wrapper launch the worker).
+    if activate:
+        _activate(boot_path, run_id, token)
+
+    trigger_crash_failpoint("p07_after_activation_before_observe")
+    return {"claim_id": claim_id, "run_id": run_id, "pid": pid, "pgid": pgid,
+            "boot_id": boot_id, "start_time": start_time, "state": "RUNNING"}
 
 
 def poll_wake_claim_execution(
@@ -1258,22 +1369,23 @@ def poll_wake_claim_execution(
     if row is None:
         raise SafetyError(f"no wake claim for run {run_id!r}")
     claim = dict(row)
+    run_id = claim["run_id"] or run_id
+    res = _read_record(claim.get("result_path") or "", claim_id=claim["claim_id"],
+                       run_id=run_id, exec_token=claim["exec_token"])
     if claim["state"] in ("COMPLETED", "FAILED"):
-        res = _read_result(claim.get("result_path") or "")
         return {"run_id": run_id, "state": claim["state"],
                 "claim_id": claim["claim_id"],
                 "exit_code": (res or {}).get("exit_code")}
-    res = _read_result(claim.get("result_path") or "")
+    # A VALIDATED durable result record is the ONLY terminal authority; the
+    # wrapper exit code is never trusted on its own (it may have exited
+    # without running the worker).
     if res is not None:
         return _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
                                source="result_file")
     proc = _CHILDREN.get(run_id)
-    if proc is not None:
-        rc = proc.poll()
-        if rc is None:
-            return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
-                    "claim_id": claim["claim_id"], "exit_code": None}
-        return _finalize_claim(db, claim, rc, now, source="popen")
+    if proc is not None and proc.poll() is None:
+        return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
+                "claim_id": claim["claim_id"], "exit_code": None}
     if _identity_matches(int(claim["pid"]), claim["boot_id"], claim["start_time"]):
         return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
                 "claim_id": claim["claim_id"], "exit_code": None}
@@ -1306,36 +1418,65 @@ def reconcile_wake_claims(db: Database, *, now: int | None = None) -> list[dict[
         cid = claim["claim_id"]
         frm = claim["state"]
         to = frm
-        clear_run = False
-        if frm == "CLAIMED" and not claim["run_id"]:
+        run_id = claim["run_id"]
+        res = None
+        boot = None
+        if run_id:
+            res = _read_record(claim.get("result_path") or "", claim_id=cid,
+                               run_id=run_id, exec_token=claim["exec_token"])
+            boot = _read_record(claim.get("bootstrap_path") or "", claim_id=cid,
+                                run_id=run_id, exec_token=claim["exec_token"])
+        if frm == "CLAIMED" and not run_id:
             to = "RETRY_ELIGIBLE"
-        elif frm == "STARTING" and not claim["pid"]:
-            # STARTING durable but the process was never spawned: release
-            # the reservation so exactly one eventual execution can start.
-            if _read_result(claim.get("result_path") or "") is None:
+        elif frm == "STARTING":
+            if not run_id:
                 to = "RETRY_ELIGIBLE"
-                clear_run = True
-        else:
-            res = _read_result(claim.get("result_path") or "")
+            elif res is not None:
+                # STARTING + durable terminal result -> finalize (never stuck).
+                _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
+                                source="reconcile")
+                to = "COMPLETED" if int(res.get("exit_code", -1)) == 0 else "FAILED"
+            elif boot is not None and _identity_matches(
+                    int(boot.get("pid") or 0), boot.get("boot_id", ""),
+                    boot.get("start_time", "")):
+                # Bootstrap identity exists and the exact owned process is
+                # alive: recover the SAME lineage and resume activation.
+                wake_job_id = f"wake-{claim['obligation_id']}"
+                with db.transaction() as cur:
+                    cur.execute(
+                        "UPDATE wake_claims SET state='RUNNING', pid=?, pgid=?, "
+                        "boot_id=?, start_time=?, heartbeat_at=?, "
+                        "attempts=attempts+1 WHERE claim_id=? AND exec_token=?",
+                        (int(boot.get("pid") or 0), int(boot.get("pgid") or 0),
+                         boot.get("boot_id", ""), boot.get("start_time", ""),
+                         now, cid, claim["exec_token"]))
+                    cur.execute("UPDATE wake_jobs SET state='RUNNING' WHERE job_id=?",
+                                (wake_job_id,))
+                    cur.execute("UPDATE wake_jobs SET state='RUNNING' "
+                                "WHERE linked_job_id=?", (wake_job_id,))
+                _activate(claim["bootstrap_path"], run_id, claim["exec_token"])
+                to = "RUNNING"
+            else:
+                # Cannot prove no process exists, and no terminal result.
+                to = "EFFECT_UNKNOWN"
+        elif frm == "RUNNING":
             if res is not None:
                 _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
                                 source="reconcile")
                 to = "COMPLETED" if int(res.get("exit_code", -1)) == 0 else "FAILED"
             elif _identity_matches(int(claim["pid"]), claim["boot_id"],
                                    claim["start_time"]):
-                to = "RUNNING"  # exact owned process still alive; keep supervision
+                # Exact owned process still alive: keep RUNNING and RE-ASSERT
+                # activation (idempotent; safe if the crash landed between
+                # identity-durable and activation).
+                _activate(claim["bootstrap_path"], run_id, claim["exec_token"])
+                to = "RUNNING"
             else:
-                to = "EFFECT_UNKNOWN"  # outcome cannot be proven -> fail closed
-        if to != frm or clear_run:
+                to = "EFFECT_UNKNOWN"
+        if to != frm:
             with db.transaction() as cur:
-                if clear_run:
-                    cur.execute(
-                        "UPDATE wake_claims SET state=?, run_id='', exec_token='', "
-                        "result_path='', heartbeat_at=? WHERE claim_id=?",
-                        (to, now, cid))
-                else:
-                    cur.execute("UPDATE wake_claims SET state=?, heartbeat_at=? "
-                                "WHERE claim_id=?", (to, now, cid))
+                cur.execute("UPDATE wake_claims SET state=?, heartbeat_at=? "
+                            "WHERE claim_id=?", (to, now, cid))
                 cur.execute("UPDATE wake_jobs SET state=? WHERE job_id=?",
                             (to, f"wake-{claim['obligation_id']}"))
                 cur.execute("UPDATE wake_jobs SET state=? WHERE linked_job_id=?",
@@ -1397,7 +1538,8 @@ def stop_wake_claim_execution(
         terminated = _kill_owned_pgid(int(claim["pgid"]) or 0, None,
                                       pid=int(claim["pid"]))
     # If neither, we do NOT signal anything (never a reused PID / stranger).
-    res = _read_result(claim.get("result_path") or "")
+    res = _read_record(claim.get("result_path") or "", claim_id=claim["claim_id"],
+                       run_id=claim["run_id"], exec_token=claim["exec_token"])
     if res is not None:
         return _finalize_claim(db, claim, int(res.get("exit_code", -1)), now,
                                source="stop")

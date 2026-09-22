@@ -920,25 +920,33 @@ class TestExecutionAuthority(_Base):
         self.assertEqual(last["state"], "COMPLETED")
         self.assertEqual(len(list(marker.iterdir())), 1)
 
-    def test_starting_crash_before_spawn_recovery(self):
-        grant, camp = self._campaign(plan_id="pl-st", grant_id="gr-st")
+    def test_pre_spawn_failure_then_retry(self):
+        grant, camp = self._campaign(plan_id="pl-ps", grant_id="gr-ps")
         d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
         claim_id = d["claim_id"]
-        # Simulate a crash at STARTING with NO process spawned.
-        with self._db.transaction() as cur:
-            cur.execute("UPDATE wake_claims SET state='STARTING', run_id=?, "
-                        "exec_token='tok', pid=0, result_path=? WHERE claim_id=?",
-                        (f"run-{claim_id}", str(self._tmp / "none.json"), claim_id))
-        self._reopen()
-        recon = reconcile_wake_claims(self._db, now=2)
-        self.assertEqual(recon[0]["to"], "RETRY_ELIGIBLE")
-        # Exactly one eventual execution.
+        os.environ["TR_FAILPOINT_p07_after_starting_before_bootstrap_spawn"] = "raise"
+        try:
+            with self.assertRaises(SafetyError):
+                start_wake_claim_execution(
+                    self._db, claim_id=claim_id,
+                    argv=[sys.executable, "-c", "pass"], cwd=str(self._tmp), now=2)
+        finally:
+            os.environ.pop("TR_FAILPOINT_p07_after_starting_before_bootstrap_spawn")
+        claim = wake_claim(self._db, claim_id)
+        # The ENTIRE reservation was cleared (so a retry can actually win).
+        self.assertEqual(claim["state"], "RETRY_ELIGIBLE")
+        for f in ("run_id", "exec_token", "bootstrap_path", "result_path"):
+            self.assertEqual(claim[f], "")
+        self.assertEqual(int(claim["pid"]), 0)
+        # A second valid start succeeds -> exactly one eventual execution.
         run = start_wake_claim_execution(
             self._db, claim_id=claim_id, argv=[sys.executable, "-c", "pass"],
             cwd=str(self._tmp), now=3)
         self.assertEqual(self._wait_terminal(run["run_id"])["state"], "COMPLETED")
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims").fetchone()["n"], 1)
 
-    def test_spawn_failure_no_starting_deadlock(self):
+    def test_outer_spawn_failure_then_retry(self):
         grant, camp = self._campaign(plan_id="pl-sf", grant_id="gr-sf")
         d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
         # Invalid cwd forces the OUTER spawn to fail (bounded policy).
@@ -947,8 +955,129 @@ class TestExecutionAuthority(_Base):
                 self._db, claim_id=d["claim_id"],
                 argv=[sys.executable, "-c", "pass"],
                 cwd="/nonexistent-dir-xyz-123", now=2)
-        # Never a permanent STARTING deadlock.
         self.assertEqual(wake_claim(self._db, d["claim_id"])["state"], "RETRY_ELIGIBLE")
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "pass"], cwd=str(self._tmp), now=3)
+        self.assertEqual(self._wait_terminal(run["run_id"])["state"], "COMPLETED")
+
+    def test_bootstrap_crash_recovers_same_lineage(self):
+        """REAL window: STARTING durable -> bootstrap spawned -> crash
+        BEFORE identity durable / before activation."""
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-bc", grant_id="gr-bc")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        claim_id = d["claim_id"]
+        marker = self._tmp / "mcrash"
+        marker.mkdir()
+        os.environ["TR_FAILPOINT_p07_after_bootstrap_spawn_before_identity_read"] = "raise"
+        try:
+            with self.assertRaises(RuntimeError):
+                start_wake_claim_execution(
+                    self._db, claim_id=claim_id, argv=_marker_worker(marker),
+                    cwd=str(self._tmp), now=2,
+                    result_dir=str(self._tmp / "res-bc"))
+        finally:
+            os.environ.pop("TR_FAILPOINT_p07_after_bootstrap_spawn_before_identity_read")
+        claim = wake_claim(self._db, claim_id)
+        self.assertEqual(claim["state"], "STARTING")
+        self.assertTrue(claim["bootstrap_path"])
+        # No worker effect occurred before activation.
+        self.assertEqual(len(list(marker.iterdir())), 0)
+        # The (still-live) bootstrap writes its durable identity record shortly
+        # after spawn; a real restart happens after that.
+        deadline = time.time() + 3
+        while time.time() < deadline and not os.path.exists(claim["bootstrap_path"]):
+            time.sleep(0.02)
+        self.assertTrue(os.path.exists(claim["bootstrap_path"]))
+        # Restart.
+        self._reopen()
+        p07mod._CHILDREN.clear()
+        recon = reconcile_wake_claims(self._db, now=3)
+        self.assertEqual(recon[0]["to"], "RUNNING")  # same lineage recovered
+        # No second bootstrap/worker spawned blindly: exactly one claim.
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims").fetchone()["n"], 1)
+        last = self._wait_terminal(claim["run_id"])
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(len(list(marker.iterdir())), 1)  # exactly one worker
+        self.assertEqual(int(wake_claim(self._db, claim_id)["attempts"]), 1)
+
+    def test_crash_after_identity_before_activation(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-ia", grant_id="gr-ia")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        marker = self._tmp / "mia"
+        marker.mkdir()
+        os.environ["TR_FAILPOINT_p07_after_identity_durable_before_activation"] = "raise"
+        try:
+            with self.assertRaises(RuntimeError):
+                start_wake_claim_execution(
+                    self._db, claim_id=d["claim_id"], argv=_marker_worker(marker),
+                    cwd=str(self._tmp), now=2, result_dir=str(self._tmp / "res-ia"))
+        finally:
+            os.environ.pop("TR_FAILPOINT_p07_after_identity_durable_before_activation")
+        claim = wake_claim(self._db, d["claim_id"])
+        self.assertEqual(claim["state"], "RUNNING")  # identity durable
+        self.assertGreater(int(claim["pid"]), 0)
+        self.assertEqual(len(list(marker.iterdir())), 0)  # not activated yet
+        self._reopen()
+        p07mod._CHILDREN.clear()
+        reconcile_wake_claims(self._db, now=3)  # re-assert activation
+        self.assertEqual(self._wait_terminal(claim["run_id"])["state"], "COMPLETED")
+        self.assertEqual(len(list(marker.iterdir())), 1)
+
+    def test_crash_after_activation_before_observe(self):
+        import overnight_runner.p07 as p07mod
+        grant, camp = self._campaign(plan_id="pl-ao", grant_id="gr-ao")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        marker = self._tmp / "mao"
+        marker.mkdir()
+        os.environ["TR_FAILPOINT_p07_after_activation_before_observe"] = "raise"
+        try:
+            with self.assertRaises(RuntimeError):
+                start_wake_claim_execution(
+                    self._db, claim_id=d["claim_id"], argv=_marker_worker(marker),
+                    cwd=str(self._tmp), now=2, result_dir=str(self._tmp / "res-ao"))
+        finally:
+            os.environ.pop("TR_FAILPOINT_p07_after_activation_before_observe")
+        claim = wake_claim(self._db, d["claim_id"])
+        self.assertEqual(claim["state"], "RUNNING")
+        self._reopen()
+        p07mod._CHILDREN.clear()
+        reconcile_wake_claims(self._db, now=3)
+        self.assertEqual(self._wait_terminal(claim["run_id"])["state"], "COMPLETED")
+        self.assertEqual(len(list(marker.iterdir())), 1)
+
+    def test_starting_with_durable_result_finalizes(self):
+        grant, camp = self._campaign(plan_id="pl-dr", grant_id="gr-dr")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="x", now=1)
+        claim_id = d["claim_id"]
+        rp = self._tmp / "r.json"
+        rp.write_text(json.dumps({"claim_id": claim_id, "run_id": f"run-{claim_id}",
+                                  "exec_token": "tok", "exit_code": 0,
+                                  "finished_at": 1}))
+        with self._db.transaction() as cur:
+            cur.execute("UPDATE wake_claims SET state='STARTING', run_id=?, "
+                        "exec_token='tok', bootstrap_path='', result_path=? "
+                        "WHERE claim_id=?", (f"run-{claim_id}", str(rp), claim_id))
+        recon = reconcile_wake_claims(self._db, now=2)
+        self.assertEqual(recon[0]["to"], "COMPLETED")
+        self.assertEqual(wake_claim(self._db, claim_id)["state"], "COMPLETED")
+
+    def test_forged_records_rejected(self):
+        from overnight_runner.p07 import _read_record
+        p = self._tmp / "rec.json"
+        p.write_text(json.dumps({"claim_id": "c1", "run_id": "r1",
+                                 "exec_token": "good", "exit_code": 0}))
+        self.assertIsNotNone(_read_record(str(p), claim_id="c1", run_id="r1",
+                                          exec_token="good"))
+        self.assertIsNone(_read_record(str(p), claim_id="c1", run_id="r1",
+                                       exec_token="wrong-token"))
+        self.assertIsNone(_read_record(str(p), claim_id="cX", run_id="r1",
+                                       exec_token="good"))
+        self.assertIsNone(_read_record(str(p), claim_id="c1", run_id="rX",
+                                       exec_token="good"))
 
     def test_restart_preserves_running_and_recovers_durable_result(self):
         import overnight_runner.p07 as p07mod

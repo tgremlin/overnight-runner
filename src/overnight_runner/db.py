@@ -384,7 +384,8 @@ CREATE TABLE IF NOT EXISTS wake_claims (
     exec_token TEXT NOT NULL DEFAULT '',   -- ownership token for the start reservation
     boot_id TEXT NOT NULL DEFAULT '',      -- host boot id of the owned process
     start_time TEXT NOT NULL DEFAULT '',   -- /proc start-time identity
-    result_path TEXT NOT NULL DEFAULT ''   -- durable worker result record
+    result_path TEXT NOT NULL DEFAULT '',  -- durable worker result record
+    bootstrap_path TEXT NOT NULL DEFAULT '' -- durable bootstrap identity record
 );
 CREATE INDEX IF NOT EXISTS wake_claims_campaign ON wake_claims(campaign_id);
 
@@ -467,6 +468,7 @@ class Database:
         self._record_migration("p07-0001-hermes-foreman-tables")
         self._record_migration("p07-0002-capacity-outcomes-wake-claims-fallbacks")
         self._record_migration("p07-0003-claim-execution-and-wait-model")
+        self._record_migration("p07-0004-bootstrap-handshake")
         for _tbl, _col, _decl in (
             ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),
@@ -480,6 +482,7 @@ class Database:
             ("wake_claims", "boot_id", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "start_time", "TEXT NOT NULL DEFAULT ''"),
             ("wake_claims", "result_path", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "bootstrap_path", "TEXT NOT NULL DEFAULT ''"),
             ("wake_jobs", "linked_job_id", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),

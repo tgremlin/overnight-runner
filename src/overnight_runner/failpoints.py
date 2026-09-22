@@ -54,6 +54,19 @@ INTERNAL_FAILPOINTS: dict[str, str] = {
     "activate_grant_before_commit": (
         "protected approval consumed but active grant not yet committed"
     ),
+    # P07 owned-launch handshake failpoints (test-only).
+    "p07_after_starting_before_bootstrap_spawn": (
+        "STARTING reservation durable, bootstrap wrapper not yet spawned"
+    ),
+    "p07_after_bootstrap_spawn_before_identity_read": (
+        "bootstrap wrapper spawned, durable process identity not yet read"
+    ),
+    "p07_after_identity_durable_before_activation": (
+        "process identity durable, worker not yet activated"
+    ),
+    "p07_after_activation_before_observe": (
+        "worker activated, parent has not yet observed RUNNING/result"
+    ),
 }
 
 
