@@ -212,7 +212,10 @@ def main() -> int:
             model_digest=profile.model_digest or "0" * 64,
             policy_profile_id="pol-1", validator_profile_ids=["python_compile", "pytest"],
             provider_profile_id="local-ollama", egress_policy_id="eg-local",
-            operator_id="op-canary", operator_receipt_digest="c" * 64,
+            operator_id="op-canary",
+            operator_receipt_digest=hashlib.sha256(json.dumps(
+                {"approval_id": "appr-canary", "operator_id": "op-canary"},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
             budget=Budget(schema_version="trio.budget.v1", max_chunks=3, max_model_calls=10,
                           max_tool_calls=30, max_local_repairs=1, max_rechunks=1,
                           max_active_seconds=1800, max_wall_seconds=3600,
@@ -270,6 +273,7 @@ def main() -> int:
                               ttl_seconds=600)
         ident = process_identity(os.getpid())
         applied_ids: list[str] = []
+        mutation_receipt_ids: list[str] = []
 
         class FencedBroker(RunnerBrokerClient):
             def apply(self, proposal_id: str) -> dict:
@@ -279,6 +283,8 @@ def main() -> int:
                     lease_id=lease.lease_id, owner_id="wkr-canary",
                     owner_pid=os.getpid(), owner_start_time=ident["start_time"])
                 applied_ids.append(proposal_id)
+                if res.get("receipt_id"):
+                    mutation_receipt_ids.append(res["receipt_id"])
                 return res
 
         broker = FencedBroker(wt, runner_src=RUNNER_SRC,
@@ -320,6 +326,8 @@ def main() -> int:
         ev["worker_completion_report"] = report.model_dump(mode="json")
         ev["broker_proposal_ids"] = list(broker._proposals.keys())
         ev["fenced_applied_proposal_ids"] = applied_ids
+        ev["mutation_receipt_ids"] = mutation_receipt_ids
+        ev["mutation_receipt_kinds"] = ["mutation/apply"] if mutation_receipt_ids else []
 
         if not applied_ids:
             return _blocked("model_did_not_apply_candidate",

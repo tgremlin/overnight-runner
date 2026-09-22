@@ -196,10 +196,25 @@ def mutation_canary(tmp: Path) -> dict:
     # Brokered real mutation.
     reg = CommandRegistry()
     reg.register(CommandSpec("noop", ["true"], "repo", 5, "read"))
+    from overnight_runner.receipts import mint_mutation_receipt
+
+    def _mint(payload: dict) -> str:
+        try:
+            return mint_mutation_receipt(
+                proposal_id=payload.get("proposal_id", ""), path=payload.get("path", ""),
+                op=payload.get("op", ""), pre_sha256=payload.get("pre_sha256", ""),
+                post_sha256=payload.get("post_sha256", ""),
+                bytes_written=int(payload.get("bytes_written", 0)),
+                candidate_snapshot_digest=payload.get("candidate_snapshot_digest", ""),
+                receipts_dir=state / "receipts")
+        except Exception:
+            return ""
+
     broker = Broker(repo_root=wt, registry=reg,
                     allowed_write_paths=["src/app.py", "tests/test_app.py"],
                     allowed_create_paths=[],
                     allowed_read_paths=["src/app.py", "tests/test_app.py"],
+                    on_apply_receipt=_mint,
                     allowed_protected_read_paths=[],
                     model_allowed_command_ids=["noop"], required_validator_ids=[],
                     approved_repo_head=None, artifact_dir=tmp / "art")
