@@ -309,6 +309,7 @@ CREATE TABLE IF NOT EXISTS capacity_waits (
     provider TEXT NOT NULL DEFAULT '',
     account TEXT NOT NULL DEFAULT '',
     profile TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',      -- actual model identity (cooldown key)
     reason_kind TEXT NOT NULL,
     entered_at INTEGER NOT NULL,
     next_eligible_at INTEGER NOT NULL DEFAULT 0,
@@ -331,7 +332,8 @@ CREATE TABLE IF NOT EXISTS wake_jobs (
     requested_at INTEGER NOT NULL,
     state TEXT NOT NULL,                -- ACCEPTED | COMPLETED | NOOP | REFUSED
     detail TEXT NOT NULL DEFAULT '',
-    wake_generation INTEGER NOT NULL DEFAULT 1
+    wake_generation INTEGER NOT NULL DEFAULT 1,
+    linked_job_id TEXT NOT NULL DEFAULT ''   -- control job -> wake/run lineage
 );
 CREATE INDEX IF NOT EXISTS wake_jobs_campaign ON wake_jobs(campaign_id);
 
@@ -371,7 +373,14 @@ CREATE TABLE IF NOT EXISTS wake_claims (
     generation INTEGER NOT NULL,
     claimed_at INTEGER NOT NULL,
     state TEXT NOT NULL,
-    caller_trigger_id TEXT NOT NULL DEFAULT ''
+    caller_trigger_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    pid INTEGER NOT NULL DEFAULT 0,
+    pgid INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at INTEGER NOT NULL DEFAULT 0,
+    finished_at INTEGER NOT NULL DEFAULT 0,
+    result TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS wake_claims_campaign ON wake_claims(campaign_id);
 
@@ -453,7 +462,17 @@ class Database:
         # P07 (Hermes foreman) — runner-owned capacity/cooldown/wait/job tables.
         self._record_migration("p07-0001-hermes-foreman-tables")
         self._record_migration("p07-0002-capacity-outcomes-wake-claims-fallbacks")
+        self._record_migration("p07-0003-claim-execution-and-wait-model")
         for _tbl, _col, _decl in (
+            ("capacity_waits", "model", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "run_id", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "pid", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_claims", "pgid", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_claims", "heartbeat_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_claims", "finished_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_claims", "result", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_claims", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("wake_jobs", "linked_job_id", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "repo_root", "TEXT NOT NULL DEFAULT ''"),
             ("campaigns", "worktree_path", "TEXT NOT NULL DEFAULT ''"),
             ("chunks", "required_validator_ids_json", "TEXT NOT NULL DEFAULT '[]'"),

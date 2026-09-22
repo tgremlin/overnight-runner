@@ -24,6 +24,9 @@ Review corrections applied here (P07 follow-up):
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -378,7 +381,7 @@ def apply_capacity_outcome(
 def enter_capacity_wait(
     db: Database, *, campaign_id: str, reason_kind: str, grant_id: str = "",
     budget_ledger_id: str = "", chunk_id: str = "", obligation: str = "",
-    provider: str = "", account: str = "", profile: str = "",
+    provider: str = "", account: str = "", profile: str = "", model: str = "",
     next_eligible_at: int = 0, retry_provenance: str = "", now: int | None = None,
 ) -> str:
     now = int(now if now is not None else time.time())
@@ -388,13 +391,13 @@ def enter_capacity_wait(
             """
             INSERT INTO capacity_waits (
                 wait_id, campaign_id, chunk_id, obligation, provider, account,
-                profile, reason_kind, entered_at, next_eligible_at,
+                profile, model, reason_kind, entered_at, next_eligible_at,
                 retry_provenance, grant_id, budget_ledger_id, wake_generation,
                 active, resolved_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,0)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,0)
             """,
             (wait_id, campaign_id, chunk_id, obligation, provider, account,
-             profile, reason_kind, now, int(next_eligible_at),
+             profile, model, reason_kind, now, int(next_eligible_at),
              retry_provenance[:512], grant_id, budget_ledger_id),
         )
     return wait_id
@@ -594,20 +597,28 @@ def obligation_identity(camp: dict[str, Any]) -> tuple[str, int]:
 
 def _routing_identity(db: Database, camp: dict[str, Any],
                       waits: list[dict[str, Any]]) -> tuple[str, str, str]:
-    for w in waits:
-        if w.get("provider"):
-            return w["provider"], w.get("account", ""), w.get("profile", "")
+    """Return the (provider, account, MODEL) cooldown identity.
+
+    The third element is the actual MODEL identity (the cooldown key), NOT
+    the provider profile id. A wait's own model is preferred; otherwise
+    the grant's model_name is used.
+    """
+    grant_provider = grant_model = ""
     gid = camp.get("grant_id", "")
     row = db._conn.execute("SELECT payload_json FROM grants WHERE grant_id=?",
                            (gid,)).fetchone()
     if row is not None:
         try:
             payload = json.loads(row["payload_json"])
-            return (payload.get("provider_profile_id", ""), "",
-                    payload.get("model_name", ""))
+            grant_provider = payload.get("provider_profile_id", "")
+            grant_model = payload.get("model_name", "")
         except Exception:
             pass
-    return "", "", ""
+    for w in waits:
+        if w.get("provider"):
+            return (w["provider"], w.get("account", "") or "",
+                    w.get("model") or grant_model)
+    return grant_provider, "", grant_model
 
 
 def _budget_headroom_reason(db: Database, campaign_id: str) -> str | None:
@@ -644,6 +655,8 @@ def _wake_decision(db: Database, camp: dict[str, Any], now: int) -> tuple[str, s
             return "REFUSED", f"capacity_parked_no_reset:{w['reason_kind']}"
         if w["reason_kind"] in ("auth_failure", "invalid_provider_model_profile"):
             return "REFUSED", f"capacity_authority_required:{w['reason_kind']}"
+        if w["reason_kind"] == "unknown_transport":
+            return "REFUSED", "capacity_fail_closed:unknown_transport"
 
     # Cooldown authority (independent of capacity_waits.next_eligible_at).
     provider, account, model = _routing_identity(db, camp, waits)
@@ -688,21 +701,27 @@ def wake_tick(
     claim_id = f"wclaim-{obligation_id}"
     job_id = f"wake-{obligation_id}"
 
-    if db._conn.execute("SELECT claim_id FROM wake_claims WHERE claim_id=?",
-                        (claim_id,)).fetchone() is not None:
+    existing = db._conn.execute(
+        "SELECT claim_id, state FROM wake_claims WHERE claim_id=?",
+        (claim_id,)).fetchone()
+    if existing is not None:
         return {"decision": "DUPLICATE", "advanced": 0,
                 "reason": "obligation_already_claimed", "job_id": job_id,
-                "claim_id": claim_id, "obligation_id": obligation_id}
+                "claim_id": claim_id, "obligation_id": obligation_id,
+                "claim_state": existing["state"]}
 
     decision, reason = _wake_decision(db, camp, now)
     advanced = 0
     with db.transaction() as cur:
         # Re-check under the write lock (concurrent duplicate triggers).
-        if cur.execute("SELECT claim_id FROM wake_claims WHERE claim_id=?",
-                       (claim_id,)).fetchone() is not None:
+        ex = cur.execute("SELECT claim_id, state FROM wake_claims WHERE claim_id=?",
+                         (claim_id,)).fetchone()
+        if ex is not None:
             return {"decision": "DUPLICATE", "advanced": 0,
                     "reason": "obligation_already_claimed", "job_id": job_id,
-                    "claim_id": claim_id, "obligation_id": obligation_id}
+                    "claim_id": claim_id, "obligation_id": obligation_id,
+                    "claim_state": ex["state"]}
+        job_val = "CLAIMED" if decision == "DISPATCH_ELIGIBLE" else decision
         cur.execute(
             """
             INSERT INTO wake_jobs (job_id, operation, campaign_id, requested_at,
@@ -711,7 +730,7 @@ def wake_tick(
                 state=excluded.state, detail=excluded.detail,
                 requested_at=excluded.requested_at
             """,
-            (job_id, WAKE_OPERATION, campaign_id, now, decision, reason, gen),
+            (job_id, WAKE_OPERATION, campaign_id, now, job_val, reason, gen),
         )
         if decision == "DISPATCH_ELIGIBLE":
             cur.execute(
@@ -927,6 +946,326 @@ def project_hermes_cards(db: Database, *, campaign_id: str) -> list[dict[str, An
 
 
 # ===========================================================================
+# A06/A03 — one trusted provider-result -> capacity-state path
+# ===========================================================================
+
+# Deterministic mapping from a normalized outcome to a durable capacity
+# state. Nothing here is caller-chosen.
+def _capacity_state_for(kind: str) -> tuple[str, bool]:
+    """Return (wait_reason or '', is_cooling) for a normalized kind."""
+    if kind in (CapacityKind.RATE_LIMITED.value, CapacityKind.OVERLOADED.value,
+                CapacityKind.PROVIDER_UNAVAILABLE.value):
+        return kind, True
+    if kind == CapacityKind.QUOTA_EXHAUSTED_KNOWN_RESET.value:
+        return kind, True
+    if kind == CapacityKind.QUOTA_EXHAUSTED_NO_RESET.value:
+        return "quota_exhausted_no_reset", True
+    if kind == CapacityKind.AUTH_FAILURE.value:
+        return "auth_failure", False
+    if kind == CapacityKind.INVALID_PROVIDER_MODEL_PROFILE.value:
+        return "invalid_provider_model_profile", False
+    if kind == CapacityKind.UNKNOWN_TRANSPORT.value:
+        return "unknown_transport", False
+    return "", False
+
+
+def handle_provider_result(
+    db: Database, outcome: CapacityOutcome, *, account: str = "",
+    campaign_id: str = "", chunk_id: str = "", obligation: str = "",
+    grant_id: str = "", budget_ledger_id: str = "", now: int | None = None,
+) -> dict[str, Any]:
+    """ONE trusted runner-owned path: classify -> persist outcome ->
+    update cooldown -> establish/update the durable WAIT_CAPACITY /
+    blocking provider state.
+
+    Atomic enough that a persisted AUTH_FAILURE (or any blocking kind)
+    cannot exist while the runner independently considers the same
+    obligation healthy. Idempotent per (campaign, reason_kind).
+    """
+    now = int(now if now is not None else time.time())
+    outcome_id = f"cap-{uuid.uuid4().hex[:16]}"
+    wait_reason, cooling = _capacity_state_for(outcome.kind)
+    cooldown_until = 0
+    if cooling:
+        if outcome.reset_at:
+            cooldown_until = int(outcome.reset_at)
+        elif outcome.retry_after_seconds:
+            cooldown_until = now + int(outcome.retry_after_seconds)
+    wait_id = ""
+    with db.transaction() as cur:
+        cur.execute(
+            """
+            INSERT INTO capacity_outcomes (
+                outcome_id, schema_version, provider, account, model, kind,
+                http_status, error_code, retry_after_seconds, reset_at,
+                transport_class, occurred_at, campaign_id, chunk_id, obligation,
+                evidence_ref, classification_source, classification_version
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (outcome_id, outcome.schema_version, outcome.provider, account,
+             outcome.model, outcome.kind, outcome.http_status, outcome.error_code,
+             outcome.retry_after_seconds, outcome.reset_at, outcome.transport_class,
+             now, campaign_id, chunk_id, obligation, outcome.evidence,
+             outcome.source, outcome.classification_version),
+        )
+        if cooling:
+            cur.execute(
+                """
+                INSERT INTO provider_cooldowns
+                    (provider, account, model, kind, reason, until_at, updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(provider, account, model) DO UPDATE SET
+                    kind=excluded.kind, reason=excluded.reason,
+                    until_at=MAX(provider_cooldowns.until_at, excluded.until_at),
+                    updated_at=excluded.updated_at
+                """,
+                (outcome.provider, account, outcome.model, outcome.kind,
+                 outcome.evidence[:512], int(cooldown_until), now),
+            )
+        if wait_reason and campaign_id:
+            nxt = cooldown_until if cooling else 0
+            existing = cur.execute(
+                "SELECT wait_id FROM capacity_waits WHERE campaign_id=? "
+                "AND reason_kind=? AND active=1", (campaign_id, wait_reason)
+            ).fetchone()
+            if existing is not None:
+                wait_id = existing["wait_id"]
+                cur.execute(
+                    "UPDATE capacity_waits SET next_eligible_at=?, model=?, "
+                    "provider=?, account=?, entered_at=? WHERE wait_id=?",
+                    (int(nxt), outcome.model, outcome.provider, account, now, wait_id),
+                )
+            else:
+                wait_id = f"cwait-{uuid.uuid4().hex[:16]}"
+                cur.execute(
+                    """
+                    INSERT INTO capacity_waits (
+                        wait_id, campaign_id, chunk_id, obligation, provider,
+                        account, profile, model, reason_kind, entered_at,
+                        next_eligible_at, retry_provenance, grant_id,
+                        budget_ledger_id, wake_generation, active, resolved_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,0)
+                    """,
+                    (wait_id, campaign_id, chunk_id, obligation, outcome.provider,
+                     account, "", outcome.model, wait_reason, now, int(nxt),
+                     outcome.evidence[:512], grant_id, budget_ledger_id),
+                )
+    return {"outcome_id": outcome_id, "kind": outcome.kind,
+            "wait_id": wait_id, "wait_reason": wait_reason,
+            "cooldown_until": cooldown_until}
+
+
+# ===========================================================================
+# A06 — wake claim lifecycle + runner-owned execution
+# ===========================================================================
+
+# Owned child processes keyed by run_id. Supervision is per-pgid only:
+# NEVER a broad kill by name.
+_CHILDREN: dict[str, subprocess.Popen] = {}
+
+
+def wake_claim(db: Database, claim_id: str) -> dict[str, Any] | None:
+    row = db._conn.execute("SELECT * FROM wake_claims WHERE claim_id=?",
+                           (claim_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def start_wake_claim_execution(
+    db: Database, *, claim_id: str, argv: list[str], cwd: str,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Start the OWNED bounded worker execution for a claim.
+
+    Stores the durable run identity on the claim (no second execution
+    state machine for the work itself). Only the runner calls this.
+    """
+    now = int(now if now is not None else time.time())
+    row = wake_claim(db, claim_id)
+    if row is None:
+        raise SafetyError(f"wake claim {claim_id!r} not found")
+    if row["state"] not in ("CLAIMED", "RETRY_ELIGIBLE"):
+        raise SafetyError(f"claim {claim_id!r} not startable (state={row['state']})")
+    if row["run_id"]:
+        raise SafetyError(f"claim {claim_id!r} already has run {row['run_id']!r}")
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = 0
+    run_id = f"run-{claim_id}"
+    _CHILDREN[run_id] = proc
+    wake_job_id = f"wake-{row['obligation_id']}"
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE wake_claims SET state='RUNNING', run_id=?, pid=?, pgid=?, "
+            "heartbeat_at=?, attempts=attempts+1 WHERE claim_id=?",
+            (run_id, proc.pid, pgid, now, claim_id),
+        )
+        cur.execute(
+            "UPDATE wake_jobs SET state='RUNNING', detail=? WHERE job_id=?",
+            (run_id, wake_job_id),
+        )
+        # Mirror the lineage onto any control job that requested this wake.
+        cur.execute(
+            "UPDATE wake_jobs SET state='RUNNING' WHERE linked_job_id=?",
+            (wake_job_id,),
+        )
+    return {"claim_id": claim_id, "run_id": run_id, "pid": proc.pid, "pgid": pgid,
+            "state": "RUNNING"}
+
+
+def poll_wake_claim_execution(
+    db: Database, *, run_id: str, now: int | None = None,
+) -> dict[str, Any]:
+    """Observe the owned worker; transition the claim on terminal exit."""
+    now = int(now if now is not None else time.time())
+    row = db._conn.execute("SELECT * FROM wake_claims WHERE run_id=?",
+                           (run_id,)).fetchone()
+    if row is None:
+        raise SafetyError(f"no wake claim for run {run_id!r}")
+    claim = dict(row)
+    proc = _CHILDREN.get(run_id)
+    if proc is None:
+        return {"run_id": run_id, "state": claim["state"], "exit_code": None,
+                "claim_id": claim["claim_id"]}
+    rc = proc.poll()
+    if rc is None:
+        return {"run_id": run_id, "state": "RUNNING", "pid": claim["pid"],
+                "claim_id": claim["claim_id"], "exit_code": None}
+    state = "COMPLETED" if rc == 0 else "FAILED"
+    result = json.dumps({"exit_code": rc, "terminal": state})
+    wake_job_id = f"wake-{claim['obligation_id']}"
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE wake_claims SET state=?, finished_at=?, result=? WHERE run_id=?",
+            (state, now, result, run_id),
+        )
+        cur.execute(
+            "UPDATE wake_jobs SET state=?, detail=? WHERE job_id=?",
+            (state, result, wake_job_id),
+        )
+        cur.execute(
+            "UPDATE wake_jobs SET state=?, detail=? WHERE linked_job_id=?",
+            (state, result, wake_job_id),
+        )
+    return {"run_id": run_id, "state": state, "exit_code": rc,
+            "claim_id": claim["claim_id"], "result": result}
+
+
+def reconcile_wake_claims(db: Database, *, now: int | None = None) -> list[dict[str, Any]]:
+    """Reconcile claims at restart.
+
+    A claim stuck in CLAIMED with NO run identity (crash after the claim
+    was durable but before execution started) is NOT a permanent
+    dead-end: it is transitioned to RETRY_ELIGIBLE so the runner can
+    start exactly one eventual execution.
+    """
+    now = int(now if now is not None else time.time())
+    rows = db._conn.execute(
+        "SELECT * FROM wake_claims WHERE state='CLAIMED' AND run_id=''"
+    ).fetchall()
+    out = []
+    with db.transaction() as cur:
+        for r in rows:
+            cur.execute(
+                "UPDATE wake_claims SET state='RETRY_ELIGIBLE', heartbeat_at=? "
+                "WHERE claim_id=? AND state='CLAIMED' AND run_id=''",
+                (now, r["claim_id"]),
+            )
+            # Un-suppress the corresponding wake job so status reflects it.
+            cur.execute(
+                "UPDATE wake_jobs SET state='RETRY_ELIGIBLE' WHERE job_id=?",
+                (f"wake-{r['obligation_id']}",),
+            )
+            out.append({"claim_id": r["claim_id"], "state": "RETRY_ELIGIBLE"})
+    return out
+
+
+def stop_wake_claim_execution(
+    db: Database, *, run_id: str, now: int | None = None,
+) -> dict[str, Any]:
+    """Runner-owned termination of its OWN owned worker (per-pgid only)."""
+    now = int(now if now is not None else time.time())
+    row = db._conn.execute("SELECT * FROM wake_claims WHERE run_id=?",
+                           (run_id,)).fetchone()
+    if row is None:
+        raise SafetyError(f"no wake claim for run {run_id!r}")
+    claim = dict(row)
+    proc = _CHILDREN.get(run_id)
+    if proc is not None and proc.poll() is None:
+        try:
+            pgid = claim["pgid"] or os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(claim["pgid"], signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+    return poll_wake_claim_execution(db, run_id=run_id, now=now)
+
+
+def consume_control_requests(
+    db: Database, *, worker_argv: list[str] | None = None, cwd: str = ".",
+    now: int | None = None,
+) -> list[dict[str, Any]]:
+    """Runner-owned consumer: drive ACCEPTED control requests.
+
+    ``wake``/``tick`` requests claim the due obligation and (when a worker
+    is provided) start the owned bounded execution; ``status-refresh`` is
+    a short no-long-work operation. The CLI never executes work itself.
+    """
+    now = int(now if now is not None else time.time())
+    rows = db._conn.execute(
+        "SELECT * FROM wake_jobs WHERE state='ACCEPTED' "
+        "AND operation IN ('wake','tick','status-refresh') ORDER BY requested_at ASC"
+    ).fetchall()
+    out = []
+    for r in rows:
+        job = dict(r)
+        op = job["operation"]
+        if op == "status-refresh":
+            with db.transaction() as cur:
+                cur.execute("UPDATE wake_jobs SET state='COMPLETED', detail=? "
+                            "WHERE job_id=?", ("short_status_refresh", job["job_id"]))
+            out.append({"job_id": job["job_id"], "state": "COMPLETED"})
+            continue
+        cid = job["campaign_id"]
+        if not cid:
+            with db.transaction() as cur:
+                cur.execute("UPDATE wake_jobs SET state='REFUSED', detail=? WHERE job_id=?",
+                            ("no_campaign", job["job_id"]))
+            out.append({"job_id": job["job_id"], "state": "REFUSED"})
+            continue
+        res = wake_tick(db, campaign_id=cid, trigger_id=job["job_id"], now=now)
+        claim_id = res.get("claim_id", "")
+        run = None
+        if worker_argv and claim_id:
+            claim = wake_claim(db, claim_id)
+            if claim is not None and claim["state"] in ("CLAIMED", "RETRY_ELIGIBLE"):
+                run = start_wake_claim_execution(db, claim_id=claim_id,
+                                                 argv=worker_argv, cwd=cwd, now=now)
+        with db.transaction() as cur:
+            cur.execute(
+                "UPDATE wake_jobs SET state=?, detail=?, linked_job_id=? WHERE job_id=?",
+                ("RUNNING" if run else res.get("decision", "REFUSED"),
+                 json.dumps({"claim_id": claim_id,
+                             "run_id": (run or {}).get("run_id", ""),
+                             "decision": res.get("decision", "")}),
+                 res.get("job_id", ""), job["job_id"]),
+            )
+        out.append({"job_id": job["job_id"], "state": "RUNNING" if run else res.get("decision"),
+                    "claim_id": claim_id, "run_id": (run or {}).get("run_id", "")})
+    return out
+
+
+# ===========================================================================
 # Narrow schema-defined adapter surface
 # ===========================================================================
 
@@ -963,7 +1302,10 @@ __all__ = [
     "FallbackProfile", "FallbackPolicy", "register_approved_fallback",
     "load_fallback_policy", "resolve_fallback",
     "WAKE_OPERATION", "ALLOWED_CONTROL_OPERATIONS", "obligation_identity",
+    "handle_provider_result",
     "wake_tick", "hermes_tick",
+    "wake_claim", "start_wake_claim_execution", "poll_wake_claim_execution",
+    "reconcile_wake_claims", "stop_wake_claim_execution", "consume_control_requests",
     "request_control", "job_state", "complete_job",
     "project_campaign_status", "project_hermes_cards",
     "ADAPTER_SCHEMA",

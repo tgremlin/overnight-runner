@@ -8,7 +8,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -36,19 +40,26 @@ from overnight_runner.p07 import (
     classify_capacity,
     cooldown_state,
     complete_job,
+    consume_control_requests,
     enter_capacity_wait,
+    handle_provider_result,
     hermes_tick,
     job_state,
     list_cooldowns,
     load_fallback_policy,
     next_eligible_at,
+    poll_wake_claim_execution,
     project_campaign_status,
     project_hermes_cards,
+    reconcile_wake_claims,
     register_approved_fallback,
     request_control,
     resolve_capacity_wait,
     resolve_fallback,
+    start_wake_claim_execution,
+    stop_wake_claim_execution,
     upsert_cooldown,
+    wake_claim,
     wake_tick,
 )
 from overnight_runner.plans import load_plan_digest, register_plan
@@ -482,6 +493,309 @@ class TestProjection(_Base):
             self.assertIn(f, forbidden)
         self.assertEqual(set(ADAPTER_SCHEMA["surfaces"]["control"]["allowed_operations"]),
                          set(ALLOWED_CONTROL_OPERATIONS))
+
+
+# ============================================================
+# A06 — real runner-owned EXECUTION (duplicate-safe)
+# ============================================================
+
+class TestWakeExecution(_Base):
+    def _alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _budget_snapshot(self):
+        rows = self._db._conn.execute(
+            "SELECT campaign_id, cumulative_chunks, cumulative_model_calls, "
+            "cumulative_tool_calls FROM budget_ledgers").fetchall()
+        return sorted(tuple(r) for r in rows)
+
+    def test_two_triggers_one_execution_concurrent(self):
+        grant, camp = self._campaign(plan_id="pl-ex", grant_id="gr-ex")
+        dbfile = Path(os.environ["OVERNIGHT_STATE_DIR"]) / "state.db"
+        results: list[dict] = []
+        barrier = threading.Barrier(2)
+
+        def _trigger(tid):
+            db2 = Database(dbfile)
+            try:
+                barrier.wait(timeout=10)
+                results.append(wake_tick(db2, campaign_id=camp.campaign_id,
+                                         trigger_id=tid, now=10))
+            finally:
+                db2.close()
+
+        ts = [threading.Thread(target=_trigger, args=(f"trig-{i}",)) for i in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=20)
+        # Exactly one claim (one trigger advances; the other converges).
+        advanced = [r for r in results if r.get("advanced") == 1]
+        self.assertEqual(len(advanced), 1)
+        n_claims = self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims WHERE campaign_id=?",
+            (camp.campaign_id,)).fetchone()["n"]
+        self.assertEqual(n_claims, 1)
+        claim_id = advanced[0]["claim_id"]
+        before = self._budget_snapshot()
+        # Runner starts the OWNED bounded worker exactly once.
+        run = start_wake_claim_execution(
+            self._db, claim_id=claim_id,
+            argv=[sys.executable, "-c", "print('ok')"], cwd=str(self._tmp), now=11)
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims WHERE run_id=?",
+            (run["run_id"],)).fetchone()["n"], 1)
+        # Complete + observe the single terminal result.
+        deadline = time.time() + 10
+        last = None
+        while time.time() < deadline:
+            last = poll_wake_claim_execution(self._db, run_id=run["run_id"], now=12)
+            if last["state"] in ("COMPLETED", "FAILED"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(last["exit_code"], 0)
+        # No duplicate budget consumption / attempt.
+        att = self._db._conn.execute(
+            "SELECT attempts FROM wake_claims WHERE claim_id=?",
+            (claim_id,)).fetchone()["attempts"]
+        self.assertEqual(int(att), 1)
+        self.assertEqual(self._budget_snapshot(), before)
+        # Both callers observe the same authoritative lineage.
+        job = job_state(self._db, f"wake-{advanced[0]['obligation_id']}")
+        self.assertIn(job["state"], ("COMPLETED",))
+
+    def test_crash_before_execution_reconciles_to_one_execution(self):
+        grant, camp = self._campaign(plan_id="pl-cr", grant_id="gr-cr")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="a", now=10)
+        self.assertEqual(d["advanced"], 1)
+        self.assertEqual(wake_claim(self._db, d["claim_id"])["state"], "CLAIMED")
+        # Restart before execution started.
+        self._reopen()
+        recon = reconcile_wake_claims(self._db, now=11)
+        self.assertEqual(len(recon), 1)
+        self.assertEqual(wake_claim(self._db, d["claim_id"])["state"], "RETRY_ELIGIBLE")
+        # Exactly one eventual execution.
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "pass"], cwd=str(self._tmp), now=12)
+        deadline = time.time() + 10
+        last = None
+        while time.time() < deadline:
+            last = poll_wake_claim_execution(self._db, run_id=run["run_id"], now=13)
+            if last["state"] in ("COMPLETED", "FAILED"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(self._db._conn.execute(
+            "SELECT COUNT(*) AS n FROM wake_claims WHERE campaign_id=?",
+            (camp.campaign_id,)).fetchone()["n"], 1)
+
+
+# ============================================================
+# A07 — real process supervision + durable job continuity
+# ============================================================
+
+class TestProcessSupervision(_Base):
+    def _alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def test_short_control_owns_long_worker_and_survives_caller(self):
+        grant, camp = self._campaign(plan_id="pl-sup", grant_id="gr-sup")
+        # 1) short control request -> durable control job id
+        job_id = request_control(self._db, operation="wake",
+                                 campaign_id=camp.campaign_id, window_key="w")
+        self.assertEqual(job_state(self._db, job_id)["state"], "ACCEPTED")
+        # 2) runner consumes it and starts the OWNED long-running fixture
+        consumed = consume_control_requests(
+            self._db,
+            worker_argv=[sys.executable, "-c", "import time; time.sleep(1.5)"],
+            cwd=str(self._tmp), now=10)
+        self.assertEqual(len(consumed), 1)
+        run_id = consumed[0]["run_id"]
+        self.assertTrue(run_id)
+        claim = wake_claim(self._db, consumed[0]["claim_id"])
+        child_pid = int(claim["pid"])
+        # 3) the durable job is RUNNING (NOT accepted-as-complete)
+        self.assertEqual(job_state(self._db, job_id)["state"], "RUNNING")
+        self.assertTrue(self._alive(child_pid))
+        # 4) caller times out / disconnects: nothing happens to the worker
+        time.sleep(0.2)
+        self.assertTrue(self._alive(child_pid))
+        self.assertEqual(poll_wake_claim_execution(self._db, run_id=run_id, now=11)["state"],
+                         "RUNNING")
+        self.assertEqual(job_state(self._db, job_id)["state"], "RUNNING")
+        # 5) polling observes the SAME identity/state
+        self.assertEqual(job_state(self._db, job_id)["job_id"], job_id)
+        # 6) runner-owned normal completion
+        deadline = time.time() + 10
+        last = None
+        while time.time() < deadline:
+            last = poll_wake_claim_execution(self._db, run_id=run_id, now=12)
+            if last["state"] in ("COMPLETED", "FAILED"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(last["state"], "COMPLETED")
+        self.assertEqual(job_state(self._db, job_id)["state"], "COMPLETED")
+
+    def test_only_runner_supervision_terminates_owned_worker(self):
+        grant, camp = self._campaign(plan_id="pl-kill", grant_id="gr-kill")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, trigger_id="k", now=1)
+        run = start_wake_claim_execution(
+            self._db, claim_id=d["claim_id"],
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=str(self._tmp), now=2)
+        claim = wake_claim(self._db, d["claim_id"])
+        child_pid = int(claim["pid"])
+        self.assertTrue(self._alive(child_pid))
+        # An unrelated bystander process (our own shell child) is untouched.
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            res = stop_wake_claim_execution(self._db, run_id=run["run_id"], now=3)
+            self.assertIn(res["state"], ("COMPLETED", "FAILED"))
+            time.sleep(0.2)
+            self.assertFalse(self._alive(child_pid))
+            self.assertTrue(self._alive(bystander.pid))  # no broad kill
+        finally:
+            bystander.terminate()
+            bystander.wait(timeout=5)
+
+
+# ============================================================
+# A03/A06 — one trusted provider-result -> capacity-state path
+# ============================================================
+
+class TestProviderResultToState(_Base):
+    def test_auth_result_establishes_blocking_state_atomically(self):
+        grant, camp = self._campaign(plan_id="pl-auth", grant_id="gr-auth")
+        out = classify_capacity(provider="prv-1", http_status=401, model="gemma")
+        res = handle_provider_result(self._db, out, campaign_id=camp.campaign_id,
+                                     grant_id=grant.grant_id, now=10)
+        self.assertEqual(res["wait_reason"], "auth_failure")
+        # Persisted outcome AND a durable blocking wait exist together.
+        self.assertEqual(len(capacity_outcome_history(self._db, kind="auth_failure")), 1)
+        waits = active_waits(self._db, campaign_id=camp.campaign_id)
+        self.assertEqual([w["reason_kind"] for w in waits], ["auth_failure"])
+        # Wake cannot dispatch.
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=20)
+        self.assertEqual(d["decision"], "REFUSED")
+        self.assertIn("authority_required", d["reason"])
+
+    def test_rate_limit_creates_wait_and_cooldown(self):
+        grant, camp = self._campaign(plan_id="pl-rl2", grant_id="gr-rl2")
+        out = classify_capacity(provider="prv-1", http_status=429, model="gemma",
+                                retry_after_seconds=60)
+        res = handle_provider_result(self._db, out, campaign_id=camp.campaign_id, now=10)
+        self.assertEqual(res["wait_reason"], "rate_limited")
+        self.assertEqual(res["cooldown_until"], 70)
+        self.assertIsNotNone(cooldown_state(self._db, provider="prv-1",
+                                            model="gemma", now=20))
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=20)
+        self.assertEqual(d["decision"], "WAIT")
+
+    def test_no_reset_quota_parks_indefinitely(self):
+        grant, camp = self._campaign(plan_id="pl-nq", grant_id="gr-nq")
+        out = classify_capacity(provider="prv-1", error_code="insufficient_quota",
+                                model="gemma")
+        handle_provider_result(self._db, out, campaign_id=camp.campaign_id, now=10)
+        cool = cooldown_state(self._db, provider="prv-1", model="gemma", now=10_000_000)
+        self.assertIsNotNone(cool)  # until_at == 0 => indefinite
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=10_000_001)
+        self.assertEqual(d["decision"], "REFUSED")
+        self.assertIn("no_reset", d["reason"])
+
+    def test_unknown_transport_fails_closed(self):
+        grant, camp = self._campaign(plan_id="pl-ut", grant_id="gr-ut")
+        out = classify_capacity(provider="prv-1", transport_error="weird", model="gemma")
+        res = handle_provider_result(self._db, out, campaign_id=camp.campaign_id, now=10)
+        self.assertEqual(res["wait_reason"], "unknown_transport")
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=11)
+        self.assertEqual(d["decision"], "REFUSED")
+
+    def test_idempotent_no_duplicate_wait(self):
+        grant, camp = self._campaign(plan_id="pl-idem", grant_id="gr-idem")
+        for _ in range(3):
+            out = classify_capacity(provider="prv-1", http_status=429, model="gemma")
+            handle_provider_result(self._db, out, campaign_id=camp.campaign_id, now=10)
+        self.assertEqual(len(active_waits(self._db, campaign_id=camp.campaign_id)), 1)
+
+
+# ============================================================
+# A03 — exact provider/account/model cooldown identity
+# ============================================================
+
+class TestCooldownModelIdentity(_Base):
+    def test_wait_model_identity_matches_cooldown(self):
+        grant, camp = self._campaign(plan_id="pl-mi", grant_id="gr-mi")
+        enter_capacity_wait(self._db, campaign_id=camp.campaign_id,
+                            reason_kind="rate_limited", grant_id=grant.grant_id,
+                            provider="minimax", account="A",
+                            profile="minimax-oauth-profile", model="MiniMax-M3",
+                            next_eligible_at=1000, now=1)
+        upsert_cooldown(self._db, provider="minimax", account="A", model="MiniMax-M3",
+                        kind="rate_limited", until_at=5000, now=1)
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=100)
+        self.assertEqual(d["decision"], "WAIT")
+        self.assertIn("cooldown_until", d["reason"])
+
+    def test_other_model_not_blocked(self):
+        grant, camp = self._campaign(plan_id="pl-om", grant_id="gr-om")
+        # Wait is for model=gemma; the cooldown is for a DIFFERENT model.
+        enter_capacity_wait(self._db, campaign_id=camp.campaign_id,
+                            reason_kind="rate_limited", grant_id=grant.grant_id,
+                            provider="minimax", account="A", model="gemma",
+                            next_eligible_at=0, now=1)
+        upsert_cooldown(self._db, provider="minimax", account="A", model="OTHER-MODEL",
+                        kind="rate_limited", until_at=5000, now=1)
+        # OTHER-MODEL cooldown must NOT block gemma on the same provider/account.
+        d = wake_tick(self._db, campaign_id=camp.campaign_id, now=100)
+        self.assertEqual(d["decision"], "DISPATCH_ELIGIBLE")
+
+
+# ============================================================
+# A05/A09 — paid fallback authorization contract
+# ============================================================
+
+class TestPaidFallbackContract(_Base):
+    def _primary(self):
+        return FallbackProfile(profile_id="primary", role="worker", model_name="gemma",
+                               provider="prv-1", runtime_digest="a" * 64,
+                               egress_policy_id="eg-1")
+
+    def _candidate(self, paid=True, cost=10):
+        return FallbackProfile(profile_id="fb-1", role="worker", model_name="gemma",
+                               provider="prv-1", runtime_digest="a" * 64,
+                               egress_policy_id="eg-1", paid=paid, cost_microusd=cost,
+                               context_tokens=4096)
+
+    def test_grant_spend_allowance_is_the_paid_authorization(self):
+        # max_cost_microusd > 0 is the EXPLICIT grant-level paid-spend
+        # authorization; == 0 denies paid fallback.
+        grant_ok, _ = self._campaign(plan_id="pl-paid", grant_id="gr-paid",
+                                     max_cost_microusd=5000)
+        register_approved_fallback(self._db, role="worker", profile_id="fb-1",
+                                   model_name="gemma", provider="prv-1",
+                                   runtime_digest="a" * 64, egress_policy_id="eg-1",
+                                   paid=True, cost_microusd=10, context_tokens=4096)
+        got = resolve_fallback(self._db, grant_id=grant_ok.grant_id, role="worker",
+                               primary=self._primary(), candidates=[self._candidate()],
+                               primary_unavailable=True)
+        self.assertEqual(got.profile_id, "fb-1")
+
+    def test_registry_has_no_hermes_or_worker_surface(self):
+        # The approved_fallbacks registry is a trusted operator surface;
+        # the adapter schema exposes no registration capability.
+        self.assertNotIn("register_fallback", json.dumps(ADAPTER_SCHEMA))
+        for surface in ADAPTER_SCHEMA["surfaces"].values():
+            self.assertNotIn("fallback", json.dumps(surface).lower())
 
 
 if __name__ == "__main__":
