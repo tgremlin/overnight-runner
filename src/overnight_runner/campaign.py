@@ -476,6 +476,111 @@ def resume_campaign(db: Database, *, campaign_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Human gate (C09 -> G01): the canonical Runner-owned transition
+# ---------------------------------------------------------------------------
+HUMAN_GATE_STATE = "AWAITING_HUMAN_AT_CLOSE"
+#: Lifecycle states from which the human gate may be entered.
+HUMAN_GATE_ELIGIBLE_STATES = ("ACTIVE",)
+
+
+def record_human_gate(
+    db: Database, *, campaign_id: str, gate_id: str, chunk_id: str = "",
+    reason: str = "", now: int | None = None,
+) -> dict[str, Any]:
+    """Park an ACCEPTED campaign at the human acceptance gate.
+
+    This is the canonical Runner-owned replacement for ad-hoc SQL that wrote
+    ``campaigns.state = 'AWAITING_HUMAN_AT_CLOSE'`` from outside the Runner.
+
+    Semantics:
+      * the campaign must exist;
+      * only ``HUMAN_GATE_ELIGIBLE_STATES`` may enter the gate;
+      * the SAME gate request (same gate_id + chunk_id) replays idempotently;
+      * a DIFFERENT gate/chunk while already parked is contradictory and
+        rejected;
+      * a correctly shaped ``campaign_events`` row is emitted;
+      * budgets, acceptance history and C10 are untouched — the gate is never
+        auto-approved.
+    """
+    now = int(now if now is not None else time.time())
+    if not campaign_id:
+        raise SafetyError("record_human_gate: campaign_id is required")
+    if not gate_id:
+        raise SafetyError("record_human_gate: gate_id is required")
+    require_not_paused_or_raise()
+
+    row = db._conn.execute(
+        "SELECT state, completed_at FROM campaigns WHERE campaign_id=?",
+        (campaign_id,),
+    ).fetchone()
+    if row is None:
+        raise SafetyError(f"record_human_gate: campaign {campaign_id!r} not found")
+    state = row["state"]
+
+    with db.transaction() as cur:
+        # Idempotency: the same gate request is a replay, not a new transition.
+        existing = cur.execute(
+            "SELECT event_id, chunk_id, payload FROM campaign_events "
+            "WHERE campaign_id=? AND event_type=? ORDER BY issued_at DESC LIMIT 1",
+            (campaign_id, HUMAN_GATE_STATE),
+        ).fetchone()
+        if state == HUMAN_GATE_STATE:
+            if existing is None:
+                raise SafetyError(
+                    f"campaign {campaign_id!r} is {HUMAN_GATE_STATE} without a "
+                    f"durable gate event; refusing to guess"
+                )
+            prior_chunk = existing["chunk_id"] or ""
+            if prior_chunk != chunk_id:
+                raise SafetyError(
+                    f"record_human_gate: campaign {campaign_id!r} is already at the "
+                    f"gate for chunk {prior_chunk!r}; refusing contradictory gate "
+                    f"for chunk {chunk_id!r}"
+                )
+            return {"schema_version": "trio.human-gate.v1", "campaign_id": campaign_id,
+                    "gate_id": gate_id, "chunk_id": chunk_id,
+                    "state": HUMAN_GATE_STATE, "event_id": existing["event_id"],
+                    "idempotent_replay": True}
+
+        if state not in HUMAN_GATE_ELIGIBLE_STATES:
+            raise SafetyError(
+                f"record_human_gate: campaign {campaign_id!r} is in state {state!r}; "
+                f"only {HUMAN_GATE_ELIGIBLE_STATES} may enter the human gate"
+            )
+
+        event_id = f"ev-{uuid.uuid4().hex[:16]}"
+        cur.execute(
+            """
+            INSERT INTO campaign_events (
+                event_id, campaign_id, chunk_id, event_type,
+                from_state, to_state, actor, payload, fence_generation,
+                issued_at, idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id, campaign_id, chunk_id or None, HUMAN_GATE_STATE,
+                state, HUMAN_GATE_STATE, "runner",
+                json.dumps({"gate_id": gate_id, "reason": reason[:512]}),
+                int(cur.execute("SELECT current_fence FROM campaigns WHERE campaign_id=?",
+                                (campaign_id,)).fetchone()["current_fence"]),
+                now, f"gate-{campaign_id}-{gate_id}-{chunk_id}",
+            ),
+        )
+        cur.execute(
+            "UPDATE campaigns SET state=?, updated_at=? WHERE campaign_id=? AND state=?",
+            (HUMAN_GATE_STATE, now, campaign_id, state),
+        )
+        if cur.rowcount != 1:
+            raise SafetyError(
+                f"record_human_gate: campaign {campaign_id!r} state changed concurrently"
+            )
+    return {"schema_version": "trio.human-gate.v1", "campaign_id": campaign_id,
+            "gate_id": gate_id, "chunk_id": chunk_id, "state": HUMAN_GATE_STATE,
+            "event_id": event_id, "from_state": state, "issued_at": now,
+            "idempotent_replay": False}
+
+
 def cancel_campaign(db: Database, *, campaign_id: str, reason: str) -> None:
     """Operator cancellation: stop work, preserve evidence."""
     require_not_paused_or_raise()
@@ -514,6 +619,9 @@ def _load_campaign(db: Database, campaign_id: str) -> CampaignRecord:
 
 
 __all__ = [
+    "HUMAN_GATE_STATE",
+    "HUMAN_GATE_ELIGIBLE_STATES",
+    "record_human_gate",
     "CampaignHandle",
     "create_campaign",
     "activate_campaign",
