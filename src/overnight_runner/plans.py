@@ -35,6 +35,29 @@ from .safety import SafetyError
 PLAN_TRUSTED_OPERATOR_SURFACE = True
 
 
+def plan_projection_digest(
+    plan_id: str, work_package_criterion_ids: dict[str, set[str]]
+) -> str:
+    """The Runner's canonical projection digest (the EXACT existing formula).
+
+    Extracted so callers can verify a projection before registering it, without
+    changing ``register_plan``'s digest for any existing plan.
+    """
+    canonical = {
+        "plan_id": plan_id,
+        "work_packages": [
+            {
+                "package_id": pkg,
+                "criterion_ids": sorted(sorted(crits)),
+            }
+            for pkg, crits in sorted(work_package_criterion_ids.items())
+        ],
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    import hashlib
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def register_plan(
     db: Database,
     *,
@@ -55,19 +78,18 @@ def register_plan(
     preserve content-addressed immutability.
     """
     # Canonicalize to a sorted JSON-serializable form.
-    canonical = {
-        "plan_id": plan_id,
-        "work_packages": [
-            {
-                "package_id": pkg,
-                "criterion_ids": sorted(sorted(crits)),
-            }
-            for pkg, crits in sorted(work_package_criterion_ids.items())
-        ],
-    }
-    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    import hashlib
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    digest = plan_projection_digest(plan_id, work_package_criterion_ids)
+    payload = json.dumps(
+        {
+            "plan_id": plan_id,
+            "work_packages": [
+                {"package_id": pkg, "criterion_ids": sorted(sorted(crits))}
+                for pkg, crits in sorted(work_package_criterion_ids.items())
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     # Refuse to re-register an existing plan_id (content-addressed immutability).
     existing = load_plan_digest(db, plan_id)
     if existing is not None:
@@ -88,6 +110,60 @@ def register_plan(
             (plan_id, approved_artifact_id, digest, payload),
         )
     return digest
+
+
+def register_plan_verified(
+    db: Database,
+    *,
+    plan_id: str,
+    approved_artifact_id: str,
+    work_package_criterion_ids: dict[str, set[str]],
+    candidate_projection: dict | None = None,
+    expected_plan_digest: str | None = None,
+) -> str:
+    """Register a plan AFTER verifying its projection (M5/H1 proposal).
+
+    The Runner's ``register_plan`` does not verify the projection against the
+    approved artifact. This additive surface closes that gap for callers that can
+    supply the candidate projection (as produced by the compiler adapter):
+
+      * when ``candidate_projection`` is supplied, its ``plan_id`` and
+        ``work_package_criterion_ids`` MUST equal the projection being registered
+        (fail closed: ``SafetyError``);
+      * when ``expected_plan_digest`` is supplied (e.g. the grant's pinned
+        ``approved_plan_digest``), the computed digest MUST equal it (fail closed).
+
+    The digest formula is UNCHANGED — it delegates to ``plan_projection_digest``.
+    A caller with no projection simply calls ``register_plan`` as before.
+    """
+    if candidate_projection is not None:
+        proj_plan_id = candidate_projection.get("plan_id")
+        proj_wpci = candidate_projection.get("work_package_criterion_ids")
+        if not isinstance(proj_wpci, dict):
+            raise SafetyError(
+                "candidate_projection must carry work_package_criterion_ids"
+            )
+        normalised = {
+            pkg: set(crits) for pkg, crits in proj_wpci.items()
+        }
+        if proj_plan_id != plan_id or normalised != work_package_criterion_ids:
+            raise SafetyError(
+                "plan projection does not match the approved artifact projection; "
+                "refusing to register (unknown effect)"
+            )
+    if expected_plan_digest is not None:
+        computed = plan_projection_digest(plan_id, work_package_criterion_ids)
+        if computed != expected_plan_digest:
+            raise SafetyError(
+                f"plan projection digest {computed[:8]} does not equal the pinned "
+                f"{expected_plan_digest[:8]}; refusing to register"
+            )
+    return register_plan(
+        db,
+        plan_id=plan_id,
+        approved_artifact_id=approved_artifact_id,
+        work_package_criterion_ids=work_package_criterion_ids,
+    )
 
 
 def load_plan_digest(db: Database, plan_id: str) -> str | None:
@@ -188,6 +264,8 @@ def assert_chunk_criteria_approved(
 __all__ = [
     "PLAN_TRUSTED_OPERATOR_SURFACE",
     "register_plan",
+    "register_plan_verified",
+    "plan_projection_digest",
     "load_plan",
     "load_plan_digest",
     "load_plan_artifact_id",
