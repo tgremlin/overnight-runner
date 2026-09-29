@@ -27,6 +27,7 @@ __all__ = [
     "discard_runner_evidence",
     "evidence_root",
     "host_tests_scratch_root",
+    "scratch_root",
     "intake_runner_evidence",
     "prune_runner_evidence",
     "run_trusted_validators",
@@ -39,22 +40,32 @@ __all__ = [
 EVIDENCE_ROOT_ENV = "TRIO_RUNNER_EVIDENCE_ROOT"
 
 
+def scratch_root() -> Path:
+    """The Runner-owned scratch root: evidence and host-tests copies live here.
+
+    It is deliberately NOT the state dir. Nesting it in the state dir wrote into the
+    operator's real state directory whenever a caller did not set `OVERNIGHT_STATE_DIR`
+    (the qualification runs the Runner against the real one), which the campaign's
+    "never touch the real state directory" rule forbids. One stable root, with the
+    per-run directories discarded after intake and pruned if a run dies.
+    """
+    root = Path(tempfile.gettempdir()) / "trio-runner-scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def evidence_root() -> Path:
     """The Runner-owned directory validator evidence is created under."""
     override = os.environ.get(EVIDENCE_ROOT_ENV)
-    if override:
-        root = Path(override)
-    else:
-        from .runtime import state_dir
-
-        root = state_dir() / "validator-evidence"
+    root = Path(override) if override else scratch_root() / "validator-evidence"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def host_tests_scratch_root() -> Path:
     """§EXEC3 fix 2 — the Runner-owned root for host-tests scratch copies."""
-    root = evidence_root().parent / "host-tests-scratch"
+    override = os.environ.get(EVIDENCE_ROOT_ENV)
+    root = Path(override).parent / "host-tests-scratch" if override else scratch_root() / "host-tests-scratch"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -153,6 +164,21 @@ class RunnerValidatorEvidence:
         }
 
 
+_PRUNED_THIS_PROCESS = False
+
+
+def _prune_once() -> None:
+    """Retention, once per process: drop evidence a crashed run left behind."""
+    global _PRUNED_THIS_PROCESS
+    if _PRUNED_THIS_PROCESS:
+        return
+    _PRUNED_THIS_PROCESS = True
+    try:
+        prune_runner_evidence()
+    except OSError:
+        pass
+
+
 def run_trusted_validators(
     *,
     workspace_dir: str,
@@ -165,6 +191,7 @@ def run_trusted_validators(
     # The Runner CREATES the evidence path; nothing the candidate wrote is read.
     # §EXEC3 fix 2: inside the Runner-owned root (the state dir by default), NOT the
     # bare system temp dir, so the directory is retained and prunable instead of leaked.
+    _prune_once()
     evidence_dir = tempfile.mkdtemp(prefix="evidence-", dir=str(evidence_root()))
     results: list[dict[str, Any]] = []
     for validator_id in validator_ids:

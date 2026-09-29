@@ -37,9 +37,11 @@ from overnight_runner.validator_evidence import (
     RUNNER_VALIDATOR_EVIDENCE_SCHEMA,
     discard_runner_evidence,
     evidence_root,
+    host_tests_scratch_root,
     intake_runner_evidence,
     prune_runner_evidence,
     run_trusted_validators,
+    scratch_root,
 )
 from overnight_runner.workspace_snapshot import snapshot_workspace
 
@@ -344,10 +346,14 @@ def test_exec3_evidence_is_created_under_the_runner_owned_root(tmp_path: Path, m
     assert len(list(root.iterdir())) == 1
     assert discard_runner_evidence(evidence) is True
     assert not directory.exists()
-    # with NO override the root is the STATE dir, not the bare system temp dir
+    # with NO override the root is the Runner's OWN scratch root, and it is NOT the
+    # state dir: nesting it there wrote into the operator's real state directory
     monkeypatch.delenv(EVIDENCE_ROOT_ENV)
     monkeypatch.setenv("OVERNIGHT_STATE_DIR", str(tmp_path / "state"))
-    assert evidence_root().resolve() == (tmp_path / "state" / "validator-evidence").resolve()
+    default_root = evidence_root().resolve()
+    assert default_root == (scratch_root() / "validator-evidence").resolve()
+    assert not default_root.is_relative_to((tmp_path / "state").resolve())
+    assert host_tests_scratch_root().resolve() == (scratch_root() / "host-tests-scratch").resolve()
 
 
 def test_exec3_discard_removes_the_directory_and_refuses_a_foreign_path(tmp_path: Path, monkeypatch) -> None:
