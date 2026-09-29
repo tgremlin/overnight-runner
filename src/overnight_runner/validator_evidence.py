@@ -42,6 +42,10 @@ VALIDATOR_COMMANDS: Mapping[str, list[str]] = {
     "py_compile": ["python3", "-B", "-c", PY_SYNTAX_CHECK],
 }
 
+#: §OV6-3: `host-tests` is NOT a plain subprocess — the Runner runs it inside the
+#: bwrap confinement (read-only workspace copy + pinned toolchain root).
+HOST_TESTS_VALIDATOR_ID = "host-tests"
+
 
 @dataclass(frozen=True)
 class IntakeDecision:
@@ -90,6 +94,18 @@ def run_trusted_validators(
     evidence_dir = tempfile.mkdtemp(prefix="trio-runner-evidence-")
     results: list[dict[str, Any]] = []
     for validator_id in validator_ids:
+        if validator_id == HOST_TESTS_VALIDATOR_ID:
+            from .host_tests import run_host_tests
+
+            host = run_host_tests(workspace_dir=workspace_dir, timeout_s=timeout_s)
+            results.append({
+                "validator_id": validator_id,
+                "outcome": host.outcome,
+                "exit_code": host.exit_code,
+                "stdout_digest": _digest_of(host.stdout),
+                "stderr_digest": _digest_of(host.stderr),
+            })
+            continue
         argv = VALIDATOR_COMMANDS.get(validator_id)
         if argv is None:
             results.append({"validator_id": validator_id, "outcome": "unknown", "exit_code": None})
@@ -126,6 +142,7 @@ def intake_runner_evidence(
     *,
     submitted: Any,
     runner_evidence: RunnerValidatorEvidence | None,
+    current_tree_digest: str | None = None,
 ) -> IntakeDecision:
     """Compare a submitted evidence document with the Runner's OWN run."""
     if not isinstance(runner_evidence, RunnerValidatorEvidence):
@@ -141,6 +158,10 @@ def intake_runner_evidence(
         return IntakeDecision(False, "EVIDENCE_BINDING_MISMATCH", "the submitted evidence is bound to a different candidate tree", digest=runner_evidence.digest)
     if submitted.get("digest") != runner_evidence.digest:
         return IntakeDecision(False, "EVIDENCE_DISAGREES", "the submitted evidence digest is not the Runner's", digest=runner_evidence.digest)
+    # §OV6-2: the evidence must have been run on the tree the Runner holds NOW
+    # (only checked when the caller supplies the tree it actually holds).
+    if current_tree_digest is not None and runner_evidence.candidate_tree_digest != current_tree_digest:
+        return IntakeDecision(False, "EVIDENCE_BINDING_MISMATCH", "the Runner's evidence was produced on a different candidate tree", digest=runner_evidence.digest)
     if submitted.get("passed") is not True:
         return IntakeDecision(False, "EVIDENCE_SUBMITTED_REFUSAL", "the submitted evidence refuses; a refusal is never ok=True", digest=runner_evidence.digest)
     if runner_evidence.passed is not True:

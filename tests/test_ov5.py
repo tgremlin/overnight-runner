@@ -204,17 +204,21 @@ def _clean_completion(tmp_path: Path, tamper=None):
     changes = [{"kind": c.kind, "path": c.path, "reasons": list(c.reasons), **({"from": c.from_path} if c.from_path else {})} for c in diff_snapshots(dict(baseline.entries), after)]
     ok, refusals = gate(scope_contract_from(chunk_spec=spec, grant=grant), changes, after)
     digest = submitted_verdict_digest(ok, [r.code for r in refusals], len(changes))
-    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest="t" * 64)
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
+    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest=candidate_tree_digest(ws))
     return ws, baseline, spec, grant, digest, evidence
 
 
 def test_ov54_an_honest_candidate_is_accepted_at_completion(tmp_path: Path) -> None:
     ws, baseline, spec, grant, digest, evidence = _clean_completion(tmp_path)
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
     decision = check_completion(
         workspace_dir=ws, baseline=baseline, chunk_spec=spec, grant=grant,
         submitted_scope={"allowed": True, "digest": digest},
         submitted_evidence=evidence.as_dict(), runner_evidence=evidence,
-        flag=TRUST_BOUNDARY_FLAG,
+        accepted_tree_digest=candidate_tree_digest(ws), flag=TRUST_BOUNDARY_FLAG,
     )
     assert decision.ok, decision
 
@@ -277,21 +281,31 @@ def test_ov55_a_candidate_authored_evidence_file_is_ignored(tmp_path: Path) -> N
     repo, head = _owner_repo(tmp_path)
     ws = _ws_from_base(tmp_path, repo, head)
     # the candidate forges a passing evidence file INSIDE the workspace
-    forged = {"schema_version": RUNNER_VALIDATOR_EVIDENCE_SCHEMA, "producer": "runner", "passed": True, "base_commit": head, "candidate_tree_digest": "t" * 64, "digest": "sha256:forged"}
+    from overnight_runner.workspace_snapshot import candidate_tree_digest as _ctd
+
+    # the forgery gets the base commit and tree RIGHT and still fails, because the
+    # digest and the Run's own result are the Runner's alone
+    forged = {"schema_version": RUNNER_VALIDATOR_EVIDENCE_SCHEMA, "producer": "runner", "passed": True, "base_commit": head, "candidate_tree_digest": _ctd(ws), "digest": "sha256:forged"}
     (Path(ws) / "runner-validator-evidence.json").write_text(json.dumps(forged), encoding="utf-8")
     (Path(ws) / "Saved").mkdir(exist_ok=True)
     (Path(ws) / "Saved" / "SUCCESS").write_text("yes", encoding="utf-8")
-    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest="t" * 64)
-    # the Runner's own evidence is what it is; the forged digest is not it
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
+    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest=_ctd(ws))
     assert evidence.digest != "sha256:forged"
     decision = intake_runner_evidence(submitted=forged, runner_evidence=evidence)
-    assert (decision.ok, decision.code) == (False, "EVIDENCE_DISAGREES")
+    assert decision.ok is False
+    # and with a mismatched tree, the binding check refuses first
+    forged_wrong_tree = dict(forged, candidate_tree_digest="t" * 64)
+    assert intake_runner_evidence(submitted=forged_wrong_tree, runner_evidence=evidence).code == "EVIDENCE_BINDING_MISMATCH"
 
 
 def test_ov55_evidence_bound_to_another_base_or_tree_is_refused(tmp_path: Path) -> None:
     repo, head = _owner_repo(tmp_path)
     ws = _ws_from_base(tmp_path, repo, head)
-    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest="t" * 64)
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
+    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest=candidate_tree_digest(ws))
     other_base = dict(evidence.as_dict())
     other_base["base_commit"] = "f" * 40
     assert intake_runner_evidence(submitted=other_base, runner_evidence=evidence).code == "EVIDENCE_BINDING_MISMATCH"

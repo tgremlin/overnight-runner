@@ -125,6 +125,7 @@ def intake_validator_evidence(
     recomputed: Mapping[str, Any] | None = None,
     required_fields: Iterable[str] = ("validator_results",),
     runner_evidence: Any = None,
+    current_tree_digest: str | None = None,
 ) -> IntakeDecision:
     """Compare submitted evidence with the Runner's recomputation.
 
@@ -134,7 +135,7 @@ def intake_validator_evidence(
     if runner_evidence is not None:
         from .validator_evidence import intake_runner_evidence
 
-        return intake_runner_evidence(submitted=submitted, runner_evidence=runner_evidence)
+        return intake_runner_evidence(submitted=submitted, runner_evidence=runner_evidence, current_tree_digest=current_tree_digest)
     if not isinstance(submitted, Mapping):
         return IntakeDecision(False, "EVIDENCE_MISSING", "no submitted validator evidence")
     if not isinstance(recomputed, Mapping):

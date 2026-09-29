@@ -12,6 +12,7 @@ No IO beyond reading the workspace; no clock; no Runner state.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,7 @@ from typing import Any
 __all__ = [
     "ChangeEntry",
     "SnapshotEntry",
+    "candidate_tree_digest",
     "diff_snapshots",
     "snapshot_workspace",
 ]
@@ -113,3 +115,22 @@ def diff_snapshots(before: dict[str, SnapshotEntry], after: dict[str, SnapshotEn
     for r in removed:
         changes.append(ChangeEntry("deleted", r.path, ("deleted",)))
     return sorted(changes, key=lambda c: c.path)
+
+
+def candidate_tree_digest(root: str) -> str:
+    """§OV6-2 — the canonical digest of the tree the Runner holds.
+
+    Same algorithm as the trusted snapshot (path, type, mode, size, content
+    digest, nlink, symlink target), sorted by path, hashed over canonical JSON.
+    The digest therefore covers exactly what the change set is computed from.
+    """
+    entries = snapshot_workspace(root)
+    payload = [
+        {
+            "path": e.path, "type": e.type, "mode": e.mode, "size": e.size,
+            "digest": e.digest, "nlink": e.nlink, "link_target": e.link_target,
+        }
+        for _, e in sorted(entries.items())
+    ]
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

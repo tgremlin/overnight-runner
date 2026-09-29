@@ -19,6 +19,7 @@ from .baseline import RunnerBaseline, is_runner_issued
 from .execution_class import ExecutionClass, admit_execution_class
 from .intake import intake_scope_gate, intake_validator_evidence
 from .safety import SafetyError
+from .workspace_snapshot import candidate_tree_digest
 
 __all__ = [
     "TRUST_BOUNDARY_ENV",
@@ -109,6 +110,7 @@ def check_completion(
     runner_evidence: Any = None,
     recomputed_evidence: Mapping[str, Any] | None = None,
     contract_override: Mapping[str, Any] | None = None,
+    accepted_tree_digest: str | None = None,
     flag: str | None = None,
 ) -> TrustBoundaryDecision:
     """The COMPLETION gate: scope + validator-evidence intake (OV5-4).
@@ -126,13 +128,18 @@ def check_completion(
         return TrustBoundaryDecision(False, applied=True, code="UNWIRED_WORKSPACE", detail="completion needs a workspace, the stored ChunkSpec and the grant")
     if not isinstance(baseline, RunnerBaseline) or not is_runner_issued(baseline):
         return TrustBoundaryDecision(False, applied=True, code="UNWIRED_BASELINE", detail="completion needs a Runner-issued baseline")
+    # §OV6-2: the Runner computes the tree digest from the workspace IT holds and
+    # requires it to equal the accepted digest before anything else is believed.
+    computed_tree = candidate_tree_digest(workspace_dir)
+    if accepted_tree_digest is not None and computed_tree != accepted_tree_digest:
+        return TrustBoundaryDecision(False, applied=True, code="TREE_DIGEST_MISMATCH", detail=f"computed tree {computed_tree[:12]} != accepted {accepted_tree_digest[:12]}")
     scope = intake_scope_gate(
         submitted=submitted_scope, workspace_dir=workspace_dir, baseline=baseline,
         chunk_spec=chunk_spec, grant=grant, contract_override=contract_override,
     )
     if not scope.ok:
         return TrustBoundaryDecision(False, applied=True, code=scope.code, detail=scope.detail, scope=scope)
-    evidence = intake_validator_evidence(submitted=submitted_evidence, recomputed=recomputed_evidence, runner_evidence=runner_evidence)
+    evidence = intake_validator_evidence(submitted=submitted_evidence, recomputed=recomputed_evidence, runner_evidence=runner_evidence, current_tree_digest=computed_tree)
     if not evidence.ok:
         return TrustBoundaryDecision(False, applied=True, code=evidence.code, detail=evidence.detail, scope=scope, evidence=evidence)
     return TrustBoundaryDecision(True, applied=True, scope=scope, evidence=evidence)

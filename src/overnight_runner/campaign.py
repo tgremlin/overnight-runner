@@ -247,14 +247,16 @@ def record_chunk_accepted(
     the chunk is accepted.
     """
     require_not_paused_or_raise()
-    if trust_boundary_flag is not None or completion_inputs is not None:
-        from .admission_trust_boundary import check_completion
+    # §OV6-1: ALWAYS go through the completion gate. With the flag absent (and
+    # TRIO_ADMISSION_TRUST_BOUNDARY unset) it is a no-op, so the environment
+    # variable enforces the boundary even when no kwargs are passed.
+    from .admission_trust_boundary import check_completion
 
-        decision = check_completion(**(completion_inputs or {}), flag=trust_boundary_flag)
-        if not decision.ok:
-            raise SafetyError(
-                f"completion trust boundary refused ({decision.code}): {decision.detail}"
-            )
+    decision = check_completion(**(completion_inputs or {}), flag=trust_boundary_flag)
+    if not decision.ok:
+        raise SafetyError(
+            f"completion trust boundary refused ({decision.code}): {decision.detail}"
+        )
     now = int(time.time())
     with db.transaction() as cur:
         cur.execute(
