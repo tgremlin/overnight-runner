@@ -19,17 +19,18 @@ sys.path.insert(0, str(ROOT / "src"))
 
 @pytest.fixture(autouse=True)
 def _isolated_runner_dirs(tmp_path, monkeypatch):
-    """§EXEC3 fix 2 — every test is isolated from the shared Runner dirs.
+    """§EXEC3 fix 2 — every test gets its OWN Runner scratch root.
 
-    Two things this guarantees, both of which a test suite must never get wrong:
-      * the Runner's OWN evidence/scratch root is per test and inside pytest's
-        tmp_path, so a test cannot accumulate directories in the shared root;
-      * the state dir is per test, so no test can write into the REAL state
-        directory when it forgets to set OVERNIGHT_STATE_DIR.
+    The shared root used to accumulate one directory per evidence run, and the first
+    version of that root was nested in the state dir, so a test that left
+    OVERNIGHT_STATE_DIR unset wrote into the configured — possibly REAL — state
+    directory. Both are now impossible: the scratch root is a per-test tmp_path, and
+    the Runner's default root is never the state dir. The state dir itself is
+    deliberately left alone here: the approval-binding rows need the bindings the
+    session already has.
     """
     from overnight_runner.validator_evidence import EVIDENCE_ROOT_ENV
 
-    monkeypatch.setenv("OVERNIGHT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(tmp_path / "runner-scratch"))
 
 
