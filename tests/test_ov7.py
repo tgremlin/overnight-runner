@@ -11,12 +11,15 @@ from pathlib import Path
 import pytest
 
 from overnight_runner.credential_exposure import (
+    AUTH_LOCATIONS_PATH,
+    AUTH_LOCATIONS_SCHEMA_VERSION,
     KNOWN_AUTH_LOCATIONS,
     KNOWN_AUTH_VARIABLES,
     CredentialRefusal,
     assert_no_secret_in_argv,
     build_auth_file_bind,
     build_env_allowlist_variable,
+    load_auth_locations,
 )
 from overnight_runner.host_tests import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -152,45 +155,132 @@ def test_ov72_the_legitimate_shape_still_builds() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# §OV7-3 credential exposure (pure builders; no real credential)
+# §OV7-3 / §OV8 credential exposure (pure builders; no real credential)
 # --------------------------------------------------------------------------- #
-def test_ov73_a_read_only_bind_of_the_known_auth_file_is_built() -> None:
-    known = KNOWN_AUTH_LOCATIONS["opencode"].replace("~", "/home/sandbox")
-    args = build_auth_file_bind(tool="opencode", auth_path=known, stat_kind="file")
-    assert args.argv == ("--ro-bind", known, known)
-    assert args.env_allow == ()
-    assert args.mechanism == "auth-file-readonly-bind"
+import json  # noqa: E402
+
+HOST_HOME = "/home/operator"
+SANDBOX_HOME = "/home/sandbox"
+#: A VERIFIED location table, as M3 would write it after observing the tools.
+VERIFIED = {
+    "opencode": {"location": "~/.local/share/opencode/auth.json", "verified": True},
+    "commandcode": {"location": "~/.commandcode/auth.json", "verified": True},
+}
 
 
-def test_ov73_a_directory_bind_is_refused() -> None:
-    known = KNOWN_AUTH_LOCATIONS["opencode"].replace("~", "/home/sandbox")
-    with pytest.raises(CredentialRefusal) as exc:
-        build_auth_file_bind(tool="opencode", auth_path=known, stat_kind="dir")
-    assert exc.value.code == "AUTH_BIND_IS_DIRECTORY"
+def _paths(tool: str) -> tuple[str, str]:
+    location = VERIFIED[tool]["location"]
+    return location.replace("~", HOST_HOME), location.replace("~", SANDBOX_HOME)
 
 
-@pytest.mark.parametrize("kind,code", [("symlink", "AUTH_BIND_IS_SYMLINK"), ("missing", "AUTH_BIND_NOT_A_FILE")])
-def test_ov73_a_non_regular_file_is_refused(kind: str, code: str) -> None:
-    known = KNOWN_AUTH_LOCATIONS["commandcode"].replace("~", "/home/sandbox")
-    with pytest.raises(CredentialRefusal) as exc:
-        build_auth_file_bind(tool="commandcode", auth_path=known, stat_kind=kind)
-    assert exc.value.code == code
+def test_ov81_source_and_destination_are_separate_and_differ() -> None:
+    source, destination = _paths("opencode")
+    args = build_auth_file_bind(
+        tool="opencode", source_path=source, destination_path=destination,
+        stat_kind="file", host_home=HOST_HOME, locations=VERIFIED,
+    )
+    assert args.argv == ("--ro-bind", source, destination)
+    assert args.source_path == source and args.destination_path == destination
+    assert source != destination  # the host layout is never reused as the sandbox path
 
 
-def test_ov73_a_path_outside_the_known_auth_location_is_refused() -> None:
-    for bad in ("/home/sandbox/.ssh/id_rsa", "/home/sandbox/.config/opencode", "/tmp/auth.json"):
+def test_ov81_the_destination_must_be_under_the_sandbox_home() -> None:
+    source, _ = _paths("opencode")
+    for bad in ("/tmp/auth.json", "/home/other/.local/share/opencode/auth.json", "/home/sandboxx/a"):
         with pytest.raises(CredentialRefusal) as exc:
-            build_auth_file_bind(tool="opencode", auth_path=bad, stat_kind="file")
-        assert exc.value.code == "AUTH_PATH_OUTSIDE_KNOWN_LOCATION"
+            build_auth_file_bind(
+                tool="opencode", source_path=source, destination_path=bad,
+                stat_kind="file", host_home=HOST_HOME, locations=VERIFIED,
+            )
+        assert exc.value.code in ("AUTH_DESTINATION_OUTSIDE_SANDBOX_HOME", "AUTH_DESTINATION_MISMATCH")
+
+
+def test_ov81_the_sandbox_home_must_match() -> None:
+    source, destination = _paths("opencode")
+    # a destination under a DIFFERENT sandbox home is refused
     with pytest.raises(CredentialRefusal) as exc:
-        build_auth_file_bind(tool="unknown-tool", auth_path="/x", stat_kind="file")
-    assert exc.value.code == "UNKNOWN_TOOL"
+        build_auth_file_bind(
+            tool="opencode", source_path=source, destination_path=destination,
+            stat_kind="file", host_home=HOST_HOME, sandbox_home="/home/elsewhere", locations=VERIFIED,
+        )
+    # the destination is not under THAT sandbox home, so it is refused (the
+    # outside-home check runs first; either refusal means "the home must match")
+    assert exc.value.code in ("AUTH_DESTINATION_OUTSIDE_SANDBOX_HOME", "AUTH_DESTINATION_MISMATCH")
+    # ...and the matching one is accepted
+    assert build_auth_file_bind(
+        tool="opencode", source_path=source, destination_path=destination,
+        stat_kind="file", host_home=HOST_HOME, sandbox_home=SANDBOX_HOME, locations=VERIFIED,
+    ).destination_path.startswith(SANDBOX_HOME + "/")
+
+
+def test_ov81_the_old_same_path_form_is_refused() -> None:
+    source, _ = _paths("opencode")
+    with pytest.raises(CredentialRefusal) as exc:
+        build_auth_file_bind(
+            tool="opencode", source_path=source, destination_path=source,
+            stat_kind="file", host_home=HOST_HOME, locations=VERIFIED,
+        )
+    assert exc.value.code == "AUTH_BIND_SAME_PATH"
+    # and the destination is not optional either
+    with pytest.raises(CredentialRefusal) as exc2:
+        build_auth_file_bind(tool="opencode", source_path=source, destination_path=None, stat_kind="file", host_home=HOST_HOME, locations=VERIFIED)
+    assert exc2.value.code == "AUTH_DESTINATION_REQUIRED"
+
+
+def test_ov82_locations_are_unverified_by_default_and_refuse() -> None:
+    assert all(entry["verified"] is False for entry in KNOWN_AUTH_LOCATIONS.values())
+    source = KNOWN_AUTH_LOCATIONS["opencode"]["location"].replace("~", HOST_HOME)
+    destination = KNOWN_AUTH_LOCATIONS["opencode"]["location"].replace("~", SANDBOX_HOME)
+    with pytest.raises(CredentialRefusal) as exc:
+        # no location table supplied: the shipped defaults are unverified
+        build_auth_file_bind(tool="opencode", source_path=source, destination_path=destination, stat_kind="file", host_home=HOST_HOME)
+    assert exc.value.code == "AUTH_LOCATION_UNVERIFIED"
+    assert AUTH_LOCATIONS_PATH in str(exc.value)          # actionable
+    assert "M3" in str(exc.value)                         # says who fills it in
+
+
+def test_ov82_only_a_versioned_data_file_can_mark_a_location_verified(tmp_path: Path) -> None:
+    good = tmp_path / "auth-locations.v1.json"
+    good.write_text(json.dumps({"schema_version": AUTH_LOCATIONS_SCHEMA_VERSION, "locations": VERIFIED}), encoding="utf-8")
+    loaded = load_auth_locations(good)
+    assert loaded["opencode"]["verified"] is True
+    source, destination = _paths("opencode")
+    assert build_auth_file_bind(tool="opencode", source_path=source, destination_path=destination, stat_kind="file", host_home=HOST_HOME, locations=loaded).argv[0] == "--ro-bind"
+    # a partial file: the OTHER tool is still unverified and refuses
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps({"schema_version": AUTH_LOCATIONS_SCHEMA_VERSION, "locations": {"opencode": VERIFIED["opencode"]}}), encoding="utf-8")
+    with pytest.raises(CredentialRefusal) as exc:
+        build_auth_file_bind(tool="commandcode", source_path="/x", destination_path="/home/sandbox/x", stat_kind="file", host_home=HOST_HOME, locations=load_auth_locations(partial))
+    assert exc.value.code in ("UNKNOWN_TOOL", "AUTH_LOCATION_UNVERIFIED")
+
+
+def test_ov82_a_wrong_schema_is_refused(tmp_path: Path) -> None:
+    for body in ('{"schema_version":"nope","locations":{}}', "[]", "not json"):
+        bad = tmp_path / "bad.json"
+        bad.write_text(body, encoding="utf-8")
+        with pytest.raises(CredentialRefusal) as exc:
+            load_auth_locations(bad)
+        assert exc.value.code in ("AUTH_LOCATIONS_SCHEMA", "AUTH_LOCATIONS_UNREADABLE")
+    with pytest.raises(CredentialRefusal) as exc:
+        load_auth_locations(tmp_path / "missing.json")
+    assert exc.value.code == "AUTH_LOCATIONS_UNREADABLE"
+
+
+def test_ov7_metadata_refusals_still_hold_with_a_verified_location() -> None:
+    source, destination = _paths("commandcode")
+    for kind, code in (("dir", "AUTH_BIND_IS_DIRECTORY"), ("symlink", "AUTH_BIND_IS_SYMLINK"), ("missing", "AUTH_BIND_NOT_A_FILE")):
+        with pytest.raises(CredentialRefusal) as exc:
+            build_auth_file_bind(tool="commandcode", source_path=source, destination_path=destination, stat_kind=kind, host_home=HOST_HOME, locations=VERIFIED)
+        assert exc.value.code == code
+    with pytest.raises(CredentialRefusal) as exc:
+        build_auth_file_bind(tool="commandcode", source_path="/home/operator/.ssh/id_rsa", destination_path=destination, stat_kind="file", host_home=HOST_HOME, locations=VERIFIED)
+    assert exc.value.code == "AUTH_PATH_OUTSIDE_KNOWN_LOCATION"
 
 
 def test_ov73_the_env_allowlist_names_one_variable_and_carries_no_value() -> None:
     args = build_env_allowlist_variable(tool="opencode", variable=KNOWN_AUTH_VARIABLES["opencode"])
     assert args.env_allow == ("OPENCODE_API_KEY",)
-    assert "<from-environment>" in args.argv  # the VALUE is never on the command line
+    assert "<from-environment>" in args.argv
     assert "OPENCODE_API_KEY" in args.argv
     assert args.mechanism == "env-allowlist-variable"
 
@@ -212,7 +302,6 @@ def test_ov73_a_secret_looking_argv_element_is_refused() -> None:
         with pytest.raises(CredentialRefusal) as exc:
             assert_no_secret_in_argv(["--setenv", "SOME_KEY", secret])
         assert exc.value.code == "CREDENTIAL_IN_ARGV"
-    # a positive control: ordinary argv is fine
     assert_no_secret_in_argv(["bwrap", "--ro-bind", "/w", "/w"])
     with pytest.raises(CredentialRefusal) as exc:
         build_env_allowlist_variable(tool="opencode", variable="OPENCODE_API_KEY", extra_argv=["--token", "sk-abcdefghijklmnopqrstuvwx"])
@@ -220,7 +309,6 @@ def test_ov73_a_secret_looking_argv_element_is_refused() -> None:
 
 
 def test_ov73_no_real_credential_file_or_hosted_call_is_needed() -> None:
-    # the builders are pure: nothing here reads a credential or touches the network
     source = (Path(__file__).parent.parent / "src" / "overnight_runner" / "credential_exposure.py").read_text(encoding="utf-8")
     assert "open(" not in source
     assert not any(word in source for word in ("requests.", "urllib.", "http://", "https://", "socket."))

@@ -1,33 +1,32 @@
-"""OV7-3 — credential exposure for hosted harnesses: PURE ARG BUILDERS ONLY.
+"""OV7-3 / OV8 — credential exposure for hosted harnesses: PURE ARG BUILDERS ONLY.
 
-The M3 qualification needs a hosted harness to authenticate inside the sandbox.
-This module offers exactly two mechanisms, and neither puts a secret in a command
-line:
+Two mechanisms, and no secret ever on a command line:
 
-  * `build_auth_file_bind` — a READ-ONLY bind of ONE named auth file that lives at
-    the tool's known auth location; and
+  * `build_auth_file_bind` — a READ-ONLY bind of ONE named auth file, from its
+    HOST source path to a SANDBOX destination path under the sandbox HOME; and
   * `build_env_allowlist_variable` — an env allowlist entry naming ONE variable
-    whose VALUE is supplied at spawn time, never on the command line.
+    whose VALUE is supplied at spawn time.
+
+§OV8-2: the tools' auth LOCATIONS are UNVERIFIED by default. They may only be
+overridden through a versioned data file that the M3 session fills in with
+OBSERVED locations (`trio.m3-auth-locations.v1`); while any location in use is
+still unverified, a bind is REFUSED with `AUTH_LOCATION_UNVERIFIED` and an
+actionable message.
 
 Every builder is pure: it decides from arguments and injected facts, so it can be
-exercised without touching the filesystem, without a real credential and without
-any hosted call. Refusals are typed.
-
-Refused:
-  * a bind of anything that is not a regular file (a directory, a symlink, a
-    missing path);
-  * a bind of a path outside the tool's KNOWN auth location;
-  * an env variable not in the tool's known set;
-  * ANY secret-looking value in the argv;
-  * more than one credential, and any wildcard.
+exercised without a filesystem, without a real credential and without any hosted
+call.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
+    "AUTH_LOCATIONS_SCHEMA_VERSION",
     "KNOWN_AUTH_LOCATIONS",
     "KNOWN_AUTH_VARIABLES",
     "SECRET_ARGV_PATTERNS",
@@ -35,12 +34,18 @@ __all__ = [
     "assert_no_secret_in_argv",
     "build_auth_file_bind",
     "build_env_allowlist_variable",
+    "load_auth_locations",
 ]
 
-#: The tool's known auth file LOCATION. A bind may only name the file itself.
-KNOWN_AUTH_LOCATIONS: Mapping[str, str] = {
-    "opencode": "~/.local/share/opencode/auth.json",
-    "commandcode": "~/.commandcode/auth.json",
+#: §OV8-2 — the only accepted shape for an operator-supplied location file.
+AUTH_LOCATIONS_SCHEMA_VERSION = "trio.m3-auth-locations.v1"
+AUTH_LOCATIONS_PATH = "tools/qualification/auth-locations.v1.json"
+
+#: The tools' auth locations as shipped: UNVERIFIED. Each value is the location
+#: M3 must OBSERVE; until the data file says otherwise, nothing may use it.
+KNOWN_AUTH_LOCATIONS: Mapping[str, Mapping[str, Any]] = {
+    "opencode": {"location": "~/.local/share/opencode/auth.json", "verified": False},
+    "commandcode": {"location": "~/.commandcode/auth.json", "verified": False},
 }
 
 #: The tool's known credential VARIABLE name. One variable, by name.
@@ -49,14 +54,15 @@ KNOWN_AUTH_VARIABLES: Mapping[str, str] = {
     "commandcode": "COMMANDCODE_API_KEY",
 }
 
-#: Secret shapes that must never appear in an argv element (the TS runner's set,
-#: plus the shapes our own tooling emits).
+#: Secret shapes that must never appear in an argv element.
 SECRET_ARGV_PATTERNS: Sequence[re.Pattern] = (
     re.compile(r"(?:^|[^A-Za-z0-9])(?:sk|pk|rk)-[A-Za-z0-9]{16,}"),
     re.compile(r"ghp_|gho_|github_pat_"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # a JWT
     re.compile(r"(?i)(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S{8,}"),
 )
+
+DEFAULT_SANDBOX_HOME = "/home/sandbox"
 
 
 class CredentialRefusal(ValueError):
@@ -75,6 +81,8 @@ class CredentialArgs:
     argv: tuple[str, ...]
     env_allow: tuple[str, ...]
     mechanism: str
+    source_path: str = ""
+    destination_path: str = ""
 
 
 def assert_no_secret_in_argv(argv: Iterable[str]) -> None:
@@ -88,41 +96,110 @@ def assert_no_secret_in_argv(argv: Iterable[str]) -> None:
                 )
 
 
-def _known_auth_path(tool: str, path: str, home: str) -> str:
-    if tool not in KNOWN_AUTH_LOCATIONS:
-        raise CredentialRefusal("UNKNOWN_TOOL", f"no known auth location for {tool!r}")
-    known = KNOWN_AUTH_LOCATIONS[tool].replace("~", home)
-    if path != known:
+def load_auth_locations(path: str | Path) -> dict[str, dict[str, Any]]:
+    """§OV8-2 — load the versioned location file M3 fills in with observations.
+
+    Only this versioned shape is accepted; anything else is refused rather than
+    guessed at.
+    """
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CredentialRefusal("AUTH_LOCATIONS_UNREADABLE", f"cannot load {path!r}: {exc}") from exc
+    if not isinstance(document, Mapping) or document.get("schema_version") != AUTH_LOCATIONS_SCHEMA_VERSION:
         raise CredentialRefusal(
-            "AUTH_PATH_OUTSIDE_KNOWN_LOCATION",
-            f"{path!r} is not the known auth file for {tool!r} ({known})",
+            "AUTH_LOCATIONS_SCHEMA",
+            f"not a {AUTH_LOCATIONS_SCHEMA_VERSION} document: {path!r}",
         )
-    return known
+    locations = document.get("locations")
+    if not isinstance(locations, Mapping):
+        raise CredentialRefusal("AUTH_LOCATIONS_SCHEMA", "the document carries no locations map")
+    out: dict[str, dict[str, Any]] = {}
+    for tool, entry in locations.items():
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("location"), str):
+            raise CredentialRefusal("AUTH_LOCATIONS_SCHEMA", f"location for {tool!r} is malformed")
+        out[str(tool)] = {"location": entry["location"], "verified": entry.get("verified") is True}
+    return out
+
+
+def _location_for(tool: str, locations: Mapping[str, Mapping[str, Any]] | None) -> tuple[str, bool]:
+    """The tool's host location and whether it is VERIFIED."""
+    table = locations if locations is not None else KNOWN_AUTH_LOCATIONS
+    if tool not in table:
+        raise CredentialRefusal("UNKNOWN_TOOL", f"no known auth location for {tool!r}")
+    entry = table[tool]
+    if isinstance(entry, str):  # a bare string means "unverified"
+        return entry, False
+    return str(entry.get("location", "")), entry.get("verified") is True
 
 
 def build_auth_file_bind(
     *,
     tool: str,
-    auth_path: str,
+    source_path: str,
+    destination_path: str | None = None,
     stat_kind: str,
-    home: str = "/home/sandbox",
+    host_home: str,
+    sandbox_home: str = DEFAULT_SANDBOX_HOME,
+    locations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> CredentialArgs:
-    """A read-only bind of ONE named auth file.
+    """A read-only bind of the tool's auth file: HOST source -> SANDBOX destination.
 
-    `stat_kind` is the TRUSTED caller's observation: 'file' | 'dir' | 'symlink' |
-    'missing'. Anything but a regular file is refused, and the path must be the
-    tool's known auth file exactly.
+    §OV8-1: the source and the destination are SEPARATE. The source must be the
+    tool's known host auth file and the destination must be the SAME relative path
+    under `sandbox_home`; binding the host path to itself (the old form) is refused.
+
+    §OV8-2: while the location is still marked unverified, the bind is refused.
     """
-    known = _known_auth_path(tool, auth_path, home)
+    location, verified = _location_for(tool, locations)
+    if not verified:
+        raise CredentialRefusal(
+            "AUTH_LOCATION_UNVERIFIED",
+            f"the auth location for {tool!r} ({location}) is UNVERIFIED; run the M3 session, "
+            f"record the observed path, and write it to {AUTH_LOCATIONS_PATH} as "
+            f"{AUTH_LOCATIONS_SCHEMA_VERSION} with verified:true before building a bind",
+        )
+    known = location.replace("~", host_home)
+    if source_path != known:
+        raise CredentialRefusal(
+            "AUTH_PATH_OUTSIDE_KNOWN_LOCATION",
+            f"{source_path!r} is not the known host auth file for {tool!r} ({known})",
+        )
     if stat_kind == "dir":
         raise CredentialRefusal("AUTH_BIND_IS_DIRECTORY", f"{known} is a directory; bind the auth FILE, never its directory")
     if stat_kind == "symlink":
         raise CredentialRefusal("AUTH_BIND_IS_SYMLINK", f"{known} is a symlink; bind a regular file")
     if stat_kind != "file":
         raise CredentialRefusal("AUTH_BIND_NOT_A_FILE", f"{known} is not a regular file (stat_kind={stat_kind!r})")
-    argv = ("--ro-bind", known, known)
+
+    if destination_path is None or destination_path == "":
+        raise CredentialRefusal(
+            "AUTH_DESTINATION_REQUIRED",
+            "the sandbox destination path is required and must be a separate argument",
+        )
+    if source_path == destination_path:
+        raise CredentialRefusal(
+            "AUTH_BIND_SAME_PATH",
+            "the source and destination must differ; binding a host path onto itself exposes the host layout",
+        )
+    sandbox_known = location.replace("~", sandbox_home)
+    if not destination_path.startswith(sandbox_home.rstrip("/") + "/"):
+        raise CredentialRefusal(
+            "AUTH_DESTINATION_OUTSIDE_SANDBOX_HOME",
+            f"{destination_path!r} is not under the sandbox home {sandbox_home}",
+        )
+    if destination_path != sandbox_known:
+        raise CredentialRefusal(
+            "AUTH_DESTINATION_MISMATCH",
+            f"{destination_path!r} is not the tool's location under the sandbox home ({sandbox_known})",
+        )
+
+    argv = ("--ro-bind", source_path, destination_path)
     assert_no_secret_in_argv(argv)
-    return CredentialArgs(argv=argv, env_allow=(), mechanism="auth-file-readonly-bind")
+    return CredentialArgs(
+        argv=argv, env_allow=(), mechanism="auth-file-readonly-bind",
+        source_path=source_path, destination_path=destination_path,
+    )
 
 
 def build_env_allowlist_variable(*, tool: str, variable: str, extra_argv: Sequence[str] = ()) -> CredentialArgs:
@@ -135,10 +212,8 @@ def build_env_allowlist_variable(*, tool: str, variable: str, extra_argv: Sequen
             "ENV_VARIABLE_NOT_KNOWN",
             f"{variable!r} is not the known credential variable for {tool!r} ({known})",
         )
-    if variable.endswith("*") or "*" in variable:
+    if "*" in variable:
         raise CredentialRefusal("ENV_VARIABLE_WILDCARD", "a wildcard credential name is refused")
-    # The value is supplied by the runner at spawn time, so the argv carries only
-    # the variable NAME plus whatever the caller asked for.
     argv = tuple(["--setenv", known, "<from-environment>", *extra_argv])
     assert_no_secret_in_argv(argv)
     return CredentialArgs(argv=argv, env_allow=(known,), mechanism="env-allowlist-variable")
