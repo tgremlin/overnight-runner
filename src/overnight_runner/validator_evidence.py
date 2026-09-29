@@ -9,8 +9,11 @@ pass as authority.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -21,9 +24,70 @@ from .evidence_util import usable_digest as _usable_digest
 __all__ = [
     "RUNNER_VALIDATOR_EVIDENCE_SCHEMA",
     "RunnerValidatorEvidence",
+    "discard_runner_evidence",
+    "evidence_root",
     "intake_runner_evidence",
+    "prune_runner_evidence",
     "run_trusted_validators",
 ]
+
+#: §EXEC3 fix 2 — the Runner-owned root for validator evidence. It used to be a bare
+#: `tempfile.mkdtemp()` in the system temp dir, and NOTHING removed it: a campaign left
+#: one `trio-runner-evidence-*` directory per validator run (939 of them after one
+#: campaign), which exhausted the temp filesystem's INODES.
+EVIDENCE_ROOT_ENV = "TRIO_RUNNER_EVIDENCE_ROOT"
+
+
+def evidence_root() -> Path:
+    """The Runner-owned directory validator evidence is created under."""
+    override = os.environ.get(EVIDENCE_ROOT_ENV)
+    if override:
+        root = Path(override)
+    else:
+        from .runtime import state_dir
+
+        root = state_dir() / "validator-evidence"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def prune_runner_evidence(max_age_s: float = 86_400.0, root: Path | None = None) -> int:
+    """Retention: drop evidence directories a crashed run left behind. Returns the count."""
+    target = evidence_root() if root is None else root
+    cutoff = time.time() - max_age_s
+    removed = 0
+    if not target.is_dir():
+        return 0
+    for child in target.iterdir():
+        if not child.is_dir() or child.name in {".keep"}:
+            continue
+        try:
+            if child.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def discard_runner_evidence(evidence: RunnerValidatorEvidence | None) -> bool:
+    """Delete a Runner-owned evidence directory once its intake decision is made.
+
+    Containment is enforced: only a direct child of `evidence_root()` is ever removed,
+    so a record carrying any other path cannot turn this into an arbitrary delete.
+    """
+    if evidence is None:
+        return False
+    directory = Path(evidence.evidence_dir)
+    root = evidence_root()
+    try:
+        if directory.parent.resolve() != root.resolve():
+            return False
+    except OSError:
+        return False
+    shutil.rmtree(directory, ignore_errors=True)
+    return not directory.exists()
 
 RUNNER_VALIDATOR_EVIDENCE_SCHEMA = "trio.runner-validator-evidence.v1"
 
@@ -91,7 +155,9 @@ def run_trusted_validators(
 ) -> RunnerValidatorEvidence:
     """Run the fixed validators on the workspace and mint Runner-owned evidence."""
     # The Runner CREATES the evidence path; nothing the candidate wrote is read.
-    evidence_dir = tempfile.mkdtemp(prefix="trio-runner-evidence-")
+    # §EXEC3 fix 2: inside the Runner-owned root (the state dir by default), NOT the
+    # bare system temp dir, so the directory is retained and prunable instead of leaked.
+    evidence_dir = tempfile.mkdtemp(prefix="evidence-", dir=str(evidence_root()))
     results: list[dict[str, Any]] = []
     for validator_id in validator_ids:
         if validator_id == HOST_TESTS_VALIDATOR_ID:

@@ -4,8 +4,10 @@ and Runner-produced validator evidence.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -30,8 +32,13 @@ from overnight_runner.intake import intake_scope_gate, scope_contract_from, subm
 from overnight_runner.safety import SafetyError
 from overnight_runner.scope_gate import evaluate_scope
 from overnight_runner.validator_evidence import (
+    EVIDENCE_ROOT_ENV,
+    RunnerValidatorEvidence,
     RUNNER_VALIDATOR_EVIDENCE_SCHEMA,
+    discard_runner_evidence,
+    evidence_root,
     intake_runner_evidence,
+    prune_runner_evidence,
     run_trusted_validators,
 )
 from overnight_runner.workspace_snapshot import snapshot_workspace
@@ -315,3 +322,79 @@ def test_ov55_evidence_bound_to_another_base_or_tree_is_refused(tmp_path: Path) 
     assert intake_runner_evidence(submitted=None, runner_evidence=evidence).code == "EVIDENCE_MISSING"
     assert intake_runner_evidence(submitted=evidence.as_dict(), runner_evidence=None).code == "EVIDENCE_NOT_RUNNER_PRODUCED"
     assert intake_runner_evidence(submitted=evidence.as_dict(), runner_evidence=evidence).ok
+
+
+# --------------------------------------------------------------------------- #
+# §EXEC3 fix 2 — validator evidence is RETAINED, not leaked into the system temp dir
+# --------------------------------------------------------------------------- #
+def test_exec3_evidence_is_created_under_the_runner_owned_root(tmp_path: Path, monkeypatch) -> None:
+    """POSITIVE: the directory lives under the Runner's root, never bare /tmp."""
+    root = tmp_path / "evidence-root"
+    monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(root))
+    repo, head = _owner_repo(tmp_path)
+    ws = _ws_from_base(tmp_path, repo, head)
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
+    evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest=candidate_tree_digest(ws))
+    directory = Path(evidence.evidence_dir)
+    assert directory.is_dir()
+    assert directory.is_relative_to(root)                      # Runner-owned
+    assert directory.parent.resolve() == root.resolve()
+    # ...and it stays bounded: one directory per run, no accumulation inside it
+    assert len(list(root.iterdir())) == 1
+    assert discard_runner_evidence(evidence) is True
+    assert not directory.exists()
+    # with NO override the root is the STATE dir, not the bare system temp dir
+    monkeypatch.delenv(EVIDENCE_ROOT_ENV)
+    monkeypatch.setenv("OVERNIGHT_STATE_DIR", str(tmp_path / "state"))
+    assert evidence_root().resolve() == (tmp_path / "state" / "validator-evidence").resolve()
+
+
+def test_exec3_discard_removes_the_directory_and_refuses_a_foreign_path(tmp_path: Path, monkeypatch) -> None:
+    """NEGATIVE: containment — a path outside the root is never deleted."""
+    root = tmp_path / "evidence-root"
+    monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(root))
+    outside = tmp_path / "not-ours"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep", encoding="utf-8")
+
+    assert discard_runner_evidence(None) is False
+    # a hand-made record pointing outside the root must not be removable
+    forged = RunnerValidatorEvidence(
+        schema_version=RUNNER_VALIDATOR_EVIDENCE_SCHEMA, producer="runner", evidence_dir=str(outside),
+        base_commit="b" * 40, candidate_tree_digest="t" * 64, validator_ids=("py_compile",),
+        results=(), passed=True, digest="sha256:" + "0" * 64,
+    )
+    assert discard_runner_evidence(forged) is False
+    assert (outside / "keep.txt").exists()
+
+
+def test_exec3_no_leaked_directories_after_a_run(tmp_path: Path, monkeypatch) -> None:
+    """POSITIVE CONTROL: repeated runs leave the root EMPTY once discarded."""
+    root = tmp_path / "evidence-root"
+    monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(root))
+    repo, head = _owner_repo(tmp_path)
+    ws = _ws_from_base(tmp_path, repo, head)
+    from overnight_runner.workspace_snapshot import candidate_tree_digest
+
+    for _ in range(3):
+        evidence = run_trusted_validators(workspace_dir=ws, base_commit=head, candidate_tree_digest=candidate_tree_digest(ws))
+        assert discard_runner_evidence(evidence) is True
+    assert list(root.iterdir()) == []
+
+
+def test_exec3_retention_prunes_only_directories_older_than_the_window(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "evidence-root"
+    monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(root))
+    root.mkdir(parents=True)
+    old = root / "evidence-old"
+    old.mkdir()
+    fresh = root / "evidence-fresh"
+    fresh.mkdir()
+    stale = time.time() - 10_000
+    os.utime(old, (stale, stale))
+
+    assert prune_runner_evidence(max_age_s=3_600) == 1
+    assert not old.exists()
+    assert fresh.exists()          # inside the window: kept
+    assert evidence_root().resolve() == root.resolve()
