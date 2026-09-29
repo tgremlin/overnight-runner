@@ -64,8 +64,15 @@ def _matches(rule: str, path: str, case_sensitive: bool) -> bool:
     return p == r or p.startswith(r + "/")
 
 
+#: §EXEC1 (reviewer decision, parity with the TypeScript gate) — the NARROWED
+#: git-internal names. An exact `.git` segment covers the directory and everything
+#: inside it; `.gitmodules`/`.gitattributes`/`.gitconfig` are the other control
+#: files. `.gitignore`, `.github/**` and `.gitkeep` are ORDINARY paths.
+GIT_INTERNAL_NAMES = frozenset({".git", ".gitmodules", ".gitattributes", ".gitconfig"})
+
+
 def _is_git_internal(path: str) -> bool:
-    return any(seg == ".git" or seg.startswith(".git") for seg in path.split("/"))
+    return any(seg in GIT_INTERNAL_NAMES for seg in path.split("/"))
 
 
 def _protected(contract: Mapping[str, Any], path: str, case_sensitive: bool) -> bool:
@@ -107,9 +114,9 @@ def evaluate_scope(
         entry = after.get(path)
         if len(path) > max_path_len:
             refusals.append(ScopeRefusal("SCOPE_PATH_TOO_LONG", path, f"path exceeds {max_path_len} characters"))
-        # §OV4-1 / parity: any .git* entry is refused outright.
+        # §EXEC1 / parity: the narrowed git-internal rule.
         if _is_git_internal(path):
-            refusals.append(ScopeRefusal("SCOPE_GIT_INTERNAL", path, "a .git/.git* path may not be created or changed by a candidate"))
+            refusals.append(ScopeRefusal("SCOPE_GIT_INTERNAL", path, "a .git/.gitmodules/.gitattributes/.gitconfig path may not be created or changed by a candidate"))
         if path == ".gitmodules":
             refusals.append(ScopeRefusal("SCOPE_SUBMODULE_CHANGE", path, "a submodule declaration may not be changed by a candidate"))
         if _licensed(contract, path, case_sensitive):

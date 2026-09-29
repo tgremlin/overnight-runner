@@ -1084,7 +1084,6 @@
       "expected": {
         "ok": false,
         "codes": [
-          "SCOPE_GIT_INTERNAL",
           "SCOPE_WRITE_OUT_OF_SCOPE"
         ]
       }
@@ -1126,6 +1125,250 @@
         "codes": [
           "SCOPE_GIT_INTERNAL",
           "SCOPE_SUBMODULE_CHANGE",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".gitattributes (refused)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": ".gitattributes"
+        }
+      ],
+      "entries": {
+        ".gitattributes": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".gitconfig (refused)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": ".gitconfig"
+        }
+      ],
+      "entries": {
+        ".gitconfig": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "declared .gitignore (in scope control)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md",
+          ".gitignore"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": ".gitignore"
+        }
+      ],
+      "entries": {
+        ".gitignore": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
+    },
+    {
+      "name": ".pytest_cache/.gitignore is out of scope, NOT git-internal",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": ".pytest_cache/.gitignore",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        ".pytest_cache/.gitignore": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".github workflow is an ordinary path",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": ".github/workflows/ci.yml",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        ".github/workflows/ci.yml": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".gitkeep is an ordinary path",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/.gitkeep",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/.gitkeep": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
           "SCOPE_WRITE_OUT_OF_SCOPE"
         ]
       }
