@@ -24,10 +24,12 @@ grant to the exact plan content.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 from .db import Database
+from .plan_verify import verify_extension, verify_projection
 from .safety import SafetyError
 
 # Module-level marker: this is the only plan-registration surface.
@@ -35,27 +37,33 @@ from .safety import SafetyError
 PLAN_TRUSTED_OPERATOR_SURFACE = True
 
 
-def plan_projection_digest(
-    plan_id: str, work_package_criterion_ids: dict[str, set[str]]
-) -> str:
-    """The Runner's canonical projection digest (the EXACT existing formula).
+class PlanVerificationError(SafetyError):
+    """A verified registration refused, with a specific code. Fail closed."""
 
-    Extracted so callers can verify a projection before registering it, without
-    changing ``register_plan``'s digest for any existing plan.
-    """
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+def _projection_payload(plan_id: str, work_package_criterion_ids: dict[str, set[str]]) -> str:
+    """The ONE canonical serialization of a projection. Used by every caller."""
     canonical = {
         "plan_id": plan_id,
         "work_packages": [
-            {
-                "package_id": pkg,
-                "criterion_ids": sorted(sorted(crits)),
-            }
+            {"package_id": pkg, "criterion_ids": sorted(sorted(crits))}
             for pkg, crits in sorted(work_package_criterion_ids.items())
         ],
     }
-    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    import hashlib
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+
+
+
+def plan_projection_digest(
+    plan_id: str, work_package_criterion_ids: dict[str, set[str]]
+) -> str:
+    """The Runner's canonical projection digest (ONE formula, one place)."""
+    return hashlib.sha256(_projection_payload(plan_id, work_package_criterion_ids).encode("utf-8")).hexdigest()
 
 
 def register_plan(
@@ -77,19 +85,9 @@ def register_plan(
     Re-registering an existing ``plan_id`` raises ``SafetyError`` to
     preserve content-addressed immutability.
     """
-    # Canonicalize to a sorted JSON-serializable form.
+    # Canonicalize to a sorted JSON-serializable form (ONE formula).
     digest = plan_projection_digest(plan_id, work_package_criterion_ids)
-    payload = json.dumps(
-        {
-            "plan_id": plan_id,
-            "work_packages": [
-                {"package_id": pkg, "criterion_ids": sorted(sorted(crits))}
-                for pkg, crits in sorted(work_package_criterion_ids.items())
-            ],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    payload = _projection_payload(plan_id, work_package_criterion_ids)
     # Refuse to re-register an existing plan_id (content-addressed immutability).
     existing = load_plan_digest(db, plan_id)
     if existing is not None:
@@ -112,52 +110,90 @@ def register_plan(
     return digest
 
 
+def _load_json(path: str, code: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:  # unreadable or malformed
+        raise PlanVerificationError(code, f"cannot load {path!r}: {exc}") from exc
+
+
 def register_plan_verified(
     db: Database,
     *,
     plan_id: str,
     approved_artifact_id: str,
     work_package_criterion_ids: dict[str, set[str]],
-    candidate_projection: dict | None = None,
+    artifact_path: str,
+    sidecar_paths: tuple[str, ...] | list[str] = (),
+    chunk_specs: dict[str, Any] | None = None,
     expected_plan_digest: str | None = None,
 ) -> str:
-    """Register a plan AFTER verifying its projection (M5/H1 proposal).
+    """Register a plan AFTER re-deriving its projection from the APPROVED ARTIFACT.
 
-    The Runner's ``register_plan`` does not verify the projection against the
-    approved artifact. This additive surface closes that gap for callers that can
-    supply the candidate projection (as produced by the compiler adapter):
+    The Runner's ``register_plan`` never checks the projection against the
+    approved artifact. This surface loads the artifact from disk and re-derives
+    the projection with the vendored ``verify_*`` helpers, failing closed on any
+    disagreement:
 
-      * when ``candidate_projection`` is supplied, its ``plan_id`` and
-        ``work_package_criterion_ids`` MUST equal the projection being registered
-        (fail closed: ``SafetyError``);
-      * when ``expected_plan_digest`` is supplied (e.g. the grant's pinned
-        ``approved_plan_digest``), the computed digest MUST equal it (fail closed).
+      * the artifact must carry ``plan_id`` and ``work_package_criterion_ids``
+        (``ARTIFACT_MALFORMED``), and both must equal the arguments
+        (``ARTIFACT_MISMATCH``);
+      * ``verify_projection`` must re-derive the digest the caller pinned
+        (``PROJECTION_*``);
+      * every ``trio.chunk-extension.v1`` sidecar must verify against its
+        ``ChunkSpec`` and the registered ``approved_artifact_id``
+        (``EXTENSION_*``).
 
-    The digest formula is UNCHANGED — it delegates to ``plan_projection_digest``.
-    A caller with no projection simply calls ``register_plan`` as before.
+    Unlike the earlier draft, the check is NOT tautological: the compared
+    projection comes from a file, not from the caller's own arguments.
     """
-    if candidate_projection is not None:
-        proj_plan_id = candidate_projection.get("plan_id")
-        proj_wpci = candidate_projection.get("work_package_criterion_ids")
-        if not isinstance(proj_wpci, dict):
-            raise SafetyError(
-                "candidate_projection must carry work_package_criterion_ids"
+    artifact = _load_json(artifact_path, "ARTIFACT_UNREADABLE")
+    if not isinstance(artifact, dict):
+        raise PlanVerificationError("ARTIFACT_MALFORMED", "the approved artifact is not an object")
+    artifact_plan_id = artifact.get("plan_id")
+    artifact_wpci = artifact.get("work_package_criterion_ids")
+    if not isinstance(artifact_plan_id, str) or not isinstance(artifact_wpci, dict):
+        raise PlanVerificationError(
+            "ARTIFACT_MALFORMED",
+            "the approved artifact lacks plan_id/work_package_criterion_ids",
+        )
+    if artifact_plan_id != plan_id:
+        raise PlanVerificationError(
+            "ARTIFACT_MISMATCH",
+            f"artifact plan_id {artifact_plan_id!r} != {plan_id!r}",
+        )
+    normalised_artifact = {pkg: set(crits) for pkg, crits in artifact_wpci.items()}
+    if normalised_artifact != work_package_criterion_ids:
+        raise PlanVerificationError(
+            "ARTIFACT_MISMATCH",
+            "the artifact projection differs from the projection being registered",
+        )
+
+    expected = (
+        expected_plan_digest
+        if expected_plan_digest is not None
+        else plan_projection_digest(plan_id, work_package_criterion_ids)
+    )
+    projection = {"plan_id": artifact_plan_id, "work_package_criterion_ids": artifact_wpci}
+    verdict = verify_projection(projection, expected)
+    if not verdict.ok:
+        raise PlanVerificationError(verdict.code, verdict.detail)
+
+    specs = chunk_specs or {}
+    for sidecar_path in sidecar_paths:
+        sidecar = _load_json(sidecar_path, "EXTENSION_UNREADABLE")
+        chunk_id = sidecar.get("chunk_id") if isinstance(sidecar, dict) else None
+        spec = specs.get(chunk_id)
+        if spec is None:
+            raise PlanVerificationError(
+                "EXTENSION_CHUNK_UNKNOWN",
+                f"sidecar {sidecar_path!r} names chunk {chunk_id!r} with no ChunkSpec",
             )
-        normalised = {
-            pkg: set(crits) for pkg, crits in proj_wpci.items()
-        }
-        if proj_plan_id != plan_id or normalised != work_package_criterion_ids:
-            raise SafetyError(
-                "plan projection does not match the approved artifact projection; "
-                "refusing to register (unknown effect)"
-            )
-    if expected_plan_digest is not None:
-        computed = plan_projection_digest(plan_id, work_package_criterion_ids)
-        if computed != expected_plan_digest:
-            raise SafetyError(
-                f"plan projection digest {computed[:8]} does not equal the pinned "
-                f"{expected_plan_digest[:8]}; refusing to register"
-            )
+        extension_verdict = verify_extension(sidecar, spec, approved_artifact_id)
+        if not extension_verdict.ok:
+            raise PlanVerificationError(extension_verdict.code, extension_verdict.detail)
+
     return register_plan(
         db,
         plan_id=plan_id,
