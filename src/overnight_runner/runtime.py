@@ -12,12 +12,18 @@ from pathlib import Path
 from .safety import sha256_bytes
 
 
-DEFAULT_STATE_DIR_FALLBACK = Path.home() / ".local" / "state" / "overnight-runner"
-
-
 def state_dir() -> Path:
-    """Read OVERNIGHT_STATE_DIR at call time so monkeypatch works."""
-    p = Path(os.environ.get("OVERNIGHT_STATE_DIR", str(DEFAULT_STATE_DIR_FALLBACK)))
+    """Read OVERNIGHT_STATE_DIR at call time so monkeypatch works.
+
+    §ACT1-0: there is NO fallback to the operator's real state directory. An unset
+    `OVERNIGHT_STATE_DIR`, or one that resolves to `~/.trio/runner-state` (or its
+    target), raises the typed refusal `STATE_DIR_UNSET_OR_REAL` — see
+    `state_dir_guard`. The previous `DEFAULT_STATE_DIR_FALLBACK` is what let EXEC4
+    write stray directories into the real state dir.
+    """
+    from .state_dir_guard import assert_usable_state_dir
+
+    p = assert_usable_state_dir()
     p.mkdir(parents=True, exist_ok=True)
     return p
 

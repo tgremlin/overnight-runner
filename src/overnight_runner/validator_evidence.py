@@ -40,6 +40,26 @@ __all__ = [
 EVIDENCE_ROOT_ENV = "TRIO_RUNNER_EVIDENCE_ROOT"
 
 
+def _require_isolated_run(root: Path) -> None:
+    """§ACT1-0 — refuse unless a real, non-real-state `OVERNIGHT_STATE_DIR` is set.
+
+    A Runner-owned scratch root may only be used inside a properly isolated run. An
+    unset or REAL `OVERNIGHT_STATE_DIR` is the `STATE_DIR_UNSET_OR_REAL` refusal, and
+    a root that resolves INSIDE the operator's real state directory is refused the
+    same way — so the EXEC4 breach (scratch written into the real state dir) cannot
+    recur even if a caller points the evidence override there.
+    """
+    from .state_dir_guard import StateDirRefusal, assert_usable_state_dir, real_state_paths
+
+    assert_usable_state_dir()
+    resolved = root.resolve()
+    for real in real_state_paths():
+        if resolved == real or str(resolved).startswith(str(real) + os.sep):
+            raise StateDirRefusal(
+                f"the Runner scratch root resolves inside the operator's real state dir ({resolved})"
+            )
+
+
 def scratch_root() -> Path:
     """The Runner-owned scratch root: evidence and host-tests copies live here.
 
@@ -50,6 +70,7 @@ def scratch_root() -> Path:
     per-run directories discarded after intake and pruned if a run dies.
     """
     root = Path(tempfile.gettempdir()) / "trio-runner-scratch"
+    _require_isolated_run(root)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -58,6 +79,7 @@ def evidence_root() -> Path:
     """The Runner-owned directory validator evidence is created under."""
     override = os.environ.get(EVIDENCE_ROOT_ENV)
     root = Path(override) if override else scratch_root() / "validator-evidence"
+    _require_isolated_run(root)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -66,6 +88,7 @@ def host_tests_scratch_root() -> Path:
     """§EXEC3 fix 2 — the Runner-owned root for host-tests scratch copies."""
     override = os.environ.get(EVIDENCE_ROOT_ENV)
     root = Path(override).parent / "host-tests-scratch" if override else scratch_root() / "host-tests-scratch"
+    _require_isolated_run(root)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
