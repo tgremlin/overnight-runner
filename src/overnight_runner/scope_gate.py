@@ -124,6 +124,11 @@ def evaluate_scope(
         for forbidden in contract.get("forbiddenScope") or []:
             if _matches(forbidden, path, case_sensitive):
                 refusals.append(ScopeRefusal("SCOPE_FORBIDDEN_SCOPE", path, f"write falls under forbidden scope {forbidden!r}"))
+        # §ACT1-1: the egress policy's exclusions (D25), with the SAME prefix semantics
+        # as protectedPaths — the shared parity fixtures prove this matches the TS gate.
+        for excluded in contract.get("excludedPaths") or []:
+            if _matches(excluded, path, case_sensitive):
+                refusals.append(ScopeRefusal("SCOPE_EGRESS_EXCLUDED_PATH", path, f"write is excluded by the egress policy ({excluded!r})"))
         if _protected(contract, path, case_sensitive):
             refusals.append(ScopeRefusal("SCOPE_PROTECTED_WRITE", path, "write touches a protected path"))
 

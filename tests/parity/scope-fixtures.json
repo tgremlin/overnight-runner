@@ -1785,6 +1785,170 @@
           "SCOPE_WRITE_OUT_OF_SCOPE"
         ]
       }
+    },
+    {
+      "name": "egress-excluded write refused",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "excludedPaths": [
+          "graphify-out",
+          "BinaryAssets"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "graphify-out/graph.json"
+        }
+      ],
+      "entries": {
+        "graphify-out/graph.json": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_EGRESS_EXCLUDED_PATH",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "egress-excluded delete refused",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "excludedPaths": [
+          "graphify-out"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "deleted",
+          "path": "graphify-out/graph.json"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_DELETE_OUT_OF_SCOPE",
+          "SCOPE_EGRESS_EXCLUDED_PATH"
+        ]
+      }
+    },
+    {
+      "name": "egress-excluded prefix refused",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "excludedPaths": [
+          "BinaryAssets"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "BinaryAssets/x.uasset",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "BinaryAssets/x.uasset": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_EGRESS_EXCLUDED_PATH",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "egress exclusions do not touch an ordinary path (control)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "excludedPaths": [
+          "graphify-out",
+          "BinaryAssets"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
     }
   ]
 }
