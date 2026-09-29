@@ -1,0 +1,1547 @@
+{
+  "schemaVersion": "trio.scope-parity.v1",
+  "fixtures": [
+    {
+      "name": "clean in-scope modify",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py",
+          "reasons": [
+            "content"
+          ]
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
+    },
+    {
+      "name": "clean in-scope add",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
+    },
+    {
+      "name": "in-scope delete (control)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "deleted",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
+    },
+    {
+      "name": "write out of scope",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/evil.py"
+        }
+      ],
+      "entries": {
+        "src/evil.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "delete out of scope",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "deleted",
+          "path": "src/evil.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_DELETE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "protected write",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "secrets/k.md"
+        }
+      ],
+      "entries": {
+        "secrets/k.md": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PROTECTED_WRITE",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "protected delete",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "deleted",
+          "path": "secrets/k.md"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_DELETE_OUT_OF_SCOPE",
+          "SCOPE_PROTECTED_DELETE",
+          "SCOPE_PROTECTED_WRITE"
+        ]
+      }
+    },
+    {
+      "name": "rename out of protected",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "renamed",
+          "path": "src/a.py",
+          "reasons": [
+            "rename"
+          ],
+          "from": "secrets/k.md"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PROTECTED_RENAME_OUT",
+          "SCOPE_RENAME_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "rename into protected",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "renamed",
+          "path": "secrets/k.md",
+          "reasons": [
+            "rename"
+          ],
+          "from": "src/a.py"
+        }
+      ],
+      "entries": {
+        "secrets/k.md": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PROTECTED_RENAME_IN",
+          "SCOPE_PROTECTED_WRITE",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "rename from out of scope",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "renamed",
+          "path": "src/a.py",
+          "reasons": [
+            "rename"
+          ],
+          "from": "other/x.py"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_RENAME_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "symlink created",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "symlink",
+          "mode": 511,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": "src/a.py",
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_SYMLINK_CREATED",
+          "SCOPE_UNEXPECTED_EXEC_BIT"
+        ]
+      }
+    },
+    {
+      "name": "symlink escape",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "symlink",
+          "mode": 511,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": "/etc/passwd",
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_SYMLINK_CREATED",
+          "SCOPE_SYMLINK_ESCAPE",
+          "SCOPE_UNEXPECTED_EXEC_BIT"
+        ]
+      }
+    },
+    {
+      "name": "hardlink",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py",
+          "reasons": [
+            "content"
+          ]
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 2
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_HARDLINK"
+        ]
+      }
+    },
+    {
+      "name": "mode change",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py",
+          "reasons": [
+            "mode"
+          ]
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 493,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_MODE_CHANGE"
+        ]
+      }
+    },
+    {
+      "name": "added exec bit",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "file",
+          "mode": 493,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_UNEXPECTED_EXEC_BIT"
+        ]
+      }
+    },
+    {
+      "name": "oversize file",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py",
+          "reasons": [
+            "content"
+          ]
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 99999999,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_FILE_TOO_LARGE"
+        ]
+      }
+    },
+    {
+      "name": "path traversal",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "../escape.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "absolute path",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "/etc/passwd"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "backslash",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src\\a.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "empty segment",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src//a.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "dot segment",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "./src/a.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "trailing slash",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py/"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "NUL byte",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a\u0000.py"
+        }
+      ],
+      "entries": {},
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_INVALID"
+        ]
+      }
+    },
+    {
+      "name": "unknown change kind",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "teleported",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_UNKNOWN_CHANGE_KIND"
+        ]
+      }
+    },
+    {
+      "name": ".git/config",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": ".git/config",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        ".git/config": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".git/hooks/post-checkout",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": ".git/hooks/post-checkout",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        ".git/hooks/post-checkout": {
+          "type": "file",
+          "mode": 493,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_UNEXPECTED_EXEC_BIT",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "bare .git",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": ".git",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        ".git": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "nested .git",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "src/.git/config",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "src/.git/config": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".gitignore",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": ".gitignore"
+        }
+      ],
+      "entries": {
+        ".gitignore": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": ".gitmodules",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": ".gitmodules"
+        }
+      ],
+      "entries": {
+        ".gitmodules": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_GIT_INTERNAL",
+          "SCOPE_SUBMODULE_CHANGE",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "licensed path",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "Content/Synty/x.uasset"
+        }
+      ],
+      "entries": {
+        "Content/Synty/x.uasset": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_LICENSED_PATH",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "forbidden scope",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "forbidden/scope/x.py"
+        }
+      ],
+      "entries": {
+        "forbidden/scope/x.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_FORBIDDEN_SCOPE",
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    },
+    {
+      "name": "undeclared output",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": [
+          "src/a.py"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_UNDECLARED_OUTPUT"
+        ]
+      }
+    },
+    {
+      "name": "too many writes",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "maxWritePaths": 1
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py"
+        },
+        {
+          "kind": "modified",
+          "path": "docs/b.md"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        },
+        "docs/b.md": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_TOO_MANY_WRITES"
+        ]
+      }
+    },
+    {
+      "name": "path too long",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "maxPathLength": 5
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_PATH_TOO_LONG"
+        ]
+      }
+    },
+    {
+      "name": "declared exec (control)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "declaredExecutablePaths": [
+          "docs/b.md"
+        ]
+      },
+      "changes": [
+        {
+          "kind": "added",
+          "path": "docs/b.md",
+          "reasons": [
+            "new file"
+          ]
+        }
+      ],
+      "entries": {
+        "docs/b.md": {
+          "type": "file",
+          "mode": 493,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": true,
+        "codes": []
+      }
+    },
+    {
+      "name": "case-fold collision in the change set",
+      "contract": {
+        "allowedWritePaths": [
+          "src/A.py",
+          "src/a.py"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "caseSensitive": false
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/A.py"
+        },
+        {
+          "kind": "modified",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {
+        "src/A.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        },
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_CASE_COLLISION"
+        ]
+      }
+    },
+    {
+      "name": "case-fold collision with the tree",
+      "contract": {
+        "allowedWritePaths": [
+          "src/A.py"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null,
+        "caseSensitive": false
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/A.py"
+        }
+      ],
+      "entries": {
+        "src/A.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        },
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_CASE_COLLISION"
+        ]
+      }
+    },
+    {
+      "name": "case-sensitive is not a collision (control)",
+      "contract": {
+        "allowedWritePaths": [
+          "src/a.py",
+          "docs/b.md"
+        ],
+        "protectedPaths": [
+          "secrets"
+        ],
+        "forbiddenScope": [
+          "forbidden/scope"
+        ],
+        "outputs": null
+      },
+      "changes": [
+        {
+          "kind": "modified",
+          "path": "src/A.py"
+        },
+        {
+          "kind": "modified",
+          "path": "src/a.py"
+        }
+      ],
+      "entries": {
+        "src/A.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        },
+        "src/a.py": {
+          "type": "file",
+          "mode": 420,
+          "size": 10,
+          "digest": "sha256:x",
+          "binary": false,
+          "linkTarget": null,
+          "nlink": 1
+        }
+      },
+      "expected": {
+        "ok": false,
+        "codes": [
+          "SCOPE_WRITE_OUT_OF_SCOPE"
+        ]
+      }
+    }
+  ]
+}

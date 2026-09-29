@@ -34,8 +34,9 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from .admission_trust_boundary import apply_trust_boundary
 from .campaign_schemas import (
     AdmissionReceipt,
     AutonomyGrant,
@@ -111,6 +112,8 @@ def derive_admission(
     current_provider_profile_id: str,
     current_accepted_snapshot: RepoSnapshot,
     now: int | None = None,
+    trust_boundary_flag: str | None = None,
+    trust_boundary_inputs: "Mapping[str, Any] | None" = None,
 ) -> tuple[AdmissionReceipt, BudgetLedgerEntry]:
     """Derive a trusted admission receipt for ``chunk`` under ``grant``.
 
@@ -153,6 +156,16 @@ def derive_admission(
         raise SafetyError(f"grant state must be 'active' (got {stored.state})")
     if stored.grant_id != grant.grant_id:
         raise SafetyError("grant_id mismatch between stored and supplied")
+
+    # ----- §OV4-3 (c)+(e): the admission trust boundary, DEFAULT OFF.
+    # With the flag absent nothing changes here (no new refusals). With the flag
+    # ON, an unverifiable execution class, workspace or evidence set is refused.
+    if trust_boundary_inputs is not None or trust_boundary_flag is not None:
+        boundary = apply_trust_boundary(**(trust_boundary_inputs or {}), flag=trust_boundary_flag)
+        if not boundary.ok:
+            raise SafetyError(
+                f"admission trust boundary refused ({boundary.code}): {boundary.detail}"
+            )
 
     # ----- (A-extra) Plan binding (P06 follow-up #2 A01). The grant
     # is pinned to an exact ``approved_plan_digest``; admission MUST
