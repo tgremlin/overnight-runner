@@ -235,10 +235,26 @@ def install_chunk(db: Database, *, chunk: ChunkSpec) -> None:
 
 
 def record_chunk_accepted(
-    db: Database, *, chunk_id: str, accepted_commit: str, accepted_tree_digest: str
+    db: Database, *, chunk_id: str, accepted_commit: str, accepted_tree_digest: str,
+    trust_boundary_flag: str | None = None,
+    completion_inputs: "dict | None" = None,
 ) -> None:
-    """Mark a chunk ACCEPTED_FOR_CONTINUATION and capture its accepted snapshot."""
+    """Mark a chunk ACCEPTED_FOR_CONTINUATION and capture its accepted snapshot.
+
+    §OV5-4: the COMPLETION gate lives here. With the versioned flag absent nothing
+    changes; when it is ON the candidate's finished work is re-checked (scope from
+    a Runner-held baseline, validator evidence the Runner produced itself) BEFORE
+    the chunk is accepted.
+    """
     require_not_paused_or_raise()
+    if trust_boundary_flag is not None or completion_inputs is not None:
+        from .admission_trust_boundary import check_completion
+
+        decision = check_completion(**(completion_inputs or {}), flag=trust_boundary_flag)
+        if not decision.ok:
+            raise SafetyError(
+                f"completion trust boundary refused ({decision.code}): {decision.detail}"
+            )
     now = int(time.time())
     with db.transaction() as cur:
         cur.execute(

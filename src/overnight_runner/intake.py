@@ -1,34 +1,14 @@
-"""OV4-2 — scope-gate and validator-evidence intake with REAL recomputation.
+"""OV5-2/3 — intake with Runner-HELD baseline and contract.
 
-The Runner computes the change set ITSELF, from a workspace it holds, using the
-trusted snapshot/diff port (`workspace_snapshot.py`) and its own scope gate
-(`scope_gate.py`). A caller-supplied change list or verdict is never authority.
-
-Fail-closed rules:
-  * a submitted verdict or a recomputation with a missing/None digest is a failure
-    (`EVIDENCE_DIGEST_MISSING`), on EITHER side;
-  * a recomputed refusal is returned as not-ok;
-  * a submitted REFUSAL is also returned as not-ok — a refusal is not an
-    authorisation, so `ok=True` is never returned for one;
-  * a digest disagreement is refused.
+The Runner computes the change set from a workspace it holds, against a baseline
+IT issued (`baseline.py`), under a contract IT derives from the stored `ChunkSpec`
+and `AutonomyGrant` — never from a caller. A caller-supplied snapshot, contract or
+change list is either impossible (no such parameter) or explicitly ignored.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
-
-from .scope_gate import evaluate_scope
-from .workspace_snapshot import SnapshotEntry, diff_snapshots, snapshot_workspace
-
-__all__ = [
-    "INTAKE_SCHEMA_VERSION",
-    "IntakeDecision",
-    "intake_scope_gate",
-    "intake_validator_evidence",
-    "recompute_scope_change_set",
-]
 
 INTAKE_SCHEMA_VERSION = "trio.runner-intake.v1"
 
@@ -41,64 +21,120 @@ class IntakeDecision:
     recomputed: Any = None
     digest: str = ""
 
+from .baseline import RunnerBaseline, is_runner_issued
+from .evidence_util import digest_of as _digest_of
+from .evidence_util import usable_digest as _usable_digest
+from .scope_gate import evaluate_scope
+from .workspace_snapshot import SnapshotEntry, diff_snapshots, snapshot_workspace
 
-def _digest_of(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+__all__ = [
+    "INTAKE_SCHEMA_VERSION",
+    "IntakeDecision",
+    "intake_scope_gate",
+    "intake_validator_evidence",
+    "recompute_scope_change_set",
+    "scope_contract_from",
+    "submitted_verdict_digest",
+]
 
 
-def _usable_digest(value: Any) -> bool:
-    return isinstance(value, str) and value.strip() != "" and value not in ("None", "null")
+def scope_contract_from(*, chunk_spec: Any, grant: Any) -> dict[str, Any]:
+    """Derive the scope contract from the STORED chunk spec and grant.
+
+    The allowed writes are the INTERSECTION of the grant's and the chunk's
+    permitted writes (a chunk may never widen the grant), and the protections come
+    from the grant. A caller cannot add or widen a path here.
+    """
+    grant_allowed = set(getattr(grant, "allowed_write_paths", []) or [])
+    chunk_permitted = list(getattr(chunk_spec, "permitted_write_paths", []) or [])
+    allowed = [p for p in chunk_permitted if p in grant_allowed]
+    return {
+        "allowedWritePaths": allowed,
+        "protectedPaths": list(getattr(grant, "protected_paths", []) or []),
+        "forbiddenScope": [],
+        "licensedPathPrefixes": None,
+        "caseSensitive": True,
+    }
 
 
-def recompute_scope_change_set(pre: Mapping[str, SnapshotEntry], workspace_dir: str) -> tuple[list[dict[str, Any]], dict[str, Mapping[str, Any]]]:
-    """The Runner's OWN change set: snapshot the workspace it holds and diff it."""
+def _usable_digest_or_none(value: Any) -> bool:
+    return _usable_digest(value)
+
+
+def recompute_scope_change_set(baseline: RunnerBaseline, workspace_dir: str) -> tuple[list[dict[str, Any]], dict[str, Mapping[str, Any]]]:
+    """The Runner's OWN change set, against the baseline IT issued."""
     after = snapshot_workspace(workspace_dir)
     changes = [
         {"kind": c.kind, "path": c.path, "reasons": list(c.reasons), **({"from": c.from_path} if c.from_path else {})}
-        for c in diff_snapshots(dict(pre), after)
+        for c in diff_snapshots(dict(baseline.entries), after)
     ]
     return changes, after
+
+
+def submitted_verdict_digest(decision_ok: bool, codes: Iterable[str], changes: int) -> str:
+    """The digest a truthful submitter would produce (the Runner recomputes it)."""
+    return _digest_of({"ok": decision_ok, "codes": sorted(set(codes)), "changes": changes})
 
 
 def intake_scope_gate(
     *,
     submitted: Any,
     workspace_dir: str,
-    pre_snapshot: Mapping[str, SnapshotEntry],
-    contract: Mapping[str, Any],
+    baseline: RunnerBaseline,
+    chunk_spec: Any,
+    grant: Any,
+    contract_override: Mapping[str, Any] | None = None,
 ) -> IntakeDecision:
-    """Recompute the scope decision from the workspace; never trust the caller."""
+    """Recompute the scope decision against a Runner-held baseline and contract.
+
+    `contract_override` exists only to be REFUSED as an attention check: a caller
+    cannot widen the contract, so supplying one is an error, not a silent ignore.
+    """
+    if contract_override is not None:
+        return IntakeDecision(False, "CONTRACT_OVERRIDE_REFUSED", "the scope contract is derived from the stored ChunkSpec and grant; a caller may not supply one")
+    if not isinstance(baseline, RunnerBaseline) or not is_runner_issued(baseline):
+        return IntakeDecision(False, "BASELINE_NOT_TRUSTED", "the baseline was not issued by the Runner")
     if not isinstance(submitted, Mapping):
         return IntakeDecision(False, "SCOPE_EVIDENCE_MISSING", "no submitted scope verdict")
-    if not _usable_digest(submitted.get("digest")):
+    if not _usable_digest_or_none(submitted.get("digest")):
         return IntakeDecision(False, "EVIDENCE_DIGEST_MISSING", "the submitted verdict carries no digest")
 
-    changes, after = recompute_scope_change_set(pre_snapshot, workspace_dir)
+    contract = scope_contract_from(chunk_spec=chunk_spec, grant=grant)
+    changes, after = recompute_scope_change_set(baseline, workspace_dir)
     ok, refusals = evaluate_scope(contract, changes, after)
     codes = sorted({r.code for r in refusals})
-    recomputed = {"ok": ok, "codes": codes, "changes": len(changes)}
-    recomputed["digest"] = _digest_of(recomputed)
-    if not _usable_digest(recomputed["digest"]):
+    # the digest covers the DECISION only; metadata (the baseline source) is not
+    # part of what a submitter signs, so both sides can compute it identically.
+    body = {"ok": ok, "codes": codes, "changes": len(changes)}
+    recomputed = {**body, "baseline_source": baseline.source, "digest": _digest_of(body)}
+    if not _usable_digest_or_none(recomputed["digest"]):
         return IntakeDecision(False, "EVIDENCE_DIGEST_MISSING", "the recomputation produced no digest")
 
     if submitted.get("digest") != recomputed["digest"]:
         return IntakeDecision(False, "SCOPE_EVIDENCE_DISAGREES", "the submitted verdict digest does not equal the Runner's recomputation", recomputed=recomputed, digest=recomputed["digest"])
     if not ok:
         return IntakeDecision(False, codes[0] if codes else "SCOPE_REFUSED", "the Runner's recomputation refuses this change set", recomputed=recomputed, digest=recomputed["digest"])
-    # §OV4-2d: a submitted REFUSAL is not an authorisation.
     if submitted.get("allowed") is not True:
-        return IntakeDecision(False, "SCOPE_SUBMITTED_REFUSAL", "the submitted verdict refuses; a refusal is never an ok=True", recomputed=recomputed, digest=recomputed["digest"])
+        return IntakeDecision(False, "SCOPE_SUBMITTED_REFUSAL", "the submitted verdict refuses; a refusal is never ok=True", recomputed=recomputed, digest=recomputed["digest"])
     return IntakeDecision(True, recomputed=recomputed, digest=recomputed["digest"])
 
 
 def intake_validator_evidence(
     *,
     submitted: Any,
-    recomputed: Mapping[str, Any] | None,
+    recomputed: Mapping[str, Any] | None = None,
     required_fields: Iterable[str] = ("validator_results",),
+    runner_evidence: Any = None,
 ) -> IntakeDecision:
-    """Compare submitted evidence with the Runner's recomputation."""
+    """Compare submitted evidence with the Runner's recomputation.
+
+    When `runner_evidence` is supplied the Runner's OWN validator run is
+    authoritative (OV5-5) and the caller's `recomputed` is ignored entirely.
+    """
+    if runner_evidence is not None:
+        from .validator_evidence import intake_runner_evidence
+
+        return intake_runner_evidence(submitted=submitted, runner_evidence=runner_evidence)
     if not isinstance(submitted, Mapping):
         return IntakeDecision(False, "EVIDENCE_MISSING", "no submitted validator evidence")
     if not isinstance(recomputed, Mapping):

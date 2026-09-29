@@ -157,11 +157,17 @@ def derive_admission(
     if stored.grant_id != grant.grant_id:
         raise SafetyError("grant_id mismatch between stored and supplied")
 
-    # ----- §OV4-3 (c)+(e): the admission trust boundary, DEFAULT OFF.
-    # With the flag absent nothing changes here (no new refusals). With the flag
-    # ON, an unverifiable execution class, workspace or evidence set is refused.
-    if trust_boundary_inputs is not None or trust_boundary_flag is not None:
-        boundary = apply_trust_boundary(**(trust_boundary_inputs or {}), flag=trust_boundary_flag)
+    # ----- §OV4-3/§OV5-4: ONLY execution-class admission lives here. The scope
+    # and validator-evidence intake moved to the COMPLETION path (campaign.
+    # record_chunk_accepted) because they describe finished work, not the chunk.
+    # Default OFF: with the flag absent nothing changes.
+    if trust_boundary_flag is not None or trust_boundary_inputs is not None:
+        inputs = trust_boundary_inputs or {}
+        boundary = apply_trust_boundary(
+            execution_class=inputs.get("execution_class"),
+            flag=trust_boundary_flag,
+            inputs_supplied=bool(inputs),
+        )
         if not boundary.ok:
             raise SafetyError(
                 f"admission trust boundary refused ({boundary.code}): {boundary.detail}"
