@@ -26,6 +26,7 @@ __all__ = [
     "RunnerValidatorEvidence",
     "discard_runner_evidence",
     "evidence_root",
+    "host_tests_scratch_root",
     "intake_runner_evidence",
     "prune_runner_evidence",
     "run_trusted_validators",
@@ -47,6 +48,13 @@ def evidence_root() -> Path:
         from .runtime import state_dir
 
         root = state_dir() / "validator-evidence"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def host_tests_scratch_root() -> Path:
+    """§EXEC3 fix 2 — the Runner-owned root for host-tests scratch copies."""
+    root = evidence_root().parent / "host-tests-scratch"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

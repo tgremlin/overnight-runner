@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -312,3 +313,37 @@ def test_ov73_no_real_credential_file_or_hosted_call_is_needed() -> None:
     source = (Path(__file__).parent.parent / "src" / "overnight_runner" / "credential_exposure.py").read_text(encoding="utf-8")
     assert "open(" not in source
     assert not any(word in source for word in ("requests.", "urllib.", "http://", "https://", "socket."))
+
+
+# --------------------------------------------------------------------------- #
+# §EXEC3 fix 2 — the host-tests scratch is Runner-owned and removed on every path
+# --------------------------------------------------------------------------- #
+def _temp_dirs_with_prefix(prefix: str) -> list[str]:
+    return sorted(p.name for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith(prefix))
+
+
+def _workspace_with_one_passing_test(tmp_path: Path) -> Path:
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    return ws
+
+
+def test_exec3_host_tests_scratch_lives_under_the_runner_root_and_is_removed(tmp_path: Path, monkeypatch) -> None:
+    """NEGATIVE: nothing is left in the shared temp dir; POSITIVE: it ran and cleaned."""
+    from overnight_runner.validator_evidence import EVIDENCE_ROOT_ENV, host_tests_scratch_root
+
+    root = tmp_path / "state"
+    monkeypatch.setenv(EVIDENCE_ROOT_ENV, str(root))
+    ws = _workspace_with_one_passing_test(tmp_path)
+    before = _temp_dirs_with_prefix("host-tests-")
+
+    result = run_host_tests(workspace_dir=str(ws), timeout_s=90)
+
+    assert result.outcome in {"passed", "failed", "timeout"}          # bwrap may be unavailable
+    # the scratch was created under the Runner-owned root, and is GONE afterwards
+    assert str(result.scratch_dir).startswith(str(host_tests_scratch_root()))
+    assert not Path(result.scratch_dir).exists()
+    assert list(host_tests_scratch_root().iterdir()) == []
+    # and the shared temp dir gained no `trio-host-tests-` directory
+    assert _temp_dirs_with_prefix("trio-host-tests-") == before

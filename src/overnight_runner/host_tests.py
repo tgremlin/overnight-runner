@@ -167,7 +167,26 @@ def run_host_tests(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> HostTestsResult:
     """Run pytest on a read-only copy of the workspace, inside bwrap."""
-    scratch = tempfile.mkdtemp(prefix="trio-host-tests-")  # Runner-owned, outside the workspace
+    # §EXEC3 fix 2 — the scratch is Runner-owned AND lives under the Runner's own root,
+    # not in the shared system temp dir, and it is removed on EVERY path out of here.
+    from .validator_evidence import host_tests_scratch_root
+
+    scratch = tempfile.mkdtemp(prefix="host-tests-", dir=str(host_tests_scratch_root()))
+    try:
+        return _run_host_tests_in(scratch, workspace_dir=workspace_dir, toolchain_root=toolchain_root,
+                                 timeout_s=timeout_s, max_output_bytes=max_output_bytes)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _run_host_tests_in(
+    scratch: str,
+    *,
+    workspace_dir: str,
+    toolchain_root: str,
+    timeout_s: int,
+    max_output_bytes: int,
+) -> HostTestsResult:
     shutil.copytree(workspace_dir, scratch, dirs_exist_ok=True, symlinks=True)
     python = os.path.join(toolchain_root, "bin", "python")
     roots = list(READ_ONLY_ROOTS) + ([toolchain_root] if os.path.isdir(toolchain_root) else [])
@@ -191,7 +210,6 @@ def run_host_tests(
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-    shutil.rmtree(scratch, ignore_errors=True)
     # §OV7-1: cap both streams and digest the CAPPED bytes (never the unbounded
     # ones), so a flooding test cannot grow the evidence without bound.
     raw_out = out or b""
