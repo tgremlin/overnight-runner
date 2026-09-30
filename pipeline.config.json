@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "trio.pipeline-config.v1",
+  "qualification": {
+    "command": "python3",
+    "args": ["-m", "pytest", "-q", "-p", "no:cacheprovider"],
+    "timeoutSeconds": 3600,
+    "env": { "PYTHONDONTWRITEBYTECODE": "1" },
+    "envAllow": ["PYTHONDONTWRITEBYTECODE"]
+  },
+  "protectedPaths": [
+    "pyproject.toml",
+    "tests/**",
+    "pipeline.config.json",
+    "pipeline.operator.pub"
+  ],
+  "note": "PIPEGIT4 declared qualification for the Runner: the host-side pytest suite, read from the pipeline mirror AT THE CAMPAIGN BASE and never from the caller or the head. Protected paths are the qualification infrastructure: the pytest config, the whole tests/ tree, the config itself and the operator public key. `publishPolicy` is operator-approved. OPERATOR ACTION BEFORE USE: run `forge campaign keygen` once and commit the printed public key as `pipeline.operator.pub` at this repo's base — until then the gate refuses every approval with CAMPAIGN_APPROVAL_KEY_UNKNOWN. No key is committed here because keygen is terminal-only and must be run by the operator."
+}
