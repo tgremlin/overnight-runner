@@ -238,6 +238,7 @@ def record_chunk_accepted(
     db: Database, *, chunk_id: str, accepted_commit: str, accepted_tree_digest: str,
     trust_boundary_flag: str | None = None,
     completion_inputs: "dict | None" = None,
+    lineage_mirror: str | None = None,
 ) -> None:
     """Mark a chunk ACCEPTED_FOR_CONTINUATION and capture its accepted snapshot.
 
@@ -257,6 +258,18 @@ def record_chunk_accepted(
         raise SafetyError(
             f"completion trust boundary refused ({decision.code}): {decision.detail}"
         )
+    # §PIPEGIT2 G8: when a pipeline mirror is supplied, the accepted commit must DESCEND
+    # from the previous accepted commit of the same campaign — `ACCEPT_LINEAGE_BROKEN`
+    # otherwise. Opt-in and additive: with no mirror the behaviour is unchanged.
+    if lineage_mirror is not None:
+        from .accept_lineage import campaign_of, verify_accept_lineage
+
+        campaign_id = campaign_of(db, chunk_id)
+        if campaign_id is not None:
+            verify_accept_lineage(
+                db=db, campaign_id=campaign_id, chunk_id=chunk_id,
+                accepted_commit=accepted_commit, mirror=lineage_mirror,
+            )
     now = int(time.time())
     with db.transaction() as cur:
         cur.execute(
