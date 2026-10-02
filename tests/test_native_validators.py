@@ -239,3 +239,19 @@ def test_the_scope_gate_protects_every_judge_path_but_not_the_chunks_own_tests(w
 def test_the_judge_pattern_table_is_exactly_the_documented_set():
     assert [p for p, _ in JUDGE_PATTERNS] == ["scripts/trio_native_*.py", "scripts/trio_validators.py", "scripts/trio_log_markers.py", "scripts/ue.sh", "pytest.ini", "pipeline.config.json", "pipeline.operator.pub"]
     assert judge_tamper.__name__ == "judge_tamper"
+
+
+def test_the_judged_copy_is_a_runner_owned_git_repo_never_the_candidates(world):
+    """UBT needs a git work tree (a tree that builds inside one fails without it). The Runner makes its OWN repo; the candidate's .git is never copied."""
+    (world["ws"] / ".git").mkdir()
+    (world["ws"] / ".git" / "HOOKS_MUST_NOT_RUN").write_text("candidate git internals")
+    probe = world["tmp"] / "probe_stub.py"
+    # reuse the trusted stub contract: a build that succeeds only if the judged copy is a git repo whose HEAD exists and has no candidate files in .git
+    stub = STUB_COMPILE.replace('src = "".join(', 'import subprocess\nif subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"], capture_output=True).returncode != 0 or (repo / ".git" / "HOOKS_MUST_NOT_RUN").exists():\n    print("FAIL NATIVE_COMPILE_FAILED  --  no runner-owned git repo", file=sys.stderr); sys.exit(1)\nsrc = "".join(', 1)
+    repo = Path(world["repo"])
+    (repo / "scripts/trio_native_compile.py").write_text(stub)
+    _git(repo, "add", "."); _git(repo, "commit", "-q", "-m", "stub with git probe")
+    world["base"] = _git(repo, "rev-parse", "HEAD")
+    shutil.copy(repo / "scripts/trio_native_compile.py", world["ws"] / "scripts/trio_native_compile.py")
+    assert run(world)["outcome"] == "passed"
+    assert probe is not None

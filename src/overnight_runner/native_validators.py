@@ -201,6 +201,17 @@ def _provision_vendor(plugins: Iterable[tuple[str, str]], project: Path) -> str 
     return None
 
 
+def _init_judged_repo(judged: Path) -> None:
+    """A Runner-owned git repo (hooks off) at the judged copy's root, committing everything.
+
+    UBT builds differently without a git work tree (diagnosed 2026-10-02: the SAME tree that compiles inside a git repo fails with
+    `-Werror` unreachable-code errors in the vendor plugin when `.git` is absent). The candidate's own `.git` is never copied.
+    """
+    base = ["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "user.name=runner", "-c", "user.email=runner@localhost"]
+    for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "--allow-empty", "-m", "judged"]):
+        subprocess.run([*base, "-C", str(judged), *args], capture_output=True)
+
+
 def _env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW}
 
@@ -279,6 +290,7 @@ def run_native_validator(
             return _row(validator_id, "refused", "JUDGE_COPY_MISMATCH" if blob.returncode == 0 else "NATIVE_JUDGE_ERROR")
         if _provision_vendor(config.vendor_plugins, judged) is not None:
             return _row(validator_id, "refused", "NATIVE_VENDOR_MISSING")
+        _init_judged_repo(judged)
         log_file = scratch / "native.log"
         argv = [config.python, str(script), "--sandbox", "--engine", config.engine_root, "--lock", config.heavy_lock, "--log-out", str(log_file)]
         if validator_id == NATIVE_COMPILE_ID:
@@ -292,6 +304,13 @@ def run_native_validator(
         rc, out, err, timed_out = _run(argv, judged, timeout_s)
         log = log_file.read_bytes() if log_file.is_file() else None
         seconds = time.time() - started
+        debug_dir = os.environ.get("TRIO_NATIVE_DEBUG_DIR")                 # operator-only: keep the raw judge output OUTSIDE the evidence (never in the row)
+        if debug_dir:
+            d = Path(debug_dir) / f"{validator_id}-{int(started)}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "stdout.txt").write_bytes(out); (d / "stderr.txt").write_bytes(err)
+            if log is not None:
+                (d / "native.log").write_bytes(log)
         if timed_out:
             return _row(validator_id, "failed", timeout_code, out=out, err=err, log=log, seconds=seconds)
         if rc == 0:
