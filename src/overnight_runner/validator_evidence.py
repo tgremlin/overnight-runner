@@ -209,6 +209,8 @@ def run_trusted_validators(
     candidate_tree_digest: str,
     validator_ids: Iterable[str] = ("py_compile",),
     timeout_s: int = 120,
+    trusted_repo: str | None = None,
+    native_config: Any = None,
 ) -> RunnerValidatorEvidence:
     """Run the fixed validators on the workspace and mint Runner-owned evidence."""
     # The Runner CREATES the evidence path; nothing the candidate wrote is read.
@@ -229,6 +231,13 @@ def run_trusted_validators(
                 "stdout_digest": _digest_of(host.stdout),
                 "stderr_digest": _digest_of(host.stderr),
             })
+            continue
+        if validator_id in ("native-compile", "native-automation-nullrhi"):
+            # M5 candidate: the T2 profiles. The judge is a TRUSTED copy resolved from `trusted_repo` at `base_commit`, never the
+            # candidate workspace; the row carries digests and a typed code only (overnight_runner.native_validators).
+            from .native_validators import run_native_validator
+
+            results.append(run_native_validator(validator_id, workspace_dir=workspace_dir, trusted_repo=trusted_repo, base_commit=base_commit, config=native_config))
             continue
         argv = VALIDATOR_COMMANDS.get(validator_id)
         if argv is None:
