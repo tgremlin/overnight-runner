@@ -209,6 +209,9 @@ def run_trusted_validators(
     candidate_tree_digest: str,
     validator_ids: Iterable[str] = ("py_compile",),
     timeout_s: int = 120,
+    target_repo: str | None = None,
+    merge_base: str | None = None,
+    t2_lock_path: str | None = None,
 ) -> RunnerValidatorEvidence:
     """Run the fixed validators on the workspace and mint Runner-owned evidence."""
     # The Runner CREATES the evidence path; nothing the candidate wrote is read.
@@ -218,6 +221,22 @@ def run_trusted_validators(
     evidence_dir = tempfile.mkdtemp(prefix="evidence-", dir=str(evidence_root()))
     results: list[dict[str, Any]] = []
     for validator_id in validator_ids:
+        # §T2 — native-compile / NullRHI automation: the validator COMMANDS come from the
+        # target repo at the MERGE-BASE (never the candidate), under the heavy lock and an
+        # editor guard; the result carries digests + a typed code only.
+        from .t2_validators import T2_VALIDATOR_IDS, run_t2_validator
+
+        if validator_id in T2_VALIDATOR_IDS:
+            if target_repo is None or merge_base is None:
+                results.append({"validator_id": validator_id, "outcome": "refused", "code": "T2_SOURCE_MISSING", "exit_code": None})
+                continue
+            t2 = run_t2_validator(
+                validator_id=validator_id, repo_root=workspace_dir, merge_base=merge_base,
+                target_repo=target_repo, lock_path=t2_lock_path or os.path.join(str(evidence_root()), "t2-heavy.lock"),
+                timeout_s=max(timeout_s, 3600),
+            )
+            results.append(t2.as_evidence())
+            continue
         if validator_id == HOST_TESTS_VALIDATOR_ID:
             from .host_tests import run_host_tests
 
