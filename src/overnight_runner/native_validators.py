@@ -258,6 +258,9 @@ def run_native_validator(
         return _row(validator_id, "refused", "NATIVE_TRUSTED_REPO_REQUIRED")
     if config is None:
         return _row(validator_id, "refused", "NATIVE_CONFIG_REQUIRED")
+    if not os.path.isabs(workspace_dir) or not os.path.isdir(workspace_dir):
+        # ported from agent/t2-validators: refuse a relative/nonexistent workspace before any judge work
+        return _row(validator_id, "refused", "NATIVE_JUDGE_ERROR")
     started = time.time()
     try:
         tampered = judge_tamper(workspace_dir, trusted_repo, base_commit)

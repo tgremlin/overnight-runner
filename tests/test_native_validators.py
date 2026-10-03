@@ -195,6 +195,12 @@ def test_missing_inputs_are_typed(world):
     assert run_native_validator(NATIVE_COMPILE_ID, workspace_dir=str(world["ws"]), trusted_repo=world["repo"], base_commit=world["base"], config=cfg)["code"] == "NATIVE_VENDOR_MISSING"
 
 
+def test_a_relative_or_absent_workspace_is_refused(world):
+    # ported from agent/t2-validators: never resolve a relative/absent workspace
+    assert run_native_validator(NATIVE_COMPILE_ID, workspace_dir="relative/ws", trusted_repo=world["repo"], base_commit=world["base"], config=world["cfg"])["code"] == "NATIVE_JUDGE_ERROR"
+    assert run_native_validator(NATIVE_COMPILE_ID, workspace_dir=str(world["tmp"] / "absent"), trusted_repo=world["repo"], base_commit=world["base"], config=world["cfg"])["code"] == "NATIVE_JUDGE_ERROR"
+
+
 def test_vendor_plugin_sources_are_provisioned_into_the_judged_copy_only(world):
     plugin = world["tmp"] / "acf"; (plugin / "Source").mkdir(parents=True); (plugin / "Source/X.cpp").write_text("int x;\n"); (plugin / "Intermediate").mkdir(); (plugin / "Intermediate/skip").write_text("1")
     cfg = NativeConfig(engine_root="/e", heavy_lock=world["cfg"].heavy_lock, vendor_plugins=((str(plugin), "Plugins/Marketplace/ACF"),))
