@@ -148,6 +148,16 @@ def test_a_candidate_that_breaks_the_build_is_NATIVE_COMPILE_FAILED(world):
     assert row["log_digest"] is not None
 
 
+def test_a_failed_judge_writes_a_sanitized_repair_summary(world, tmp_path, monkeypatch):
+    # the evidence row stays digests+codes only; the SANITIZED summary goes to the driver repair dir
+    monkeypatch.setenv("TRIO_NATIVE_REPAIR_DIR", str(tmp_path / "repair"))
+    (world["ws"] / "Source/Mod/A.cpp").write_text("int a = BROKEN;\n")
+    assert run(world)["outcome"] == "failed"
+    text = (tmp_path / "repair" / "native-compile.repair.txt").read_text(encoding="utf-8")
+    assert "FAIL NATIVE_COMPILE_FAILED" in text or "error:" in text
+    assert "/mnt/" not in text and "/tmp/" not in text and "pytest-" not in text     # sanitized: no absolute scratch paths
+
+
 def test_a_failing_automation_test_is_typed(world):
     (world["ws"] / "Source/Mod/A.cpp").write_text("// AUTOFAIL\n")
     assert (run(world, NATIVE_AUTOMATION_ID)["outcome"], run(world, NATIVE_AUTOMATION_ID)["code"]) == ("failed", "NATIVE_AUTOMATION_TEST_FAILED")

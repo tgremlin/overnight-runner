@@ -216,6 +216,20 @@ def _env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW}
 
 
+def _sanitize_repair(text: str, cap: int = 4000) -> str:
+    """A SANITIZED repair summary for the NEXT attempt's prompt: only typed error/result lines,
+    repo-relative paths, no absolute scratch paths and no long digests. Written to a
+    driver-readable repair dir (TRIO_NATIVE_REPAIR_DIR); never part of the evidence row."""
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "error:" in stripped or stripped.startswith("FAIL ") or stripped.startswith("Result:"):
+            s = re.sub(r"(?:/[^\s:]*/)*([A-Za-z0-9_.+-]+\.(?:cpp|cc|h|hpp|py|ini|json|cs))", r"\1", stripped)
+            s = re.sub(r"\b[0-9a-f]{16,}\b", "<hash>", s)
+            out.append(s[:300])
+    return "\n".join(out)[:cap]
+
+
 def _row(validator_id: str, outcome: str, code: str, *, exit_code: int | None = None, out: bytes = b"", err: bytes = b"", log: bytes | None = None,
          seconds: float = 0.0, tampered: Sequence[str] = ()) -> dict[str, Any]:
     """The evidence row: digests and a typed code ONLY."""
@@ -314,6 +328,11 @@ def run_native_validator(
             (d / "stdout.txt").write_bytes(out); (d / "stderr.txt").write_bytes(err)
             if log is not None:
                 (d / "native.log").write_bytes(log)
+        repair_dir = os.environ.get("TRIO_NATIVE_REPAIR_DIR")             # driver repair channel: SANITIZED error summary only
+        if repair_dir:
+            rd = Path(repair_dir); rd.mkdir(parents=True, exist_ok=True)
+            (rd / f"{validator_id}.repair.txt").write_text(
+                _sanitize_repair(err.decode("utf-8", "replace") + "\n" + (log.decode("utf-8", "replace") if log else "")))
         if timed_out:
             return _row(validator_id, "failed", timeout_code, out=out, err=err, log=log, seconds=seconds)
         if rc == 0:
