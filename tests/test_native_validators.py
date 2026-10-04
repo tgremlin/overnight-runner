@@ -179,10 +179,12 @@ def test_the_repair_summary_carries_automation_and_crash_markers_but_no_paths_or
         "World Memory Leaks: 2 leaks objects and packages. See The output above.",
         "Signal 11 caught.",
         "/mnt/ue/Cache/trio-tmp/x/judged/Source/Mod/A.cpp:4:3: error: use of undeclared identifier 'Foo'",
+        "LogUnixPlatformFile: Warning: create dir('/Game/') failed: errno=30 (Read-only file system)",
+        "LogSavePackage: Warning: Failed to move '/Game/Trio/Generated/WF/Scratch_D3_1' from temp directory",
         "LogHttp: Warning: libcurl info message cache 4 (Immediate connect fail)", "Malloc Size=262146 LargeMemoryPoolOffset=262162",
     ])
     text = _sanitize_repair(log)
-    for must in ("Result={Failed}", "Fatal error", "World Memory Leaks", "Signal 11 caught", "A.cpp:4:3: error: use of undeclared identifier"):
+    for must in ("Result={Failed}", "Fatal error", "World Memory Leaks", "Signal 11 caught", "A.cpp:4:3: error: use of undeclared identifier", "create dir('/Game/') failed", "Failed to move"):
         assert must in text
     assert "/mnt/" not in text and "2026.10.04" not in text and "libcurl" not in text and "Malloc" not in text
 

@@ -219,7 +219,7 @@ def _env() -> dict[str, str]:
 _REPAIR_MARKERS = re.compile(
     r"error:|fatal error|assertion failed|ensure condition failed|world memory leaks|leaked? |signal \d+ caught|segmentation fault|"
     r"Result=\{(?:Failed|Skipped|InProcess)\}|Test Completed|LogAutomationController: Error|LogAutomationController: Warning: .*(?:Error|Fail)|"
-    r"^FAIL |^Result:|TRIO_EDITOR_EXIT|PLAY_MARKER|Error: .*Trio", re.IGNORECASE)
+    r"^FAIL |^Result:|TRIO_EDITOR_EXIT|PLAY_MARKER|Error: .*Trio|read-only file system|failed to move|unable to move|create dir\(.*failed|LogSavePackage|LogFileHelpers.*(?:error|fail)|SaveMap|LoadMap", re.IGNORECASE)
 
 
 def _sanitize_repair(text: str, cap: int = 4000) -> str:
