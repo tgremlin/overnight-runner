@@ -171,6 +171,22 @@ def test_the_automation_validator_builds_the_candidate_first_in_its_own_judged_c
     assert (row["outcome"], row["code"]) == ("failed", "NATIVE_COMPILE_FAILED")
 
 
+def test_the_repair_summary_carries_automation_and_crash_markers_but_no_paths_or_timestamps():
+    from overnight_runner.native_validators import _sanitize_repair
+    log = "\n".join([
+        "[2026.10.04-20.37.21:008][599]LogAutomationController: Display: Test Completed. Result={Failed} Name={DigestDetectsChange} Path={TRIO.X}",
+        "Fatal error: [File:./Editor/UnrealEd/Private/EditorServer.cpp] [Line: 2544]",
+        "World Memory Leaks: 2 leaks objects and packages. See The output above.",
+        "Signal 11 caught.",
+        "/mnt/ue/Cache/trio-tmp/x/judged/Source/Mod/A.cpp:4:3: error: use of undeclared identifier 'Foo'",
+        "LogHttp: Warning: libcurl info message cache 4 (Immediate connect fail)", "Malloc Size=262146 LargeMemoryPoolOffset=262162",
+    ])
+    text = _sanitize_repair(log)
+    for must in ("Result={Failed}", "Fatal error", "World Memory Leaks", "Signal 11 caught", "A.cpp:4:3: error: use of undeclared identifier"):
+        assert must in text
+    assert "/mnt/" not in text and "2026.10.04" not in text and "libcurl" not in text and "Malloc" not in text
+
+
 def test_a_failing_automation_test_is_typed(world):
     (world["ws"] / "Source/Mod/A.cpp").write_text("// AUTOFAIL\n")
     assert (run(world, NATIVE_AUTOMATION_ID)["outcome"], run(world, NATIVE_AUTOMATION_ID)["code"]) == ("failed", "NATIVE_AUTOMATION_TEST_FAILED")

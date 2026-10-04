@@ -216,17 +216,24 @@ def _env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW}
 
 
+_REPAIR_MARKERS = re.compile(
+    r"error:|fatal error|assertion failed|ensure condition failed|world memory leaks|leaked? |signal \d+ caught|segmentation fault|"
+    r"Result=\{(?:Failed|Skipped|InProcess)\}|Test Completed|LogAutomationController: Error|LogAutomationController: Warning: .*(?:Error|Fail)|"
+    r"^FAIL |^Result:|TRIO_EDITOR_EXIT|PLAY_MARKER|Error: .*Trio")
+
+
 def _sanitize_repair(text: str, cap: int = 4000) -> str:
-    """A SANITIZED repair summary for the NEXT attempt's prompt: only typed error/result lines,
-    repo-relative paths, no absolute scratch paths and no long digests. Written to a
-    driver-readable repair dir (TRIO_NATIVE_REPAIR_DIR); never part of the evidence row."""
+    """A SANITIZED repair summary for the NEXT attempt's prompt: only typed error/result/crash lines, repo-relative paths, no absolute scratch paths and no
+    long digests. Compiler errors AND the automation judge's structured markers (a failed test, an assertion, a leaked world at shutdown, a crash).
+    Written to a driver-readable repair dir (TRIO_NATIVE_REPAIR_DIR); never part of the evidence."""
     out: list[str] = []
     for line in text.splitlines():
-        stripped = line.strip()
-        if "error:" in stripped or stripped.startswith("FAIL ") or stripped.startswith("Result:"):
+        stripped = re.sub(r"^\[\d{4}\.\d\d\.\d\d-[\d.:]+\]\[\s*\d+\]", "", line.strip())   # drop the engine's timestamp prefix
+        if _REPAIR_MARKERS.search(stripped):
             s = re.sub(r"(?:/[^\s:]*/)*([A-Za-z0-9_.+-]+\.(?:cpp|cc|h|hpp|py|ini|json|cs))", r"\1", stripped)
             s = re.sub(r"\b[0-9a-f]{16,}\b", "<hash>", s)
-            out.append(s[:300])
+            if s not in out[-3:]:
+                out.append(s[:300])
     return "\n".join(out)[:cap]
 
 
