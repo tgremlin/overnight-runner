@@ -308,6 +308,31 @@ def run_native_validator(
         if _provision_vendor(config.vendor_plugins, judged) is not None:
             return _row(validator_id, "refused", "NATIVE_VENDOR_MISSING")
         _init_judged_repo(judged)
+        if validator_id == NATIVE_AUTOMATION_ID:
+            # The editor loads the project's BUILT modules, and this validator's judged copy is a fresh export (the compile validator's copy is gone):
+            # build the candidate in THIS copy first with the TRUSTED compile judge (same lock, same sandbox), then run the editor automation.
+            build_rel = "scripts/trio_native_compile.py"
+            build_blob = _git(trusted_repo, "cat-file", "blob", f"{base_commit}:{build_rel}", binary=True)
+            build_script = judged / build_rel
+            if build_blob.returncode != 0 or not build_script.is_file() or build_script.read_bytes() != build_blob.stdout:
+                return _row(validator_id, "refused", "JUDGE_COPY_MISMATCH" if build_blob.returncode == 0 else "NATIVE_JUDGE_ERROR")
+            build_log = scratch / "build.log"
+            bargv = [config.python, str(build_script), "--sandbox", "--engine", config.engine_root, "--lock", config.heavy_lock, "--log-out", str(build_log),
+                     "--max-parallel", str(config.max_parallel), "--timeout", str(config.compile_timeout_s)]
+            brc, bout, berr, btimed = _run(bargv, judged, config.compile_timeout_s + 120)
+            if os.environ.get("TRIO_NATIVE_DEBUG_DIR"):
+                bd = Path(os.environ["TRIO_NATIVE_DEBUG_DIR"]) / f"{validator_id}-build-{int(started)}"
+                bd.mkdir(parents=True, exist_ok=True)
+                (bd / "stdout.txt").write_bytes(bout); (bd / "stderr.txt").write_bytes(berr)
+                if build_log.is_file():
+                    (bd / "native.log").write_bytes(build_log.read_bytes())
+            if btimed or brc != 0:
+                bmatch = _FAIL_LINE.search(berr.decode("utf-8", "replace"))
+                bcode = "NATIVE_COMPILE_TIMEOUT" if btimed else (bmatch.group(1) if bmatch else "NATIVE_COMPILE_FAILED")
+                if bcode == "NATIVE_COMPILE_EDITOR_RUNNING":
+                    bcode = "NATIVE_EDITOR_RUNNING"
+                boutcome = "refused" if bcode in ("NATIVE_COMPILE_LOCK_HELD", "NATIVE_EDITOR_RUNNING", "NATIVE_COMPILE_SANDBOX_UNAVAILABLE") else "failed"
+                return _row(validator_id, boutcome, bcode, exit_code=brc, out=bout, err=berr, log=build_log.read_bytes() if build_log.is_file() else None, seconds=time.time() - started)
         log_file = scratch / "native.log"
         argv = [config.python, str(script), "--sandbox", "--engine", config.engine_root, "--lock", config.heavy_lock, "--log-out", str(log_file)]
         if validator_id == NATIVE_COMPILE_ID:

@@ -39,6 +39,8 @@ if any("KEY" in k or "TOKEN" in k for k in os.environ):
     print("FAIL LEAKED_ENV  --  a credential variable reached the judge", file=sys.stderr); sys.exit(1)
 src = "".join(f.read_text() for f in sorted(repo.glob("Source/**/*.cpp")))
 Path(a.log_out).write_text(f"ran-from={Path(__file__).resolve()}\nsandbox={a.sandbox}\n" + ("Foo.cpp(1): error: BROKEN\n" if "BROKEN" in src else "Result: Succeeded\n"))
+if "BROKEN" not in src:
+    (repo / "Binaries").mkdir(exist_ok=True); (repo / "Binaries" / "BUILT").write_text("1")
 if "BROKEN" in src:
     print("FAIL NATIVE_COMPILE_FAILED  --  UBT exited 6", file=sys.stderr); sys.exit(1)
 print(json.dumps({"exitCode": 0}))
@@ -53,6 +55,8 @@ a = p.parse_args()
 repo = Path(__file__).resolve().parent.parent
 src = "".join(f.read_text() for f in sorted(repo.glob("Source/**/*.cpp")))
 Path(a.log_out).write_text(f"ran-from={Path(__file__).resolve()}\n")
+if not (repo / "Binaries" / "BUILT").exists():
+    print("FAIL NATIVE_AUTOMATION_FAILED  --  editor exited 1 (the project modules are not built)", file=sys.stderr); sys.exit(1)
 if "AUTOFAIL" in src:
     print("FAIL NATIVE_AUTOMATION_TEST_FAILED  --  1 test(s) not Success", file=sys.stderr); sys.exit(1)
 print(json.dumps({"exitCode": 0}))
@@ -156,6 +160,15 @@ def test_a_failed_judge_writes_a_sanitized_repair_summary(world, tmp_path, monke
     text = (tmp_path / "repair" / "native-compile.repair.txt").read_text(encoding="utf-8")
     assert "FAIL NATIVE_COMPILE_FAILED" in text or "error:" in text
     assert "/mnt/" not in text and "/tmp/" not in text and "pytest-" not in text     # sanitized: no absolute scratch paths
+
+
+def test_the_automation_validator_builds_the_candidate_first_in_its_own_judged_copy(world):
+    # the editor cannot start without the project's BUILT modules, and the automation validator's judged copy is a fresh export: it builds first
+    assert not (world["ws"] / "Binaries").exists()
+    assert run(world, NATIVE_AUTOMATION_ID)["outcome"] == "passed"                       # the stub editor fails unless the compile judge ran in THAT copy
+    (world["ws"] / "Source/Mod/A.cpp").write_text("int a = BROKEN;\n")
+    row = run(world, NATIVE_AUTOMATION_ID)                                                 # a build failure stops the automation with the COMPILE code
+    assert (row["outcome"], row["code"]) == ("failed", "NATIVE_COMPILE_FAILED")
 
 
 def test_a_failing_automation_test_is_typed(world):
